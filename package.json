@@ -1,6 +1,6 @@
 {
   "name": "concurrex",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Fully adaptive task executor. Self-regulates concurrency limits, sheds load under pressure, and schedules fairly across lanes — no manual tuning, no environment-specific configuration.",
   "type": "module",
   "main": "./dist/index.js",
