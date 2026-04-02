@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Executor: Theoretical Curves</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; background: #fafafa; }
+    h1 { margin-bottom: 4px; }
+    h2 { margin-top: 48px; border-bottom: 2px solid #333; padding-bottom: 4px; }
+    h3 { margin-top: 32px; color: #444; }
+    .subtitle { color: #666; margin-top: 0; }
+    .chart-container { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin: 16px 0; }
+    .description { color: #555; font-size: 14px; margin: 8px 0 16px 0; line-height: 1.5; }
+    canvas { max-height: 300px; }
+    code { background: #eee; padding: 2px 6px; border-radius: 3px; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>Executor: Theoretical Curves</h1>
+<p class="subtitle">Pure mathematical plots for each section of <a href="../../../src/Infrastructure/Executor/THEORY.md">THEORY.md</a>.
+Compare against the <a href="executor-simulation-live.html">live simulation</a>.</p>
+
+<h2>&sect;2. ProDel: Probabilistic Delay Load-shedding</h2>
+
+<h3>&sect;2.3 Drop Probability: P(s) = 1 &minus; &tau;/s</h3>
+<p class="description">
+    Each stale entry (sojourn &ge; &tau;) is dropped with probability proportional to how far past the threshold it is.
+    At s = &tau;: P = 0 (just crossed, give it a chance). At s = 2&tau;: P = 0.5 (coin flip).
+    At s = 10&tau;: P = 0.9. Smooth gradient &mdash; no hard cutoff.
+</p>
+<div class="chart-container"><canvas id="prodel-drop"></canvas></div>
+
+<h3>&sect;2.3 Drop Schedule: W / &radic;n<sub>d</sub></h3>
+<p class="description">
+    Time between drop evaluation rounds decreases as cumulative drops <code>n<sub>d</sub></code> grow.
+    First round fires immediately. After 100 drops, rounds fire every W/10.
+    The 1/&radic;n schedule accelerates shedding under sustained overload.
+</p>
+<div class="chart-container"><canvas id="prodel-schedule"></canvas></div>
+
+<h2>&sect;3. Probabilistic Early Shedding</h2>
+
+<h3>&sect;3.1 Early Shed Probability</h3>
+<p class="description">
+    P = (&delta;/(&delta;+&mu;)) &times; shrinkage(&mu;), where &delta; is the drop rate EWMA and &mu; is the completion rate EWMA.
+    Shown for various drop-to-completion ratios. The shrinkage factor dampens P at low throughput.
+</p>
+<div class="chart-container"><canvas id="early-shed"></canvas></div>
+
+<h2>&sect;4. Throughput Regulator</h2>
+
+<h3>&sect;4.1 Time-Weighted EWMA Alpha</h3>
+<p class="description">
+    &alpha; = 1 &minus; exp(&minus;&Delta;t / (HALF_LIFE &times; W)). Shown for HALF_LIFE = 9 and W = 100ms.
+    On-time windows (&Delta;t = 100ms) get &alpha; &approx; 0.105.
+    Long-delayed windows get more weight (staler data discounted).
+</p>
+<div class="chart-container"><canvas id="ewma-alpha"></canvas></div>
+
+<h3>&sect;4.1.1 Bayesian Shrinkage: n/(n + Z&sup2;)</h3>
+<p class="description">
+    Weights an observation of n samples against a prior of Z&sup2; = 4 pseudo-observations.
+    At n = 1: 20% trust in new data. At n = 4: 50%. At n = 100: 96%.
+    Same denominator as the Wilson score interval.
+</p>
+<div class="chart-container"><canvas id="shrinkage"></canvas></div>
+
+<h3>&sect;4.2 WoLF: IMQ Weight Function</h3>
+<p class="description">
+    w = 1/&radic;(1 + &nu;&sup2;/Z&sup2;). The Inverse Multiquadric (IMQ) kernel downweights outlier innovations.
+    At &nu; = 0: full weight (w = 1). At &nu; = Z = 2: w = 1/&radic;2 &approx; 0.71 (half-weight point in variance terms).
+    At &nu; = 6: w &approx; 0.32. Never reaches zero &mdash; even extreme outliers get some weight.
+</p>
+<div class="chart-container"><canvas id="imq-weight"></canvas></div>
+
+<h3>&sect;4.2 WoLF: Effective Kalman Gain vs Innovation</h3>
+<p class="description">
+    K<sub>eff</sub> = K &times; w, showing how the Kalman gain drops for outlier innovations.
+    At steady state with full shrinkage, K &approx; &alpha;<sub>0</sub> &approx; 0.105 for clean observations.
+    An outlier at &nu; = 4 gets K<sub>eff</sub> &approx; 0.03 &mdash; barely moves the filtered state.
+    Three curves show the effect of shrinkage (1, 4, and 20 completions).
+</p>
+<div class="chart-container"><canvas id="kalman-gain"></canvas></div>
+
+<h3>&sect;4.3.1 Variance Convergence Inflation</h3>
+<p class="description">
+    SE is inflated by 1/&radic;shrinkage(elapsedWindows/HALF_LIFE) to account for
+    the Welford variance not having converged. After 1 half-life: 2.24&times; inflation.
+    After 5 half-lives: 1.34&times;. After 20: 1.10&times;. Prevents false positives from
+    an underestimated variance during early operation.
+</p>
+<div class="chart-container"><canvas id="variance-inflation"></canvas></div>
+
+<h3>&sect;4.4 Step Formula: Increase f(d) vs Retraction f/(1+f)</h3>
+<p class="description">
+    Both increase and retraction use the convergent factor f(d) = 1 &minus; exp(&minus;d/HALF_LIFE).
+    Increase multiplies L by (1+f); retraction divides by (1+f) using f/(1+f).
+    At convergence (d &rarr; &infin;): increase doubles (f &rarr; 1), retraction halves (f/(1+f) &rarr; 0.5).
+    Retraction is the exact multiplicative inverse of increase.
+</p>
+<div class="chart-container"><canvas id="step-factors"></canvas></div>
+
+<h3>&sect;4.4 Convergent Step Sizes (L = 100)</h3>
+<p class="description">
+    Absolute step sizes for increase, retraction, and fresh decrease at L = 100.
+    Increase and fresh decrease use the same formula but grow at different rates
+    because L changes between steps. Retraction uses f/(1+f) for exact inverse.
+</p>
+<div class="chart-container"><canvas id="step-sizes"></canvas></div>
+
+<h3>&sect;4.4 Bisection Convergence (stepScale)</h3>
+<p class="description">
+    Each increase&rarr;retract&rarr;cooling cycle halves stepScale.
+    The effective first-step size shrinks exponentially: 10.5%, 5.3%, 2.6%, 1.3%, ...
+    After k cycles, the oscillation band is &le; L &times; 0.105 / 2<sup>k</sup>.
+    Convergence to within &plusmn;1 in O(log L) cycles.
+</p>
+<div class="chart-container"><canvas id="bisection"></canvas></div>
+
+<h3>&sect;4.6 Welford Variance Bias: 2(1&minus;&alpha;)/(2&minus;&alpha;)</h3>
+<p class="description">
+    The Welford EWMS underestimates the true process variance &sigma;&sup2;.
+    At &alpha; = 0.105 (HALF_LIFE = 9): bias factor &approx; 0.945 (5.5% underestimate).
+    The SE formula corrects for this via the (2(1&minus;&alpha;)) denominator.
+</p>
+<div class="chart-container"><canvas id="welford-bias"></canvas></div>
+
+<h3>Per-Lane Error Rate: Bayesian Shrinkage</h3>
+<p class="description">
+    Bayesian shrinkage factor n/(n+Z&sup2;) used to dampen per-lane error rate EWMA updates
+    for lanes with few completions. Conservative at low counts (1&ndash;3 completions),
+    converges to 1 at high counts.
+</p>
+<div class="chart-container"><canvas id="lane-shrinkage"></canvas></div>
+
+<script>
+const Z = 2;
+const Z2 = Z * Z;
+const HALF_LIFE = Math.round(2 / (1 - Math.exp(-1 / Z2)));
+
+function shrinkage(n) { return n / (n + Z2); }
+function range(start, end, step) {
+    const r = [];
+    for (let i = start; i <= end + step / 2; i += step) r.push(Math.round(i * 1000) / 1000);
+    return r;
+}
+
+const chartDefaults = {
+    responsive: true,
+    plugins: { legend: { position: 'bottom', labels: { usePointStyle: true, pointStyle: 'line' } } },
+    elements: { point: { radius: 0 }, line: { borderWidth: 2 } },
+    scales: { x: { grid: { color: '#eee' } }, y: { grid: { color: '#eee' } } }
+};
+
+// 2.3 ProDel Drop Probability
+(() => {
+    const xs = range(1, 10, 0.1);
+    new Chart(document.getElementById('prodel-drop'), {
+        type: 'line',
+        data: {
+            labels: xs.map(x => x.toFixed(1)),
+            datasets: [{
+                label: 'P(s) = 1 - tau/s',
+                data: xs.map(x => Math.max(0, 1 - 1 / x)),
+                borderColor: '#e74c3c',
+                fill: { target: 'origin', above: 'rgba(231,76,60,0.08)' }
+            }]
+        },
+        options: { ...chartDefaults,
+            scales: {
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Sojourn / tau' }, ticks: { maxTicksLimit: 10 } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Drop probability P' }, min: 0, max: 1 }
+            }
+        }
+    });
+})();
+
+// 2.3 Drop Schedule
+(() => {
+    const xs = range(1, 200, 1);
+    new Chart(document.getElementById('prodel-schedule'), {
+        type: 'line',
+        data: {
+            labels: xs,
+            datasets: [{
+                label: 'Interval = W / sqrt(n_d)',
+                data: xs.map(n => 1 / Math.sqrt(n)),
+                borderColor: '#e67e22'
+            }]
+        },
+        options: { ...chartDefaults,
+            scales: {
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Cumulative drops (n_d)' }, ticks: { maxTicksLimit: 10 } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Interval (x controlWindow)' }, min: 0 }
+            }
+        }
+    });
+})();
+
+// 3.1 Early Shed Probability
+(() => {
+    const mus = range(1, 100, 1);
+    const ratios = [0.25, 0.5, 1.0, 2.0, 4.0];
+    const colors = ['#3498db', '#2ecc71', '#e67e22', '#e74c3c', '#9b59b6'];
+    new Chart(document.getElementById('early-shed'), {
+        type: 'line',
+        data: {
+            labels: mus,
+            datasets: ratios.map((r, i) => ({
+                label: `drop/completion = ${r}`,
+                data: mus.map(mu => {
+                    const delta = r * mu;
+                    return (delta / (delta + mu)) * shrinkage(mu);
+                }),
+                borderColor: colors[i]
+            }))
+        },
+        options: { ...chartDefaults,
+            scales: {
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Completion rate EWMA (mu)' }, ticks: { maxTicksLimit: 10 } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Early shed probability P' }, min: 0, max: 1 }
+            }
+        }
+    });
+})();
+
+// 4.1 EWMA Alpha
+(() => {
+    const dts = range(10, 500, 5);
+    const W = 100;
+    new Chart(document.getElementById('ewma-alpha'), {
+        type: 'line',
+        data: {
+            labels: dts,
+            datasets: [
+                { label: 'HALF_LIFE = 4 (Z = 1)', data: dts.map(dt => 1 - Math.exp(-dt / (4 * W))), borderColor: '#2ecc71' },
+                { label: 'HALF_LIFE = 9 (Z = 2)', data: dts.map(dt => 1 - Math.exp(-dt / (9 * W))), borderColor: '#3498db' },
+                { label: 'HALF_LIFE = 19 (Z = 3)', data: dts.map(dt => 1 - Math.exp(-dt / (19 * W))), borderColor: '#e74c3c' }
+            ]
+        },
+        options: { ...chartDefaults,
+            scales: {
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Elapsed time dt (ms)' }, ticks: { maxTicksLimit: 10 } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Alpha' }, min: 0, max: 0.5 }
+            }
+        }
+    });
+})();
+
+// 4.1.1 Bayesian Shrinkage
+(() => {
+    const ns = range(0, 50, 0.5);
+    new Chart(document.getElementById('shrinkage'), {
+        type: 'line',
+        data: {
+            labels: ns,
+            datasets: [
+                { label: 'n/(n+1)  [Z=1]', data: ns.map(n => n / (n + 1)), borderColor: '#2ecc71', borderDash: [5, 3] },
+                { label: 'n/(n+4)  [Z=2]', data: ns.map(n => n / (n + 4)), borderColor: '#3498db' },
+                { label: 'n/(n+9)  [Z=3]', data: ns.map(n => n / (n + 9)), borderColor: '#e74c3c', borderDash: [5, 3] }
+            ]
+        },
+        options: { ...chartDefaults,
+            scales: {
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Observations (n)' }, ticks: { maxTicksLimit: 10 } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Shrinkage factor' }, min: 0, max: 1 }
+            }
+        }
+    });
+})();
+
+// 4.2 IMQ Weight
+(() => {
+    const vs = range(0, 8, 0.1);
+    new Chart(document.getElementById('imq-weight'), {
+        type: 'line',
+        data: {
+            labels: vs.map(v => v.toFixed(1)),
+            datasets: [
+                { label: 'w = 1/sqrt(1 + v^2/Z^2)  [likelihood weight]', data: vs.map(v => 1 / Math.sqrt(1 + v * v / Z2)), borderColor: '#3498db' },
+                { label: 'w^2  [variance weight, not used]', data: vs.map(v => 1 / (1 + v * v / Z2)), borderColor: '#e67e22', borderDash: [5, 3] }
+            ]
+        },
+        options: { ...chartDefaults,
+            scales: {
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Innovation v (log-units)' }, ticks: { maxTicksLimit: 10 } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Weight' }, min: 0, max: 1 }
+            }
+        }
+    });
+})();
+
+// 4.2 Effective Kalman Gain
+(() => {
+    const vs = range(0, 8, 0.1);
+    const alpha0 = 1 - Math.exp(-1 / HALF_LIFE);
+    const R = Z2;
+    const Q = alpha0 * alpha0 * R / (1 - alpha0);
+
+    function kEff(nu, completions) {
+        const w = 1 / Math.sqrt(1 + nu * nu / Z2);
+        const s = shrinkage(completions);
+        const rEff = R / (w * s);
+        const P = alpha0 * R / (1 - alpha0);
+        const pPred = P + Q;
+        const S = pPred + rEff;
+        return pPred / S;
+    }
+
+    new Chart(document.getElementById('kalman-gain'), {
+        type: 'line',
+        data: {
+            labels: vs.map(v => v.toFixed(1)),
+            datasets: [
+                { label: 'K_eff (n=20, high confidence)', data: vs.map(v => kEff(v, 20)), borderColor: '#3498db' },
+                { label: 'K_eff (n=4, medium)', data: vs.map(v => kEff(v, 4)), borderColor: '#e67e22' },
+                { label: 'K_eff (n=1, low confidence)', data: vs.map(v => kEff(v, 1)), borderColor: '#e74c3c', borderDash: [5, 3] }
+            ]
+        },
+        options: { ...chartDefaults,
+            scales: {
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Innovation v (log-units)' }, ticks: { maxTicksLimit: 10 } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Effective Kalman gain K' }, min: 0 }
+            }
+        }
+    });
+})();
+
+// 4.3.1 Variance Convergence Inflation
+(() => {
+    const halflives = range(0.5, 30, 0.25);
+    new Chart(document.getElementById('variance-inflation'), {
+        type: 'line',
+        data: {
+            labels: halflives.map(h => h.toFixed(1)),
+            datasets: [
+                { label: 'SE inflation = 1/sqrt(shrinkage(n/HL))',
+                  data: halflives.map(h => 1 / Math.sqrt(shrinkage(h))),
+                  borderColor: '#3498db' },
+                { label: 'Effective z (Z=2)',
+                  data: halflives.map(h => 2 / Math.sqrt(shrinkage(h))),
+                  borderColor: '#e67e22', borderDash: [5, 3] },
+                { label: 'Effective z (Z=3)',
+                  data: halflives.map(h => 3 / Math.sqrt(shrinkage(h))),
+                  borderColor: '#e74c3c', borderDash: [5, 3] }
+            ]
+        },
+        options: { ...chartDefaults,
+            scales: {
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Half-lives elapsed' }, ticks: { maxTicksLimit: 15 } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Multiplier' }, min: 0, max: 10 }
+            }
+        }
+    });
+})();
+
+// 4.4 Step Factors
+(() => {
+    const ds = range(1, 25, 1);
+    new Chart(document.getElementById('step-factors'), {
+        type: 'line',
+        data: {
+            labels: ds,
+            datasets: [
+                { label: 'f(d) = 1 - exp(-d/HL)  [increase & fresh decrease]',
+                  data: ds.map(d => 1 - Math.exp(-d / HALF_LIFE)),
+                  borderColor: '#3498db' },
+                { label: 'f/(1+f)  [retraction, exact inverse]',
+                  data: ds.map(d => { const f = 1 - Math.exp(-d / HALF_LIFE); return f / (1 + f); }),
+                  borderColor: '#e74c3c' },
+                { label: '0.5 (halving limit)',
+                  data: ds.map(() => 0.5),
+                  borderColor: '#999', borderDash: [3, 3], borderWidth: 1 }
+            ]
+        },
+        options: { ...chartDefaults,
+            scales: {
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Regulation depth d' } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Step factor (x L)' }, min: 0, max: 1 }
+            }
+        }
+    });
+})();
+
+// 4.4 Step Sizes
+(() => {
+    const ds = range(1, 15, 1);
+    const L = 100;
+    new Chart(document.getElementById('step-sizes'), {
+        type: 'line',
+        data: {
+            labels: ds,
+            datasets: [
+                { label: 'Increase step = ceil(L x f)',
+                  data: ds.map(d => Math.max(1, Math.ceil(L * (1 - Math.exp(-d / HALF_LIFE))))),
+                  borderColor: '#3498db' },
+                { label: 'Retraction step = ceil(L x f/(1+f))',
+                  data: ds.map(d => { const f = 1 - Math.exp(-d / HALF_LIFE); return Math.max(1, Math.ceil(L * f / (1 + f))); }),
+                  borderColor: '#e74c3c' }
+            ]
+        },
+        options: { ...chartDefaults,
+            plugins: { ...chartDefaults.plugins, subtitle: { display: true, text: 'L = 100', color: '#888' } },
+            scales: {
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Regulation depth d' } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Absolute step size' }, min: 0 }
+            }
+        }
+    });
+})();
+
+// 4.4 Bisection Convergence
+(() => {
+    const cycles = range(0, 10, 1);
+    const L = 1000;
+    const f1 = 1 - Math.exp(-1 / HALF_LIFE);
+    new Chart(document.getElementById('bisection'), {
+        type: 'line',
+        data: {
+            labels: cycles,
+            datasets: [
+                { label: 'stepScale',
+                  data: cycles.map(k => 0.5 ** k),
+                  borderColor: '#3498db' },
+                { label: 'First-step size (L=1000)',
+                  data: cycles.map(k => Math.max(1, Math.ceil(L * f1 * 0.5 ** k))),
+                  borderColor: '#e74c3c', yAxisID: 'y1' }
+            ]
+        },
+        options: { ...chartDefaults,
+            scales: {
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Oscillation cycle' } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'stepScale' }, min: 0, max: 1, position: 'left' },
+                y1: { title: { display: true, text: 'Step size' }, min: 0, position: 'right', grid: { drawOnChartArea: false } }
+            }
+        }
+    });
+})();
+
+// 4.6 Welford Bias
+(() => {
+    const alphas = range(0.01, 0.5, 0.005);
+    new Chart(document.getElementById('welford-bias'), {
+        type: 'line',
+        data: {
+            labels: alphas.map(a => a.toFixed(3)),
+            datasets: [{
+                label: 'E[V] / sigma^2 = 2(1-a)/(2-a)',
+                data: alphas.map(a => 2 * (1 - a) / (2 - a)),
+                borderColor: '#3498db',
+                fill: { target: { value: 1 }, above: 'rgba(231,76,60,0.05)', below: 'rgba(52,152,219,0.08)' }
+            }, {
+                label: 'Unbiased (1.0)',
+                data: alphas.map(() => 1),
+                borderColor: '#999', borderDash: [3, 3], borderWidth: 1
+            }]
+        },
+        options: { ...chartDefaults,
+            scales: {
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'EWMA smoothing parameter alpha' }, ticks: { maxTicksLimit: 10 } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Bias factor (V/sigma^2)' }, min: 0.6, max: 1.05 }
+            }
+        }
+    });
+})();
+
+// Per-Lane: Bayesian Shrinkage
+(() => {
+    const ns = range(1, 50, 1);
+    new Chart(document.getElementById('lane-shrinkage'), {
+        type: 'line',
+        data: {
+            labels: ns,
+            datasets: [
+                { label: 'Bayesian shrinkage: n/(n+Z²)',
+                  data: ns.map(n => n / (n + Z2)),
+                  borderColor: '#3498db' }
+            ]
+        },
+        options: { ...chartDefaults,
+            scales: {
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Lane completions (n)' } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Shrinkage factor' }, min: 0, max: 1 }
+            }
+        }
+    });
+})();
+</script>
+</body>
+</html>

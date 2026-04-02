@@ -1,0 +1,64 @@
+{
+  "name": "concurrex",
+  "version": "1.0.0",
+  "description": "Fully adaptive task executor. Self-regulates concurrency limits, sheds load under pressure, and schedules fairly across lanes — no manual tuning, no environment-specific configuration.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "docs",
+    "LICENSE"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run clean && npm run build",
+    "changeset": "changeset",
+    "version": "changeset version",
+    "release": "npm run build && changeset publish"
+  },
+  "keywords": [
+    "concurrency",
+    "executor",
+    "load-shedding",
+    "adaptive",
+    "backpressure",
+    "queue",
+    "rate-limiting",
+    "fairness",
+    "lanes",
+    "prodel",
+    "aqm"
+  ],
+  "license": "MIT",
+  "author": "Henrik Udnes",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/udnes99/concurrex.git"
+  },
+  "bugs": {
+    "url": "https://github.com/udnes99/concurrex/issues"
+  },
+  "homepage": "https://github.com/udnes99/concurrex",
+  "devDependencies": {
+    "@changesets/changelog-github": "^0.6.0",
+    "@changesets/cli": "^2.30.0",
+    "@types/node": "^25.5.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
