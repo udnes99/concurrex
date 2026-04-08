@@ -12,7 +12,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Executor } from "../../src/Executor.js";
+import { Executor } from "../src/Executor.js";
 
 const PORT = 9878;
 const SAMPLE_INTERVAL = 50;
@@ -184,7 +184,7 @@ async function runDegradationScenario(zScore: number): Promise<Scenario> {
     });
 
     // Warm-up: run 2×HALF_LIFE windows of steady traffic so all EWMAs
-    // and the Welford variance reach statistical steady state before
+    // and the second moment reach statistical steady state before
     // the actual test phases begin. Not recorded in charts.
     globalDelay = 10;
     backpressureEnabled = false;
@@ -296,16 +296,16 @@ function generateHtml(scenarios: Scenario[]): void {
                 i +
                 '"></canvas></div>' +
                 '<div class="legend-note">Shaded red = ProDel dropping &middot; Shaded orange = throughput degraded &middot; Dashed red = error rate</div>' +
-                '<div class="chart-label">WoLF-EWMA Filter State &mdash; log(W) where W = &int;N(t)dt / completions (Little&rsquo;s Law latency)</div>' +
-                '<div class="chart-description">Gray dashed = raw log(W) per window (noisy, outlier-prone). Blue = WoLF-filtered level (IMQ-weighted Kalman, outlier-robust). ' +
-                "When the backend degrades, raw log(W) jumps; the filter tracks the genuine shift while suppressing spikes.</div>" +
-                '<div class="chart-container-sm"><canvas id="wolf-' +
+                '<div class="chart-label">EWMA Filter State &mdash; log(W) where W = &int;N(t)dt / completions (Little&rsquo;s Law latency)</div>' +
+                '<div class="chart-description">Gray dashed = raw log(W) per window (noisy). Blue = EWMA-filtered level (shrinkage-dampened). ' +
+                "When the backend degrades, raw log(W) jumps; the filter tracks the genuine shift while dampening noise.</div>" +
+                '<div class="chart-container-sm"><canvas id="ewma-' +
                 i +
                 '"></canvas></div>' +
                 '<div class="chart-label">Latency Trend z-Test &mdash; dLogW&#x0304; (change in filtered state per window)</div>' +
-                '<div class="chart-description">Green = EWMA of dLogW&#x0304; (trend signal). Gold dashed = &plusmn;1 SE band (Welford-tracked noise level). ' +
+                '<div class="chart-description">Green = EWMA of dLogW&#x0304; (trend signal). Gold dashed = &plusmn;1 SE band (second-moment noise level). ' +
                 "Red dashed = z &times; SE threshold. Red dots = DEGRADING (z-test fires). " +
-                "The test detects sustained upward trends in the clean WoLF output &mdash; transient spikes are absorbed by the filter before reaching this stage.</div>" +
+                "The test detects sustained upward trends in the EWMA output &mdash; transient spikes are dampened by the filter before reaching this stage.</div>" +
                 '<div class="chart-container-sm"><canvas id="ztest-' +
                 i +
                 '"></canvas></div>' +
@@ -366,7 +366,7 @@ scenarios.forEach((scenario, i) => {
             plugins: { legend: { labels: { color: '#c9d1d9', usePointStyle: true, pointStyle: 'line' } } },
         },
     });
-    new Chart(document.getElementById('wolf-' + i).getContext('2d'), {
+    new Chart(document.getElementById('ewma-' + i).getContext('2d'), {
         type: 'line',
         data: { labels, datasets: [
             { label: 'log(W) raw', data: scenario.data.map(d => d.logW), borderColor: '#8b949e', borderWidth: 1, pointRadius: 0, borderDash: [3, 3] },

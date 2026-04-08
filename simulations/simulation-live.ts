@@ -16,7 +16,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Executor } from "../../src/Executor.js";
+import { Executor } from "../src/Executor.js";
 
 // ── Configuration ────────────────────────────────────────────────────
 
@@ -34,7 +34,7 @@ type Snapshot = {
     throughputDegraded: boolean;
     requestsPerSec: number;
     errorRate: number;
-    // WoLF filter state
+    // EWMA filter state
     logW: number | null;
     logWBar: number | null;
     dLogWBarEwma: number | null;
@@ -294,7 +294,7 @@ async function scenarioBurstAbsorption(): Promise<Scenario> {
 }
 
 async function scenarioThroughputDegradation(): Promise<Scenario> {
-    console.log("\n  Running: Throughput Degradation & Recovery");
+    console.log("\n  Running: Latency Step Change & Recovery");
     const executor = new Executor({ logger });
     executor.start();
     const pool = "degrade";
@@ -343,13 +343,15 @@ async function scenarioThroughputDegradation(): Promise<Scenario> {
     executor.stop();
 
     return {
-        name: "Throughput Degradation & Recovery",
+        name: "Latency Step Change & Recovery",
         description:
             "Baseline: 20, min: 2, max: 100, delayThreshold: 200ms, controlWindow: 100ms. " +
             "Continuous arrival at 200 req/sec for 36s, no gaps between phases. " +
             "Phase 1 (0–12s): backend 10ms — healthy, ~13 ESS evals. " +
-            "Phase 2 (12–24s): backend 500ms — capacity collapses, regulator decreases (retraction + fresh ramp). " +
-            "Phase 3 (24–36s): backend 10ms — regulator re-grows cautiously. CoDel sheds stale entries.",
+            "Phase 2 (12–24s): backend 500ms — latency jumps 50×. The z-test detects the step change. " +
+            "Once the EWMA adapts to 500ms as the new baseline, the trend signal returns to zero. " +
+            "The system scales up to serve demand at the new latency (500ms × 100 concurrent = 200/sec). " +
+            "Phase 3 (24–36s): backend 10ms — latency recovers, system restores. CoDel sheds stale entries during transitions.",
         data
     };
 }
@@ -471,8 +473,9 @@ async function scenarioFullOverload(): Promise<Scenario> {
         description:
             "Baseline: 10, min: 2, max: 20, delayThreshold: 100ms, controlWindow: 100ms. " +
             "Phase 1 (0–12s): 100 req/sec at 15ms — EWMA warm-up (~13 ESS evals). " +
-            "Phase 2 (12–30s): backend 400ms, 100 req/sec — both mechanisms fire (~20 ESS evals). " +
-            "CoDel drops stale entries, regulator decreases concurrency via retraction then fresh ramp. " +
+            "Phase 2 (12–30s): backend 400ms, 100 req/sec — max concurrency capped at 20, " +
+            "so capacity (20/400ms = 50/sec) cannot meet arrival (100/sec). " +
+            "CoDel drops stale entries. Z-test detects the step change during transition. " +
             "Phase 3 (30–42s): backend 15ms — system restores. Shows recovery growth.",
         data
     };
@@ -612,7 +615,7 @@ async function scenarioBackpressure(): Promise<Scenario> {
 // ── Error scenarios ──────────────────────────────────────────────────
 
 async function scenarioWidespreadErrors(): Promise<Scenario> {
-    console.log("\n  Running: Widespread Errors (dErrorRate + Lockout)");
+    console.log("\n  Running: Widespread Errors (Probabilistic Decrease)");
     const executor = new Executor({ logger });
     executor.start();
     const pool = "errors";
@@ -666,14 +669,13 @@ async function scenarioWidespreadErrors(): Promise<Scenario> {
     executor.stop();
 
     return {
-        name: "Widespread Errors (dErrorRate + Lockout)",
+        name: "Widespread Errors (Probabilistic Decrease)",
         description:
             "Baseline: 20, min: 2, max: 50, delayThreshold: 200ms. Backend 20ms throughout. " +
             "Phase 1 (0–12s): healthy, 200 req/sec — EWMA warm-up. " +
-            "Phase 2 (12–24s): 80% errors — dErrorRate spikes, regulator decreases. " +
-            "Phase 3 (24–30s): 100% errors — dErrorRate ≈ 0 but lockout test sustains decrease. " +
-            "Phase 4 (30–42s): errors stop — error rate decays, concurrency recovers. " +
-            "Shows dErrorRate for onset, lockout for sustained total failure.",
+            "Phase 2 (12–24s): 80% errors — probabilistic error decrease fires frequently (P = errorRateEwma). " +
+            "Phase 3 (24–30s): 100% errors — total failure, sustained decrease. " +
+            "Phase 4 (30–42s): errors stop — error rate decays, concurrency recovers.",
         data
     };
 }
@@ -914,8 +916,8 @@ ${scenarios
     <div class="legend-note">
         Shaded red = CoDel dropping &middot; Shaded orange = throughput degraded (latency or error) &middot; Dashed red = error rate
     </div>
-    <div class="chart-label">WoLF-EWMA Filter State</div>
-    <div class="chart-container-sm"><canvas id="wolf-${i}"></canvas></div>
+    <div class="chart-label">EWMA Filter State</div>
+    <div class="chart-container-sm"><canvas id="ewma-${i}"></canvas></div>
     <div class="chart-label">Latency Trend z-Test</div>
     <div class="chart-container-sm"><canvas id="ztest-${i}"></canvas></div>
 </div>
@@ -1082,9 +1084,9 @@ scenarios.forEach((scenario, i) => {
         },
     });
 
-    // ── WoLF filter chart: raw log(W) vs filtered logW̄ ──
-    const wolfCtx = document.getElementById('wolf-' + i).getContext('2d');
-    new Chart(wolfCtx, {
+    // ── EWMA filter chart: raw log(W) vs filtered logW̄ ──
+    const ewmaCtx = document.getElementById('ewma-' + i).getContext('2d');
+    new Chart(ewmaCtx, {
         type: 'line',
         data: {
             labels,
@@ -1100,7 +1102,7 @@ scenarios.forEach((scenario, i) => {
                     spanGaps: true,
                 },
                 {
-                    label: 'logW̄ (WoLF-filtered)',
+                    label: 'logW̄ (EWMA-filtered)',
                     data: scenario.data.map(d => d.logWBar),
                     borderColor: '#58a6ff',
                     borderWidth: 2,

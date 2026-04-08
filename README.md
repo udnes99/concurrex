@@ -45,13 +45,13 @@ Five mechanisms cooperate:
 
 1. **ProDel** (Probabilistic Delay Load-shedding) — sojourn-based AQM. Drop probability `P = 1 - threshold/sojourn`. Adaptive LIFO/FIFO admission (FIFO when healthy, LIFO when dropping to protect fresh work).
 2. **Probabilistic early shedding** — rejects new arrivals at enqueue time with `P = dropRate/(dropRate+completionRate) * shrinkage` when ProDel is dropping and pool is at capacity. Instant rejections.
-3. **WoLF-EWMA throughput regulator** — latency detection via operational Little's Law (`W = integral N(t)dt / completions`), log-transformed, smoothed by a WoLF Kalman filter (IMQ-weighted outlier rejection), with a z-test on the filtered trend. Concurrency adjusted via a convergent step formula with bisection damping for O(log L) equilibrium convergence.
+3. **EWMA throughput regulator** — latency detection via operational Little's Law (`W = integral N(t)dt / completions`), log-transformed, smoothed by a shrinkage-dampened EWMA, with a null-hypothesis z-test on the trend. Concurrency adjusted via a convergent step formula with bisection damping for O(log L) equilibrium convergence.
 4. **Per-lane error shedding** — each lane tracks its own error rate EWMA. High-error lanes probabilistically reject new requests without affecting pool-wide concurrency.
 5. **Fair lane scheduling** — round-robin across lanes (per-tenant, per-user, or shared). Prevents noisy neighbors from monopolizing capacity.
 
 ## Single-Constant Design
 
-All statistical parameters derive from one constant: `zScoreThreshold` (default: 2). This determines HALF_LIFE (EWMA decay), WoLF Kalman Q/R, IMQ outlier threshold, Bayesian shrinkage strength, warm-up period, evaluation cadence, and detection sensitivity. Configurable globally and per-pool.
+All statistical parameters derive from one constant: `zScoreThreshold` (default: 2). This determines HALF_LIFE (EWMA decay), Bayesian shrinkage strength, warm-up period, evaluation cadence, and detection sensitivity. Configurable globally and per-pool.
 
 ```typescript
 // Global default
@@ -132,7 +132,7 @@ executor.getRegulatorState("commands");    // full filter state snapshot
 
 `isOverloaded` returns `true` only during confirmed sustained overload (dropping state). Use this to pause upstream work fetching.
 
-`getRegulatorState` returns a `RegulatorState` with the filter internals: `logW`, `logWBar`, `zScore`, `degrading`, `se`, `dLogWBarEwma`, `dLogWBarVariance`, `inFlightEwma`, `completionRateEwma`, `dropRateEwma`, `errorRateEwma`, `regulationPhase`, `regulationDepth`, `elapsedWindows`, `alpha`.
+`getRegulatorState` returns a `RegulatorState` with the filter internals: `logW`, `logWBar`, `dLogWBarEwma`, `dLogWBarSM`, `ewmaSumW2`, `se`, `zScore`, `degrading`, `inFlightEwma`, `completionRateEwma`, `dropRateEwma`, `errorRateEwma`, `regulationPhase`, `regulationDepth`, `elapsedWindows`, `alpha`.
 
 ## Error Handling
 

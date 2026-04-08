@@ -52,8 +52,6 @@ type Parameters = {
     zScoreThreshold: number;
     halfLife: number;
     z2: number;
-    wolfQ: number;
-    wolfR: number;
 };
 
 type Pool = {
@@ -101,19 +99,15 @@ type Pool = {
     // same time-weighted alpha as the control loop.
     alpha: number;
 
-    // Latency detection: WoLF-EWMA on log(W) + z-test on dLogW̄.
-    // W = ∫N(t)dt / C (exact operational Little's Law, Kim & Whitt 2013).
-    // WoLF (Weighted-Observation Likelihood Filter) robustly smooths log(W)
-    // using IMQ-weighted Kalman updates: outlier observations (error spikes)
-    // are automatically downweighted. The z-test on dLogW̄ (change in filtered
-    // state) detects sustained trends on the already-clean signal. All
-    // parameters derive from zScoreThreshold. Fully self-adjusting.
+    // Latency detection: EWMA on log(W) + trend z-test.
+    // W = ∫N(t)dt / C (operational Little's Law). Shrinkage-dampened
+    // EWMA smooths log(W). Z-test on trend detects degradation.
     inFlightEwma: number | null;
     lastLogW: number | null; // Raw log(W) from the last completed window
-    logWBar: number | null; // WoLF-filtered log(W) level
-    logWBarP: number; // Kalman state uncertainty (self-maintaining)
-    dLogWBarEwma: number | null; // EWMA of dLogW̄ (trend on filtered state)
-    dLogWBarVariance: number; // Welford variance of dLogW̄
+    logWBar: number | null; // EWMA-filtered log(W) level
+    dLogWBarEwma: number | null; // EWMA of dLogWBar rate (trend per window)
+    dLogWBarSM: number; // Second moment of dLogWBar rate (EWMA of x²)
+    ewmaSumW2: number; // Sum of squared EWMA weights (effective sample size)
 
     // Convergent throughput regulator state
     regulationDepth: number;
@@ -142,17 +136,17 @@ export type PoolOptions = {
 };
 
 export type RegulatorState = {
-    /** Raw log(W) from the most recent window (before WoLF filtering). */
+    /** Raw log(W) from the most recent window (before EWMA smoothing). */
     logW: number | null;
-    /** WoLF-filtered log(W) level — the clean signal after outlier rejection. */
+    /** EWMA-filtered log(W) level (shrinkage-dampened). */
     logWBar: number | null;
-    /** Kalman state uncertainty P — high means the filter is less certain. */
-    logWBarP: number;
-    /** EWMA of dLogW̄ (change in filtered state per window) — the trend signal. */
+    /** EWMA of dLogWBar rate (trend signal per window). */
     dLogWBarEwma: number | null;
-    /** Welford variance of dLogW̄ — self-calibrates to actual noise level. */
-    dLogWBarVariance: number;
-    /** Standard error of dLogW̄ EWMA — adaptive threshold denominator. */
+    /** Second moment of dLogWBar rate (EWMA of x²) — variance estimate under H0. */
+    dLogWBarSM: number;
+    /** Sum of squared EWMA weights — effective sample size for time-varying alpha. */
+    ewmaSumW2: number;
+    /** Standard error: sqrt(dLogWBarSM × ewmaSumW2). */
     se: number;
     /** Current z-score: dLogWBarEwma / SE. Degrading when > zScoreThreshold. */
     zScore: number;
@@ -203,12 +197,12 @@ const DEFAULT_Z_SCORE_THRESHOLD = 2;
  * `isOverloaded()` returns true during dropping state for upstream back-pressure.
  *
  * **Convergent throughput regulator**: regulates the concurrency limit using
- * WoLF-EWMA-filtered latency as the degradation signal. W = ∫N(t)dt / C per
- * window (finite-interval Little's Law). The WoLF Kalman filter smooths
- * log(W) with outlier rejection via the IMQ weight function — error-contaminated
- * observations are automatically downweighted. The z-test on dLogW̄ (change in
- * filtered log-latency) detects sustained latency trends. Systemic errors are
- * handled by probabilistic decrease (P = errorRateEwma) in the gravity branch.
+ * shrinkage-dampened EWMA on log-latency as the degradation signal. W = ∫N(t)dt / C
+ * per window (finite-interval Little's Law). A shrinkage-dampened EWMA smooths
+ * log(W), with throughput-aware dampening at low observation counts. The z-test
+ * on dLogWBar (change in filtered log-latency) detects sustained latency trends.
+ * Systemic errors are handled by probabilistic decrease (P = errorRateEwma) in
+ * the gravity branch.
  *
  * **Per-lane error shedding**: each lane tracks its own error rate EWMA.
  * Lanes with high error rates probabilistically reject new requests at enqueue,
@@ -217,7 +211,7 @@ const DEFAULT_Z_SCORE_THRESHOLD = 2;
  * so the probabilistic error decrease only fires for systemic issues.
  *
  * The single constant `zScoreThreshold` controls all detection thresholds,
- * WoLF parameters, HALF_LIFE, EWMA half-life, and warm-up period.
+ * EWMA half-life, shrinkage strength, and warm-up period.
  *
  * Both increase and decrease use the same convergent step formula:
  *   step = ceil(L × (1 - e^(-depth/HALF_LIFE)) × stepScale)
@@ -275,10 +269,7 @@ export class Executor {
     private static deriveParameters(zScoreThreshold: number): Parameters {
         const z2 = zScoreThreshold * zScoreThreshold;
         const halfLife = Math.round(2 / (1 - Math.exp(-1 / z2)));
-        const wolfAlpha = 1 - Math.exp(-1 / halfLife);
-        const wolfR = z2;
-        const wolfQ = (wolfAlpha * wolfAlpha * wolfR) / (1 - wolfAlpha);
-        return { zScoreThreshold, halfLife, z2, wolfQ, wolfR };
+        return { zScoreThreshold, halfLife, z2 };
     }
 
     /** Get parameters for a pool — pool-level override if set, else executor default. */
@@ -391,9 +382,9 @@ export class Executor {
             inFlightEwma: null,
             lastLogW: null,
             logWBar: null,
-            logWBarP: zc.wolfR,
             dLogWBarEwma: null,
-            dLogWBarVariance: 0,
+            dLogWBarSM: 0,
+            ewmaSumW2: 0,
             regulationDepth: 0,
             regulationPhase: RegulationPhase.Idle,
             stepScale: 1,
@@ -450,26 +441,19 @@ export class Executor {
         const p = this.pools.get(pool);
         if (!p) throw new ArgumentError(`Pool "${pool}" does not exist.`);
 
-        const { alpha } = p;
         let se = 0;
         let zScore = 0;
-        if (p.dLogWBarEwma !== null && p.dLogWBarVariance > 0) {
-            // Use the same variance-convergence-inflated SE as isLatencyDegrading
-            // so that zScore > zScoreThreshold ↔ degrading === true.
-            const { halfLife, z2 } = this.params(p);
-            const varianceDof = p.elapsedWindows / halfLife;
-            se = Math.sqrt(
-                (p.dLogWBarVariance * alpha) / (2 * (1 - alpha) * this.shrinkage(varianceDof, z2))
-            );
+        if (p.dLogWBarEwma !== null && p.dLogWBarSM > 0) {
+            se = Math.sqrt(p.dLogWBarSM * p.ewmaSumW2);
             zScore = se > 0 ? p.dLogWBarEwma / se : 0;
         }
 
         return {
             logW: p.lastLogW,
             logWBar: p.logWBar,
-            logWBarP: p.logWBarP,
             dLogWBarEwma: p.dLogWBarEwma,
-            dLogWBarVariance: p.dLogWBarVariance,
+            dLogWBarSM: p.dLogWBarSM,
+            ewmaSumW2: p.ewmaSumW2,
             se,
             zScore,
             degrading: this.isLatencyDegrading(p),
@@ -480,7 +464,7 @@ export class Executor {
             regulationPhase: RegulationPhase[p.regulationPhase],
             regulationDepth: p.regulationDepth,
             elapsedWindows: p.elapsedWindows,
-            alpha
+            alpha: p.alpha
         };
     }
 
@@ -938,7 +922,7 @@ export class Executor {
         if (elapsed < pool.controlWindow) return;
 
         const rate = pool.completionsThisWindow;
-        const { halfLife, z2, wolfQ, wolfR } = this.params(pool);
+        const { halfLife, z2 } = this.params(pool);
 
         // Time-weighted EWMA: alpha derived from elapsed time.
         const alpha = 1 - Math.exp(-elapsed / (halfLife * pool.controlWindow));
@@ -1001,47 +985,33 @@ export class Executor {
             const logInstantW = Math.log(instantW);
             pool.lastLogW = logInstantW;
 
-            // ── WoLF-EWMA on log(W) ──
-            // Robustly smooths log-latency using IMQ-weighted Kalman updates.
-            // Outlier observations (error spikes) get near-zero weight; real
-            // changes get full weight. Then z-test on dm detects sustained trends
-            // on the already-clean smoothed output.
+            // ── Shrinkage-dampened EWMA on log(W) ──
+            // Smooths log-latency with throughput-aware dampening.
+            // At low throughput, shrinkage reduces the update weight
+            // (fewer completions → noisier W → trust prior more).
             const shrinkageFactor = this.shrinkage(pool.completionsThisWindow, z2);
 
             if (pool.logWBar === null) {
                 pool.logWBar = logInstantW;
             } else {
                 const previousState = pool.logWBar;
+                const levelAlpha = alpha * shrinkageFactor;
+                pool.logWBar += levelAlpha * (logInstantW - pool.logWBar);
 
-                // WoLF Kalman predict + update with IMQ weight.
-                const predicted = pool.logWBar;
-                const pPredicted = pool.logWBarP + wolfQ;
-                const innovation = logInstantW - predicted;
-
-                // IMQ weight: downweights outliers beyond Z in log-space.
-                // c² = Z² — innovations within Z log-units get full weight.
-                const w = 1 / Math.sqrt(1 + (innovation * innovation) / z2);
-                // Power-likelihood weighting: raising p(y|x)^w is equivalent
-                // to observing with noise R/w. Shrinkage inflates R further
-                // at low throughput (fewer completions = noisier W).
-                const rEffective = wolfR / (w * shrinkageFactor);
-                const S = pPredicted + rEffective;
-                const K = pPredicted / S;
-
-                pool.logWBar += K * innovation;
-                pool.logWBarP = (1 - K) * pPredicted;
-
-                // dLogW̄ = change in WoLF-filtered state. Operates on clean
-                // (outlier-protected) signal, so Welford variance stays stable.
-                const dLogWBar = pool.logWBar - previousState;
-                const trendAlpha = alpha * shrinkageFactor;
+                // dLogWBar = change in filtered state, normalized by dt.
+                // The EWMA decorrelates consecutive derivatives (vs raw
+                // differencing which has ρ = -0.5 autocorrelation).
+                const dt = elapsed / pool.controlWindow;
+                const dLogWBarRate = (pool.logWBar - previousState) / dt;
                 if (pool.dLogWBarEwma === null) {
-                    pool.dLogWBarEwma = dLogWBar;
+                    pool.dLogWBarEwma = dLogWBarRate;
+                    pool.ewmaSumW2 = 1; // first observation has weight 1
                 } else {
-                    const delta = dLogWBar - pool.dLogWBarEwma;
-                    pool.dLogWBarEwma += trendAlpha * delta;
-                    pool.dLogWBarVariance =
-                        (1 - trendAlpha) * (pool.dLogWBarVariance + trendAlpha * delta * delta);
+                    pool.dLogWBarEwma += alpha * (dLogWBarRate - pool.dLogWBarEwma);
+                    pool.dLogWBarSM =
+                        (1 - alpha) * pool.dLogWBarSM + alpha * dLogWBarRate * dLogWBarRate;
+                    pool.ewmaSumW2 =
+                        (1 - alpha) * (1 - alpha) * pool.ewmaSumW2 + alpha * alpha;
                 }
             }
         }
@@ -1188,34 +1158,19 @@ export class Executor {
     }
 
     /**
-     * WoLF-EWMA z-test on dm: is latency trending upward?
+     * Trend z-test: is latency trending upward?
      *
-     * dLogW̄ = change in WoLF-filtered log(W) per window. The WoLF filter
-     * robustly tracks the log-latency level (outlier-protected via IMQ);
-     * dLogW̄ captures the trend on the already-clean output.
-     *
-     * Welford variance of dLogW̄ self-calibrates to actual noise. Because
-     * dLogW̄ is derived from the WoLF-filtered state (not raw observations),
-     * the variance stays stable during step changes — the WoLF absorbed
-     * the outlier before it reached the trend detector.
-     *
-     * z = dLogW̄Ewma / SE(dLogW̄). If z > Z, latency is degrading.
-     * All parameters derive from zScoreThreshold. Fully self-adjusting.
+     * Uses EWMA of dLogWBar (trend) and its second moment for the SE
+     * denominator. Degrading when trend / SE > zScoreThreshold.
      */
     private isLatencyDegrading(pool: Pool): boolean {
-        if (pool.dLogWBarEwma === null || pool.dLogWBarVariance === 0) return false;
-        const { alpha } = pool;
-        const { halfLife, z2, zScoreThreshold } = this.params(pool);
-        // Variance convergence correction: the Welford variance converges
-        // slower than the EWMA mean (~halfLife half-lives). Inflate SE by
-        // 1/sqrt(shrinkage) where DOF = elapsedWindows/halfLife. Early on,
-        // this widens the threshold substantially (preventing false positives
-        // from an underestimated variance); it decays to ~1 after a few
-        // half-lives as the variance stabilizes.
-        const varianceDof = pool.elapsedWindows / halfLife;
-        const se = Math.sqrt(
-            (pool.dLogWBarVariance * alpha) / (2 * (1 - alpha) * this.shrinkage(varianceDof, z2))
-        );
+        if (pool.dLogWBarEwma === null || pool.dLogWBarSM === 0) return false;
+        const { zScoreThreshold } = this.params(pool);
+        // SE = sqrt(SM × sumW2). SM estimates σ² under H0. sumW2 is the
+        // exact sum of squared EWMA weights — generalizes α/(2-α) to
+        // time-varying α, giving correct effective sample size after
+        // idle gaps and irregular window timing.
+        const se = Math.sqrt(pool.dLogWBarSM * pool.ewmaSumW2);
         return pool.dLogWBarEwma > zScoreThreshold * se;
     }
 
