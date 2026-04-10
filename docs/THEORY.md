@@ -31,8 +31,8 @@ A formal treatment of the mechanisms in the Executor: **ProDel** (Probabilistic 
 
 - $\hat{L}_k$ — EWMA of in-flight count (`inFlightEwma`)
 - $\bar{m}_k$ — shrinkage-dampened EWMA of $\log(W)$ (`logWBar`)
-- $\hat{v}_k$ — EWMA of trend $v = (\bar{m}_k - \bar{m}_{k-1})/\Delta t$ (`dLogWBarEwma`)
-- $S_k^{(2)}$ — second moment of trend $\text{EWMA}(v^2)$ (`dLogWBarSM`)
+- $\hat{v}_k$ — EWMA of shrinkage-dampened trend (`dLogWBarEwma`); input is $v_k \times s_k$ where $s_k$ is per-window shrinkage
+- $S_k^{(2)}$ — second moment of raw trend $\text{EWMA}(v_k^2)$ (`dLogWBarSM`); uses unshrunk $v_k$
 - $W_k^{(2)}$ — sum of squared EWMA weights (`ewmaSumW2`)
 
 **Error tracking state.** Per window:
@@ -246,12 +246,13 @@ where $n$ is the observation count backing the current window's measurement, and
 | 50 | 0.93 |
 | 100 | 0.96 |
 
-**Where applied:** completion rate, drop rate, error rate, log(W) level EWMA, and early shedding probability. The relevant $n$ differs per signal:
+**Where applied:** completion rate, drop rate, error rate, log(W) level EWMA, trend EWMA input, and early shedding probability. The relevant $n$ differs per signal:
 
 | Signal | $n$ |
 |--------|-----|
 | Completion rate, drop rate, error rate | `completionsThisWindow` |
 | log(W) level EWMA | `completionsThisWindow` (shrinkage-scaled alpha dampens noisy low-throughput windows) |
+| Trend EWMA input | `completionsThisWindow` (shrinkage on the derivative value, not the alpha — see §4.3.1) |
 | Early shedding | `completionRateEwma` (smoothed throughput) |
 | Per-lane error rate | $c_\ell$ (lane's cumulative completions) |
 
@@ -261,16 +262,15 @@ Given completion count $r_k$ and drop count $d_k$ for window $k$, and $\alpha_c 
 
 **Completion rate update:**
 
-$$\delta_k = r_k - \hat\mu_{k-1}$$
-$$\hat\mu_k = \hat\mu_{k-1} + \alpha_c \delta_k$$
+$$\hat\mu_k = (1 - \alpha_c) \hat\mu_{k-1} + \alpha_c r_k$$
 
 **Drop rate update:**
 
-$$\hat\delta_k = \hat\delta_{k-1} + \alpha_c (d_k - \hat\delta_{k-1})$$
+$$\hat\delta_k = (1 - \alpha_c) \hat\delta_{k-1} + \alpha_c d_k$$
 
 **In-flight EWMA update:**
 
-$$\hat{L}_k = \hat{L}_{k-1} + \alpha_k (F_k - \hat{L}_{k-1})$$
+$$\hat{L}_k = (1 - \alpha_k) \hat{L}_{k-1} + \alpha_k F_k$$
 
 **Operational Little's Law latency (Kim & Whitt, 2013):**
 
@@ -288,7 +288,7 @@ $$m_k = \log(W_k) = \log\left(\frac{\int N(t)\,dt}{r_k}\right)$$
 
 Level EWMA update (shrinkage-dampened):
 
-$$\bar{m}_k = \bar{m}_{k-1} + (\alpha_k \times \text{shrinkage}(r_k)) \times (m_k - \bar{m}_{k-1})$$
+$$\alpha_{\text{level}} = \alpha_k \times \text{shrinkage}(r_k), \quad \bar{m}_k = (1 - \alpha_{\text{level}}) \bar{m}_{k-1} + \alpha_{\text{level}} \, m_k$$
 
 where $\text{shrinkage}(r_k) = r_k / (r_k + Z^2)$ dampens the update for low-throughput windows.
 
@@ -300,17 +300,21 @@ $$v_k = \frac{\bar{m}_k - \bar{m}_{k-1}}{\Delta t_k}, \quad \Delta t_k = \frac{t
 
 where $W$ is `controlWindow`. Dividing by $\Delta t$ prevents idle gaps from producing a large trend signal — a one-time level shift spread over many windows is not a sustained per-window trend.
 
-**EWMA of trend:**
+**EWMA of trend (shrinkage-dampened input):**
 
-$$\hat{v}_k = \hat{v}_{k-1} + \alpha_k (v_k - \hat{v}_{k-1})$$
+$$\hat{v}_k = (1 - \alpha_k) \hat{v}_{k-1} + \alpha_k \bigl(v_k \times s_k\bigr)$$
 
-where $\alpha_k = 1 - e^{-\Delta t_k / H}$ is the time-weighted EWMA alpha. After idle ($\Delta t \gg 1$), $\alpha \to 1$ and the EWMA resets to the current observation.
+where $\alpha_k = 1 - e^{-\Delta t_k / H}$ is the time-weighted EWMA alpha, and $s_k = r_k / (r_k + Z^2)$ is the per-window Bayesian shrinkage factor. The derivative $v_k$ is multiplied by the shrinkage factor before entering the trend EWMA. This intentionally breaks the shrinkage cancellation that holds for the level EWMA: at low throughput, the trend signal is dampened while the SE remains honest, making the z-test conservative (see §4.3.1 for the proof).
+
+After idle ($\Delta t \gg 1$), $\alpha \to 1$ and the EWMA resets to the current (shrinkage-dampened) observation.
 
 **Second moment of trend (variance estimator under $H_0$):**
 
 $$S_k^{(2)} = (1 - \alpha_k) S_{k-1}^{(2)} + \alpha_k v_k^2$$
 
-This tracks $E[v^2]$, the second moment of the trend signal. Under the null hypothesis $H_0: E[v] = 0$ (latency is stable), the second moment equals the variance: $E[v^2] = \text{Var}(v) = \sigma^2$. This is the key insight: when the expected value is zero, the second moment is an unbiased estimator of variance without needing to subtract a mean. Under $H_1$ ($E[v] = \mu > 0$), $E[S^{(2)}] = \sigma^2 + \mu^2$, which keeps the denominator elevated and causes the z-score to saturate at $\sqrt{(2-\alpha)/\alpha} \approx 4.25$ — sufficient for binary detection.
+Note: $S^{(2)}$ uses the **raw** derivative $v_k$, not the shrinkage-dampened value $v_k \times s_k$. This asymmetry is critical — it ensures $S^{(2)}$ honestly tracks the noise level of the derivative signal regardless of throughput, while the trend EWMA $\hat{v}$ is skeptical of low-throughput observations.
+
+This tracks $E[v^2]$, the second moment of the trend signal. Under the null hypothesis $H_0: E[v] = 0$ (latency is stable), the second moment equals the variance: $E[v^2] = \text{Var}(v) = \sigma^2$. Under $H_1$ ($E[v] = \mu > 0$), $E[S^{(2)}] = \sigma^2 + \mu^2$, which keeps the denominator elevated — sufficient for binary detection.
 
 **Effective sample size ($W^{(2)}$ recursion):**
 
@@ -324,7 +328,7 @@ This generalizes $\alpha/(2-\alpha)$ to time-varying $\alpha$. After idle ($\alp
 
 **Error rate (error ratio — errors/completions):**
 
-$$\hat{E}_k = \hat{E}_{k-1} + \alpha_c \bigl(\tfrac{e_k}{r_k} - \hat{E}_{k-1}\bigr)$$
+$$\hat{E}_k = (1 - \alpha_c) \hat{E}_{k-1} + \alpha_c \tfrac{e_k}{r_k}$$
 
 where $\alpha_c = \alpha_k \times r_k / (r_k + Z^2)$ (Bayesian shrinkage-scaled alpha on completions).
 
@@ -336,7 +340,7 @@ $$\alpha_\ell^{\text{time}} = 1 - \exp\left(\frac{-\max(1, t - t_\ell)}{H \cdot 
 
 $$\alpha_\ell = \alpha_\ell^{\text{time}} \times \frac{c_\ell}{c_\ell + Z^2}$$
 
-$$\hat{p}_\ell \leftarrow \hat{p}_\ell + \alpha_\ell \bigl([e] - \hat{p}_\ell\bigr)$$
+$$\hat{p}_\ell \leftarrow (1 - \alpha_\ell) \hat{p}_\ell + \alpha_\ell [e]$$
 
 where $[e] = 1$ if the task errored, $0$ otherwise, and $c_\ell$ is the lane's cumulative completion count. The $\max(1, \cdot)$ ensures rapid completions at the same timestamp still contribute weight. The Bayesian shrinkage factor $c_\ell/(c_\ell + Z^2)$ dampens the update for lanes with few completions — a lane with 1 completion gets only 20% of the full alpha, a lane with 4 completions gets 50%, and a lane with 10 gets 71%, preventing noisy early estimates from causing aggressive per-lane shedding. This uses the same Bayesian framework as all other signals.
 
@@ -358,13 +362,46 @@ $$\text{SE} = \sqrt{S^{(2)} \cdot W^{(2)}}$$
 
 where $S^{(2)} = \text{EWMA}(v^2)$ estimates $\sigma^2$ under $H_0$ (since $E[v^2] = \text{Var}(v)$ when $E[v] = 0$), and $W^{(2)}$ is the effective sample size correction. The z-statistic:
 
-$$z = \frac{\hat{v}}{\text{SE}} \sim N(0, 1) \quad \text{under } H_0$$
+$$z = \frac{\hat{v}}{\text{SE}}$$
 
-**Latency is degrading** when $z > \sigma_D$ (one-sided test). At $\sigma_D = 2$: false positive rate $\approx 2.3\%$ per time constant evaluation.
+**Latency is degrading** when $z > \sigma_D$ (one-sided test). At $\sigma_D = 2$: false positive rate $\leq 2.3\%$ per time constant evaluation (see below).
 
-Bayesian shrinkage enters through the level EWMA alpha, not the z-test threshold. At low throughput, the shrinkage factor is small, so the level update is dampened, producing smaller derivatives $v$. This dampens both the EWMA numerator and $S^{(2)}$ equally, preserving $z \sim N(0,1)$ regardless of throughput.
+**Two layers of shrinkage, one cancellation.** Bayesian shrinkage enters at two points:
 
-**Idle and sparse traffic handling.** Two mechanisms cooperate: (1) The time-weighted alpha $\alpha_k = 1 - e^{-\Delta t / (H \cdot W)}$ approaches 1 after long idle gaps, so the first observation after idle resets the EWMA to the current value. (2) The sum of squared weights $W^{(2)}$ correctly tracks the effective sample size under time-varying $\alpha$. After idle or irregular gaps, $W^{(2)}$ is large (few effective samples, wide SE), and gradually returns to $\alpha/(2-\alpha)$ as normal observations accumulate.
+1. **Level shrinkage** (on the EWMA alpha): dampens $\bar{m}_k$ updates at low throughput, producing smaller derivatives $v_k$. This cancels in the z-score because both $\hat{v}$ and $S^{(2)}$ see the same dampened $v_k$.
+
+2. **Trend shrinkage** (on the derivative value): the trend EWMA input is $v_k \times s_k$, but $S^{(2)}$ uses the raw $v_k^2$. This does **not** cancel — it makes the z-test conservative at low throughput.
+
+Under $H_0$ with approximately constant shrinkage $s$:
+
+$$\hat{v} = \text{EWMA}(s \cdot v_k), \quad S^{(2)} = \text{EWMA}(v_k^2)$$
+
+$$\text{Var}(\hat{v}) = s^2 \cdot \sigma^2 \cdot W^{(2)}, \quad \text{SE}^2 = \sigma^2 \cdot W^{(2)}$$
+
+$$\text{Var}(z) = \frac{\text{Var}(\hat{v})}{\text{SE}^2} = s^2$$
+
+Therefore $z \sim N(0, s^2)$ under $H_0$, where $s = r_k/(r_k + Z^2) \leq 1$. The false positive rate is:
+
+$$P(z > \sigma_D \mid H_0) = \Phi(-\sigma_D / s)$$
+
+| Completions/window | $s$ | FPR |
+|---|---|---|
+| 2 | 0.33 | $\Phi(-6.1) \approx 0$ |
+| 5 | 0.56 | $\Phi(-3.6) = 0.02\%$ |
+| 10 | 0.71 | $\Phi(-2.8) = 0.26\%$ |
+| 20 | 0.83 | $\Phi(-2.4) = 0.82\%$ |
+| 50 | 0.93 | $\Phi(-2.15) = 1.6\%$ |
+| $\infty$ | 1.0 | $\Phi(-2.0) = 2.3\%$ |
+
+The nominal FPR (2.3%) is an upper bound, achieved at infinite throughput.
+
+**Detection power under $H_1$.** Under a sustained trend $\mu$, the level EWMA lag produces $E[v] = \mu$ regardless of shrinkage (level shrinkage cancels in the derivative). The trend EWMA converges to $E[\hat{v}] = s \cdot \mu$. Detection requires $z > \sigma_D$, i.e.:
+
+$$s \cdot z_0 > \sigma_D \quad \Longleftrightarrow \quad r_k > Z^2 \cdot \frac{\sigma_D}{z_0 - \sigma_D}$$
+
+where $z_0$ is the z-score without trend shrinkage. A signal producing $z_0 = 3$ requires $\geq 8$ completions/window to detect. This is the intended tradeoff: more skepticism at low throughput, where $W$ estimates are noisier.
+
+**Idle and sparse traffic handling.** Two mechanisms cooperate: (1) The time-weighted alpha $\alpha_k = 1 - e^{-\Delta t / (H \cdot W)}$ approaches 1 after long idle gaps, so the first observation after idle resets the EWMA to the current value. (2) The sum of squared weights $W^{(2)}$ correctly tracks the effective sample size under time-varying $\alpha$. After idle or irregular gaps, $W^{(2)}$ is large (few effective samples, wide SE), and gradually returns to $\alpha/(2-\alpha)$ as normal observations accumulate. (3) Trend shrinkage dampens the signal proportionally to throughput, preventing stale low-throughput observations from producing false positives during drain periods.
 
 ##### 4.3.1.1 Per-lane error rate: Bayesian shrinkage
 
@@ -384,18 +421,22 @@ Pool-wide error detection (error spread significance, dErrorRate z-test) has bee
 
 **Why this replaces pool-wide error detection.** The previous design used error spread (proportion of lanes with errors) and dErrorRate (trend in error ratio) to detect systemic errors. This required tracking `laneKeysCompletedThisWindow`, `laneKeysErroredThisWindow`, `errorSpreadEwma`, `activeLanesEwma`, `dErrorRateEwma`, and `dErrorRateVariance`. The new design achieves the same goal — decreasing concurrency for systemic errors while ignoring localized ones — with zero additional state. Per-lane shedding naturally filters localized errors, so the aggregate `errorRateEwma` is already a reliable systemic signal.
 
-**Theorem 7 (False positive rate).** *Under $H_0$, $z \sim N(0,1)$. Therefore:*
-- *$P(\text{false positive}) = \Phi(-\sigma_D) \approx 0.0228$ per time constant evaluation, independent of throughput.*
-- *Bayesian shrinkage scales both the trend signal and its second moment equally — the shrinkage factor cancels in the z-score.*
+**Theorem 7 (Conservative false positive rate).** *Under $H_0$ with per-window shrinkage $s_k = r_k/(r_k + Z^2)$, assuming approximately constant $s$ within the EWMA window:*
 
-**Theorem 8 (Detection under $H_1$: the test cannot miss severe degradation).** *Under $H_1$ ($E[v] = \mu > 0$), the second moment $S^{(2)} \to \sigma^2 + \mu^2$. The z-score becomes:*
+$$z \sim N(0, s^2), \quad P(\text{false positive}) = \Phi(-\sigma_D / s) \leq \Phi(-\sigma_D) \approx 0.0228$$
 
-$$z = \frac{\mu}{\sqrt{(\sigma^2 + \mu^2) \cdot W^{(2)}}} = \sqrt{\frac{1}{W^{(2)}}} \cdot \frac{\mu}{\sqrt{\sigma^2 + \mu^2}}$$
+*The FPR is bounded above by the nominal rate. At high throughput ($s \to 1$), the bound is tight. At low throughput, the test is conservative: with 2 completions/window ($s = 0.33$), $P(\text{FP}) = \Phi(-6.1) \approx 0$.*
 
-*Three regimes:*
+*Proof.* Level shrinkage dampens $v_k$ by factor $s$ (via $\alpha_{\text{eff}} = \alpha \cdot s$). Trend shrinkage applies an additional factor $s$ to the EWMA input. The second moment $S^{(2)} = \text{EWMA}(v_k^2)$ uses unshrunk $v_k$. Therefore: $\text{Var}(\hat{v}) = s^2 \cdot \text{Var}(v) \cdot W^{(2)}$, $\text{SE}^2 = \text{Var}(v) \cdot W^{(2)}$, and $\text{Var}(z) = s^2$. Since $s \leq 1$, $P(z > \sigma_D) \leq P(N(0,1) > \sigma_D)$. $\square$
+
+**Theorem 8 (Detection under $H_1$: the test cannot miss severe degradation at sufficient throughput).** *Under $H_1$ ($E[v] = \mu > 0$), the trend EWMA converges to $E[\hat{v}] = s \cdot \mu$. Detection requires:*
+
+$$s \cdot z_0 > \sigma_D \quad \Longleftrightarrow \quad r_k > Z^2 \cdot \frac{\sigma_D}{z_0 - \sigma_D}$$
+
+*where $z_0 = \mu / \sqrt{(\sigma^2 + \mu^2) \cdot W^{(2)}}$ is the z-score without trend shrinkage. Three regimes at high throughput ($s \approx 1$):*
 - *Small signal ($\mu < 0.53\sigma$): $z < \sigma_D$ — not detected. The signal is below the noise floor; no test could reliably detect it.*
 - *Moderate signal ($\mu \approx \sigma$): $z \approx 3$ — detected. The trend exceeds the noise level.*
-- *Severe degradation ($\mu \gg \sigma$): $z \to \sqrt{(2-\alpha)/\alpha} \approx 4.25$ — always detected. The z-score saturates because $S^{(2)}$ includes $\mu^2$, but the saturation value exceeds $\sigma_D = 2$, so detection is guaranteed.*
+- *Severe degradation ($\mu \gg \sigma$): $z \to s \cdot \sqrt{(2-\alpha)/\alpha}$ — always detected at sufficient throughput. The z-score saturates because $S^{(2)}$ includes $\mu^2$, but the saturation value exceeds $\sigma_D$ when $s > \sigma_D / \sqrt{(2-\alpha)/\alpha} \approx 0.47$, i.e., $r_k \geq 4$ completions/window.*
 
 *The saturation means the z-score indicates presence of degradation (binary), not severity. Severity is encoded through persistence: sustained degradation keeps the z-test firing across time constant evaluations, incrementing the regulation depth and producing progressively larger concurrency decreases.*
 

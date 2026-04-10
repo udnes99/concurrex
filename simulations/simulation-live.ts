@@ -348,9 +348,10 @@ async function scenarioThroughputDegradation(): Promise<Scenario> {
             "Baseline: 20, min: 2, max: 100, delayThreshold: 200ms, controlWindow: 100ms. " +
             "Continuous arrival at 200 req/sec for 36s, no gaps between phases. " +
             "Phase 1 (0–12s): backend 10ms — healthy, ~13 ESS evals. " +
-            "Phase 2 (12–24s): backend 500ms — latency jumps 50×. The z-test detects the step change. " +
-            "Once the EWMA adapts to 500ms as the new baseline, the trend signal returns to zero. " +
-            "The system scales up to serve demand at the new latency (500ms × 100 concurrent = 200/sec). " +
+            "Phase 2 (12–24s): backend 500ms — latency jumps 50×. A step change produces a transient derivative " +
+            "(not a sustained trend), so the z-test correctly does not trigger a decrease. CoDel handles immediate " +
+            "queue shedding. The EWMA adapts to 500ms as the new baseline, then the system scales up to serve " +
+            "demand at the new latency (500ms × 100 concurrent = 200/sec). " +
             "Phase 3 (24–36s): backend 10ms — latency recovers, system restores. CoDel sheds stale entries during transitions.",
         data
     };

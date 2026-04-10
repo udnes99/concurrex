@@ -938,7 +938,7 @@ export class Executor {
         if (pool.completionRateEwma === null) {
             pool.completionRateEwma = rate;
         } else {
-            pool.completionRateEwma += countAlpha * (rate - pool.completionRateEwma);
+            pool.completionRateEwma = (1 - countAlpha) * pool.completionRateEwma + countAlpha * rate;
         }
 
         // Update drop rate EWMA (for probabilistic early shedding).
@@ -946,7 +946,7 @@ export class Executor {
         if (pool.dropRateEwma === null) {
             pool.dropRateEwma = drops;
         } else {
-            pool.dropRateEwma += countAlpha * (drops - pool.dropRateEwma);
+            pool.dropRateEwma = (1 - countAlpha) * pool.dropRateEwma + countAlpha * drops;
         }
         pool.dropsThisWindow = 0;
 
@@ -961,7 +961,7 @@ export class Executor {
             if (pool.errorRateEwma === null) {
                 pool.errorRateEwma = instantErrorRate;
             } else {
-                pool.errorRateEwma += errorAlpha * (instantErrorRate - pool.errorRateEwma);
+                pool.errorRateEwma = (1 - errorAlpha) * pool.errorRateEwma + errorAlpha * instantErrorRate;
             }
         }
 
@@ -972,7 +972,7 @@ export class Executor {
         pool.inFlightEwma =
             pool.inFlightEwma === null
                 ? pool.inFlight
-                : pool.inFlightEwma + alpha * (pool.inFlight - pool.inFlightEwma);
+                : (1 - alpha) * pool.inFlightEwma + alpha * pool.inFlight;
 
         // ── Pure finite-interval Little's Law: W = ∫N(t)dt / C ──
         // Exact operational Little's Law (Kim & Whitt, 2013).
@@ -996,7 +996,7 @@ export class Executor {
             } else {
                 const previousState = pool.logWBar;
                 const levelAlpha = alpha * shrinkageFactor;
-                pool.logWBar += levelAlpha * (logInstantW - pool.logWBar);
+                pool.logWBar = (1 - levelAlpha) * pool.logWBar + levelAlpha * logInstantW;
 
                 // dLogWBar = change in filtered state, normalized by dt.
                 // The EWMA decorrelates consecutive derivatives (vs raw
@@ -1004,10 +1004,15 @@ export class Executor {
                 const dt = elapsed / pool.controlWindow;
                 const dLogWBarRate = (pool.logWBar - previousState) / dt;
                 if (pool.dLogWBarEwma === null) {
-                    pool.dLogWBarEwma = dLogWBarRate;
+                    pool.dLogWBarEwma = dLogWBarRate * shrinkageFactor;
                     pool.ewmaSumW2 = 1; // first observation has weight 1
                 } else {
-                    pool.dLogWBarEwma += alpha * (dLogWBarRate - pool.dLogWBarEwma);
+                    // Shrink the derivative before feeding it into the trend
+                    // EWMA, but let the second moment see the raw value.
+                    // This intentionally breaks the shrinkage cancellation:
+                    // at low throughput, the signal is dampened while the SE
+                    // stays honest → z is conservative → fewer false positives.
+                    pool.dLogWBarEwma = (1 - alpha) * pool.dLogWBarEwma + alpha * (dLogWBarRate * shrinkageFactor);
                     pool.dLogWBarSM =
                         (1 - alpha) * pool.dLogWBarSM + alpha * dLogWBarRate * dLogWBarRate;
                     pool.ewmaSumW2 =
@@ -1137,7 +1142,7 @@ export class Executor {
                 // completions — prevents noisy early estimates from causing
                 // aggressive per-lane shedding.
                 const laneAlpha = timeAlpha * this.shrinkage(lane.completions, z2_);
-                lane.errorRateEwma += laneAlpha * ((errored ? 1 : 0) - lane.errorRateEwma);
+                lane.errorRateEwma = (1 - laneAlpha) * lane.errorRateEwma + laneAlpha * (errored ? 1 : 0);
                 lane.lastCompletionTime = now;
 
                 if (lane.entries.length === 0 && lane.inFlight === 0) {

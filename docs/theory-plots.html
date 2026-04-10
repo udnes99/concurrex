@@ -112,9 +112,9 @@ Compare against the <a href="../simulations/executor-simulation-live.html">live 
 
 <h3>&sect;4.3 Second Moment: E[X&sup2;] = &sigma;&sup2; under H0</h3>
 <p class="description">
-    Under H0 (E[dLogWBarRate] = 0), the second moment SM = EWMA(x&sup2;) is an unbiased estimator
-    of &sigma;&sup2;: when E[X] = 0, E[X&sup2;] = Var(X) = &sigma;&sup2;. No bias correction needed.
-    SE = &radic;(SM &times; sumW2) = &sigma;/&radic;n<sub>eff</sub>, giving z ~ N(0,1) under H0.
+    Under H0 (E[dLogWBarRate] = 0), the second moment SM = EWMA(v&sup2;) uses the <strong>raw</strong> (unshrunk)
+    derivative v, giving an unbiased estimator of &sigma;&sup2;. The trend EWMA input is shrinkage-dampened
+    (v &times; s), so z ~ N(0, s&sup2;) under H0 &mdash; conservative at low throughput (s &lt; 1).
 </p>
 <div class="chart-container"><canvas id="second-moment"></canvas></div>
 
