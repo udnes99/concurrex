@@ -45,7 +45,7 @@ Five mechanisms cooperate:
 
 1. **ProDel** (Probabilistic Delay Load-shedding) — sojourn-based AQM. Drop probability `P = 1 - threshold/sojourn`. Adaptive LIFO/FIFO admission (FIFO when healthy, LIFO when dropping to protect fresh work).
 2. **Probabilistic early shedding** — rejects new arrivals at enqueue time with `P = dropRate/(dropRate+completionRate) * shrinkage` when ProDel is dropping and pool is at capacity. Instant rejections.
-3. **EWMA throughput regulator** — latency detection via operational Little's Law (`W = integral N(t)dt / completions`), log-transformed, smoothed by a shrinkage-dampened EWMA, with a null-hypothesis z-test on the trend. Concurrency adjusted via a convergent step formula with bisection damping for O(log L) equilibrium convergence.
+3. **EWMA throughput regulator** — latency detection via operational Little's Law (`W = integral N(t)dt / completions`), log-transformed, smoothed by a shrinkage-dampened EWMA, with a null-hypothesis z-test on the trend. Trend input is shrinkage-dampened (conservative at low throughput) while the variance estimator sees raw values — the z-test false positive rate scales from ~0% at 2 completions/window to the nominal 2.3% at high throughput. Concurrency adjusted via a convergent step formula with bisection damping for O(log L) equilibrium convergence.
 4. **Per-lane error shedding** — each lane tracks its own error rate EWMA. High-error lanes probabilistically reject new requests without affecting pool-wide concurrency.
 5. **Fair lane scheduling** — round-robin across lanes (per-tenant, per-user, or shared). Prevents noisy neighbors from monopolizing capacity.
 
