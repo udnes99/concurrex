@@ -51,7 +51,7 @@ Five mechanisms cooperate:
 
 ## Single-Constant Design
 
-All statistical parameters derive from one constant: `zScoreThreshold` (default: 2). This determines HALF_LIFE (EWMA decay), Bayesian shrinkage strength, warm-up period, evaluation cadence, and detection sensitivity. Configurable globally and per-pool.
+All statistical parameters derive from one constant: `zScoreThreshold` (default: 2). This determines TIME_CONSTANT (EWMA decay), Bayesian shrinkage strength, warm-up period, evaluation cadence, and detection sensitivity. Configurable globally and per-pool.
 
 ```typescript
 // Global default
@@ -198,7 +198,7 @@ class Executor {
 
     // Derived constants (read-only, executor-level defaults)
     readonly zScoreThreshold: number;
-    readonly halfLife: number;
+    readonly timeConstant: number;
 }
 ```
 

@@ -50,7 +50,7 @@ type DebouncedEntry<T = unknown> = {
 
 type Parameters = {
     zScoreThreshold: number;
-    halfLife: number;
+    timeConstant: number;
     z2: number;
 };
 
@@ -211,12 +211,12 @@ const DEFAULT_Z_SCORE_THRESHOLD = 2;
  * so the probabilistic error decrease only fires for systemic issues.
  *
  * The single constant `zScoreThreshold` controls all detection thresholds,
- * EWMA half-life, shrinkage strength, and warm-up period.
+ * EWMA time constant, shrinkage strength, and warm-up period.
  *
  * Both increase and decrease use the same convergent step formula:
- *   step = ceil(L × (1 - e^(-depth/HALF_LIFE)) × stepScale)
+ *   step = ceil(L × (1 - e^(-depth/TIME_CONSTANT)) × stepScale)
  *
- * The step converges to L×stepScale over HALF_LIFE evaluations. Bisection
+ * The step converges to L×stepScale over TIME_CONSTANT evaluations. Bisection
  * damping: each increase→retract→cooling cycle halves stepScale, so subsequent
  * cycles use finer steps — converging to within ±1 of equilibrium in O(log L)
  * cycles. stepScale resets to 1 on Restoring or Decreasing. At convergence,
@@ -230,7 +230,7 @@ const DEFAULT_Z_SCORE_THRESHOLD = 2;
  *   - Decreasing: fresh decrease ramp after retraction exhausted.
  *   - Restoring: converging toward baseline via gradual convergent steps.
  *
- * **Six branches per HALF_LIFE evaluation** (every HALF_LIFE windows after warmup):
+ * **Six branches per TIME_CONSTANT evaluation** (every TIME_CONSTANT windows after warmup):
  *   1. Latency degrading → decrease (retract or fresh ramp).
  *   2. Cooling (after decrease) → reset to Idle, one-eval pause.
  *   3. Queue pressure → increase (only when not in decrease sequence).
@@ -244,8 +244,8 @@ const DEFAULT_Z_SCORE_THRESHOLD = 2;
 export class Executor {
     /** Default z-score threshold (used by pools that don't override). */
     public readonly zScoreThreshold: number;
-    /** Default EWMA half-life in control windows. */
-    public readonly halfLife: number;
+    /** Default EWMA time constant in control windows. */
+    public readonly timeConstant: number;
 
     private readonly defaults: Parameters;
     private readonly logger: Logger;
@@ -262,14 +262,14 @@ export class Executor {
         }
         this.defaults = Executor.deriveParameters(z);
         this.zScoreThreshold = this.defaults.zScoreThreshold;
-        this.halfLife = this.defaults.halfLife;
+        this.timeConstant = this.defaults.timeConstant;
     }
 
     /** Derive all statistical parameters from a single z-score threshold. */
     private static deriveParameters(zScoreThreshold: number): Parameters {
         const z2 = zScoreThreshold * zScoreThreshold;
-        const halfLife = Math.round(2 / (1 - Math.exp(-1 / z2)));
-        return { zScoreThreshold, halfLife, z2 };
+        const timeConstant = Math.round(2 / (1 - Math.exp(-1 / z2)));
+        return { zScoreThreshold, timeConstant, z2 };
     }
 
     /** Get parameters for a pool — pool-level override if set, else executor default. */
@@ -378,7 +378,7 @@ export class Executor {
             elapsedWindows: 0,
             errorsThisWindow: 0,
             errorRateEwma: null,
-            alpha: 1 - Math.exp(-1 / zc.halfLife),
+            alpha: 1 - Math.exp(-1 / zc.timeConstant),
             inFlightEwma: null,
             lastLogW: null,
             logWBar: null,
@@ -405,11 +405,11 @@ export class Executor {
     }
 
     /** Returns whether throughput is degraded (latency worsening).
-     *  Only meaningful after HALF_LIFE windows. */
+     *  Only meaningful after TIME_CONSTANT windows. */
     public isThroughputDegraded(pool: string): boolean {
         const p = this.pools.get(pool);
         if (!p) throw new ArgumentError(`Pool "${pool}" does not exist.`);
-        if (p.elapsedWindows < this.params(p).halfLife) return false;
+        if (p.elapsedWindows < this.params(p).timeConstant) return false;
         return this.isLatencyDegrading(p);
     }
 
@@ -880,11 +880,11 @@ export class Executor {
      *
      * **Per-window:** EWMA updates for completion rate, inFlight, W, dW.
      *
-     * **Per-HALF_LIFE:** concurrency adjustment based on degradation signals.
+     * **Per-TIME_CONSTANT:** concurrency adjustment based on degradation signals.
      * Both increase and decrease use the same convergent formula:
-     *   step = ceil(L × (1 - e^(-depth/HALF_LIFE)))
-     * converging to L over HALF_LIFE evaluations. Severity is encoded through
-     * persistence: sustained degradation increments depth each HALF_LIFE period,
+     *   step = ceil(L × (1 - e^(-depth/TIME_CONSTANT)))
+     * converging to L over TIME_CONSTANT evaluations. Severity is encoded through
+     * persistence: sustained degradation increments depth each TIME_CONSTANT period,
      * producing ever-larger steps naturally.
      *
      * **Regulation phases:**
@@ -906,7 +906,7 @@ export class Executor {
      * z² = 4 pseudo-observations. At low throughput, the shrinkage dampens
      * updates from sparse windows. Detection uses a uniform σ × SE threshold.
      *
-     * **Six branches per HALF_LIFE evaluation:**
+     * **Six branches per TIME_CONSTANT evaluation:**
      *   1. latency degrading → decrease (retract or fresh ramp)
      *   2. cooling (Retracting/Decreasing → Idle) → one-eval pause
      *   3. queue pressure → increase (only when not in decrease sequence)
@@ -922,10 +922,10 @@ export class Executor {
         if (elapsed < pool.controlWindow) return;
 
         const rate = pool.completionsThisWindow;
-        const { halfLife, z2 } = this.params(pool);
+        const { timeConstant, z2 } = this.params(pool);
 
         // Time-weighted EWMA: alpha derived from elapsed time.
-        const alpha = 1 - Math.exp(-elapsed / (halfLife * pool.controlWindow));
+        const alpha = 1 - Math.exp(-elapsed / (timeConstant * pool.controlWindow));
         pool.alpha = alpha;
 
         // Bayesian shrinkage: n/(n+z²) weights the observation against a prior
@@ -1019,23 +1019,23 @@ export class Executor {
         pool.inFlightMs = 0;
 
         // ── Periodic convergent throughput regulation + gravity ──
-        // Fires every HALF_LIFE windows so dW has time (~63% absorption) to
+        // Fires every TIME_CONSTANT windows so dW has time (~63% absorption) to
         // reflect the previous adjustment before the next decision.
         //
-        // Step formula: step = ceil(L × (1 - e^(-depth/HALF_LIFE)))
+        // Step formula: step = ceil(L × (1 - e^(-depth/TIME_CONSTANT)))
         // Severity encoded through persistence: sustained signal →
         // depth keeps incrementing → steps grow naturally.
         //
         // Phase transitions: Increasing→Retracting (walk back growth),
         // Retracting→Decreasing (fresh ramp), any→Idle (cooling).
-        if (pool.elapsedWindows >= halfLife && pool.elapsedWindows % halfLife === 0) {
+        if (pool.elapsedWindows >= timeConstant && pool.elapsedWindows % timeConstant === 0) {
             if (this.isLatencyDegrading(pool)) {
                 this.applyDecrease(pool);
             } else if (
                 pool.regulationPhase === RegulationPhase.Retracting ||
                 pool.regulationPhase === RegulationPhase.Decreasing
             ) {
-                // Cooling: one HALF_LIFE eval after a decrease sequence before
+                // Cooling: one TIME_CONSTANT eval after a decrease sequence before
                 // allowing increases. The phase acts as natural momentum —
                 // prevents immediate flip-flop between latency-decrease and
                 // queue-increase. Reset to Idle so the next action starts
@@ -1075,7 +1075,7 @@ export class Executor {
                     1,
                     Math.ceil(
                         pool.concurrencyLimit *
-                            (1 - Math.exp(-pool.regulationDepth / halfLife))
+                            (1 - Math.exp(-pool.regulationDepth / timeConstant))
                     )
                 );
                 if (pool.concurrencyLimit < pool.baselineConcurrency) {
@@ -1131,7 +1131,7 @@ export class Executor {
                 // same tick still contribute weight to the EWMA.
                 lane.completions++;
                 const laneElapsed = Math.max(1, now - lane.lastCompletionTime);
-                const { halfLife: hl, z2: z2_ } = this.params(pool);
+                const { timeConstant: hl, z2: z2_ } = this.params(pool);
                 const timeAlpha = 1 - Math.exp(-laneElapsed / (hl * pool.controlWindow));
                 // Bayesian shrinkage: dampens updates for lanes with few
                 // completions — prevents noisy early estimates from causing
@@ -1205,7 +1205,7 @@ export class Executor {
             pool.regulationDepth++;
             stepIndex = pool.regulationDepth;
         }
-        const f = 1 - Math.exp(-stepIndex / this.params(pool).halfLife);
+        const f = 1 - Math.exp(-stepIndex / this.params(pool).timeConstant);
         // Retraction uses f/(1+f) — the multiplicative inverse of increase.
         // If increase multiplied L by (1+f×s), retraction divides by (1+f×s).
         // stepScale provides bisection damping: each increase→retract cycle
@@ -1230,7 +1230,7 @@ export class Executor {
         }
         pool.regulationPhase = RegulationPhase.Increasing;
         pool.regulationDepth++;
-        const f = 1 - Math.exp(-pool.regulationDepth / this.params(pool).halfLife);
+        const f = 1 - Math.exp(-pool.regulationDepth / this.params(pool).timeConstant);
         const step = Math.max(1, Math.ceil(pool.concurrencyLimit * f * pool.stepScale));
         pool.concurrencyLimit = Math.min(pool.maximumConcurrency, pool.concurrencyLimit + step);
     }

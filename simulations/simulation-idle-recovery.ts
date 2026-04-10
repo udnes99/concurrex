@@ -194,7 +194,7 @@ async function scenarioIdleGap(): Promise<Scenario> {
     const phases: { time: number; label: string }[] = [];
 
     // Phase 1: Steady traffic — 200 tasks at ~15ms each, arrival ~8ms
-    // Runs for ~1600ms (200 × 8ms), well past halfLife (9 windows = 900ms)
+    // Runs for ~1600ms (200 × 8ms), well past timeConstant (9 windows = 900ms)
     phases.push({ time: 0, label: "Steady state" });
     for (let i = 0; i < 200; i++) {
         const duration = rng.erlang(15);

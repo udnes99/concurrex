@@ -57,7 +57,7 @@ A formal treatment of the mechanisms in the Executor: **ProDel** (Probabilistic 
 
 - $\sigma_D$ — `zScoreThreshold` (default: 2, configurable globally and per-pool). Number of standard errors for significance. The single tunable constant from which all other statistical parameters are derived.
 - $Z^2 = \sigma_D^2$ — `z2`. The Bayesian prior strength in pseudo-observations. At $\sigma_D = 2$: $Z^2 = 4$.
-- $H = \text{round}(2 / (1 - e^{-1/\sigma_D^2}))$ — `halfLife`. EWMA half-life in control windows: decay constant, warm-up threshold, and evaluation cadence. At $\sigma_D = 2$: $H = 9$.
+- $H = \text{round}(2 / (1 - e^{-1/\sigma_D^2}))$ — `timeConstant`. EWMA time constant in control windows: decay constant, warm-up threshold, and evaluation cadence. At $\sigma_D = 2$: $H = 9$.
 
 ---
 
@@ -206,7 +206,7 @@ Early shed handles the **flow rate** (preventing queue growth); ProDel handles t
 
 $$\alpha_k = 1 - \exp\left(\frac{-\Delta t_k}{H \cdot W}\right)$$
 
-where $H = \text{round}(2 / (1 - e^{-1/\sigma_D^2}))$ is the EWMA half-life and $\sigma_D = 2$ (zScoreThreshold).
+where $H = \text{round}(2 / (1 - e^{-1/\sigma_D^2}))$ is the EWMA time constant and $\sigma_D = 2$ (zScoreThreshold).
 
 For $\sigma_D = 2$: $H = \text{round}(2/(1-e^{-1/4})) = \text{round}(2/0.2212) = 9$.
 
@@ -360,7 +360,7 @@ where $S^{(2)} = \text{EWMA}(v^2)$ estimates $\sigma^2$ under $H_0$ (since $E[v^
 
 $$z = \frac{\hat{v}}{\text{SE}} \sim N(0, 1) \quad \text{under } H_0$$
 
-**Latency is degrading** when $z > \sigma_D$ (one-sided test). At $\sigma_D = 2$: false positive rate $\approx 2.3\%$ per halfLife evaluation.
+**Latency is degrading** when $z > \sigma_D$ (one-sided test). At $\sigma_D = 2$: false positive rate $\approx 2.3\%$ per time constant evaluation.
 
 Bayesian shrinkage enters through the level EWMA alpha, not the z-test threshold. At low throughput, the shrinkage factor is small, so the level update is dampened, producing smaller derivatives $v$. This dampens both the EWMA numerator and $S^{(2)}$ equally, preserving $z \sim N(0,1)$ regardless of throughput.
 
@@ -380,12 +380,12 @@ Pool-wide error detection (error spread significance, dErrorRate z-test) has bee
 
 1. **Per-lane shedding** (§4.3.1.1): filters localized errors at the lane level. One bad downstream dependency causes its lane's error rate EWMA to rise, shedding requests to that lane without affecting pool-wide concurrency.
 
-2. **Probabilistic error decrease** (§4.4.1, branch 4): when the pool-wide `errorRateEwma` $\hat{E} > 0$ and $\text{rand}() < \hat{E}$, the regulator applies a decrease step. Per-lane shedding keeps the aggregate error rate low for localized failures, so `errorRateEwma` only rises significantly for systemic issues (errors across many lanes). At 2% aggregate errors, the decrease fires on ~2% of halfLife evaluations — barely noticeable. At 80% errors, it fires on most evaluations — aggressive correction. The probability self-scales to match error severity.
+2. **Probabilistic error decrease** (§4.4.1, branch 4): when the pool-wide `errorRateEwma` $\hat{E} > 0$ and $\text{rand}() < \hat{E}$, the regulator applies a decrease step. Per-lane shedding keeps the aggregate error rate low for localized failures, so `errorRateEwma` only rises significantly for systemic issues (errors across many lanes). At 2% aggregate errors, the decrease fires on ~2% of time constant evaluations — barely noticeable. At 80% errors, it fires on most evaluations — aggressive correction. The probability self-scales to match error severity.
 
 **Why this replaces pool-wide error detection.** The previous design used error spread (proportion of lanes with errors) and dErrorRate (trend in error ratio) to detect systemic errors. This required tracking `laneKeysCompletedThisWindow`, `laneKeysErroredThisWindow`, `errorSpreadEwma`, `activeLanesEwma`, `dErrorRateEwma`, and `dErrorRateVariance`. The new design achieves the same goal — decreasing concurrency for systemic errors while ignoring localized ones — with zero additional state. Per-lane shedding naturally filters localized errors, so the aggregate `errorRateEwma` is already a reliable systemic signal.
 
 **Theorem 7 (False positive rate).** *Under $H_0$, $z \sim N(0,1)$. Therefore:*
-- *$P(\text{false positive}) = \Phi(-\sigma_D) \approx 0.0228$ per halfLife evaluation, independent of throughput.*
+- *$P(\text{false positive}) = \Phi(-\sigma_D) \approx 0.0228$ per time constant evaluation, independent of throughput.*
 - *Bayesian shrinkage scales both the trend signal and its second moment equally — the shrinkage factor cancels in the z-score.*
 
 **Theorem 8 (Detection under $H_1$: the test cannot miss severe degradation).** *Under $H_1$ ($E[v] = \mu > 0$), the second moment $S^{(2)} \to \sigma^2 + \mu^2$. The z-score becomes:*
@@ -397,11 +397,11 @@ $$z = \frac{\mu}{\sqrt{(\sigma^2 + \mu^2) \cdot W^{(2)}}} = \sqrt{\frac{1}{W^{(2
 - *Moderate signal ($\mu \approx \sigma$): $z \approx 3$ — detected. The trend exceeds the noise level.*
 - *Severe degradation ($\mu \gg \sigma$): $z \to \sqrt{(2-\alpha)/\alpha} \approx 4.25$ — always detected. The z-score saturates because $S^{(2)}$ includes $\mu^2$, but the saturation value exceeds $\sigma_D = 2$, so detection is guaranteed.*
 
-*The saturation means the z-score indicates presence of degradation (binary), not severity. Severity is encoded through persistence: sustained degradation keeps the z-test firing across halfLife evaluations, incrementing the regulation depth and producing progressively larger concurrency decreases.*
+*The saturation means the z-score indicates presence of degradation (binary), not severity. Severity is encoded through persistence: sustained degradation keeps the z-test firing across time constant evaluations, incrementing the regulation depth and producing progressively larger concurrency decreases.*
 
 **Theorem 9 (Warm-up guard prevents early false positives).** *No concurrency adjustment occurs for the first $H$ windows after pool creation.*
 
-*Proof.* The halfLife evaluation requires $n_w \geq H$. $n_w$ starts at 0 and increments once per window evaluation. Therefore at least halfLife windows ($\geq H \cdot W$ ms) must pass before the first evaluation. During this period, the trend EWMA and second moment accumulate data, providing a reliable baseline. $\square$
+*Proof.* The time constant evaluation requires $n_w \geq H$. $n_w$ starts at 0 and increments once per window evaluation. Therefore at least $H$ windows ($\geq H \cdot W$ ms) must pass before the first evaluation. During this period, the trend EWMA and second moment accumulate data, providing a reliable baseline. $\square$
 
 ### 4.4 Regulation Phases and Step Formula
 
@@ -411,7 +411,7 @@ $$f(d) = 1 - e^{-d/H}$$
 
 $$\Delta(d) = \max\!\bigl(1,\; \lceil L \cdot f(d) \cdot s \rceil\bigr)$$
 
-The factor $f(d)$ is the EWMA absorption fraction after $d$ steps with time constant halfLife. It converges to 1 as $d \to \infty$, so the step converges to $L \cdot s$. The bisection scale $s$ starts at 1 and halves on each increase→retract→cooling cycle, allowing the system to converge to within $\pm 1$ of the true equilibrium in $O(\log L)$ oscillation cycles. $s$ resets to 1 when entering Restoring (operating point changed) or Decreasing (genuine degradation).
+The factor $f(d)$ is the EWMA absorption fraction after $d$ steps with time constant $H$. It converges to 1 as $d \to \infty$, so the step converges to $L \cdot s$. The bisection scale $s$ starts at 1 and halves on each increase→retract→cooling cycle, allowing the system to converge to within $\pm 1$ of the true equilibrium in $O(\log L)$ oscillation cycles. $s$ resets to 1 when entering Restoring (operating point changed) or Decreasing (genuine degradation).
 
 **Severity through persistence:** The formula has no explicit acceleration parameter. Instead, sustained signal → depth keeps incrementing → steps grow naturally. A brief spike triggers 1-2 small steps before cooling or recovery kicks in. A persistent degradation accumulates depth, producing increasingly aggressive correction. This is inherently self-damping: the moment the signal disappears, growth stops and restoring reclaims the excess.
 
@@ -425,12 +425,12 @@ The factor $f(d)$ is the EWMA absorption fraction after $d$ steps with time cons
 | $\texttt{Decreasing}$ | $d$ increments: $1, 2, \ldots$ | Fresh decrease ramp after retraction exhausted |
 | $\texttt{Restoring}$ | $d$ increments: $1, 2, \ldots$ | Converge back toward baseline from either direction |
 
-#### 4.4.1 Per-halfLife Evaluation
+#### 4.4.1 Per-Time-Constant Evaluation
 
 Every $H$ windows (when $n_w \geq H$ and $n_w \bmod H = 0$), the regulator evaluates six branches in priority order:
 
 1. **Latency degrading** → `applyDecrease`. Retract previous increase or start fresh decrease ramp.
-2. **Cooling** ($\Phi \in \{\texttt{Retracting}, \texttt{Decreasing}\}$, not degrading) → Reset to $\texttt{Idle}$, $d = 0$, $s \leftarrow s/2$ (bisection damping). One halfLife evaluation pause after a decrease sequence before allowing increases. Acts as natural momentum — prevents immediate flip-flop between latency-decrease and queue-increase. The halved $s$ ensures the next increase cycle uses finer steps.
+2. **Cooling** ($\Phi \in \{\texttt{Retracting}, \texttt{Decreasing}\}$, not degrading) → Reset to $\texttt{Idle}$, $d = 0$, $s \leftarrow s/2$ (bisection damping). One time constant evaluation pause after a decrease sequence before allowing increases. Acts as natural momentum — prevents immediate flip-flop between latency-decrease and queue-increase. The halved $s$ ensures the next increase cycle uses finer steps.
 3. **Queue pressure** ($Q > 0$, not in a decrease sequence — $\Phi \in \{\texttt{Idle}, \texttt{Increasing}, \texttt{Restoring}\}$) → `applyIncrease`. Convergent slow start.
 4. **Probabilistic error decrease** ($\hat{E} > 0$ and $\text{rand}() < \hat{E}$) → `applyDecrease`. Fires with probability equal to the aggregate error rate. Per-lane shedding keeps the aggregate rate low for localized failures, so this only fires frequently for systemic issues. No momentum — the probabilistic nature provides proportional response without needing a separate hold/gravity gate.
 5. **Restoring** ($L \neq B$) → Convergent step toward baseline from current position. Uses the same step formula $\Delta(d)$ with incrementing depth. If $L < B$: cautious probe upward (latency signal can react before overshoot). If $L > B$: shed excess capacity. Phase set to $\texttt{Restoring}$.
@@ -485,7 +485,7 @@ $$L \leftarrow \min(L_{\max},\; L + \Delta)$$
 | 7 | 0.541 | 33 | 93 |
 | 8 | 0.588 | 55 | 100 |
 
-At convergence ($d \to \infty$), $\Delta \to L$: each halfLife evaluation doubles (or halves) the limit — **true exponential adjustment** directly in the concurrency limit.
+At convergence ($d \to \infty$), $\Delta \to L$: each time constant evaluation doubles (or halves) the limit — **true exponential adjustment** directly in the concurrency limit.
 
 #### 4.4.4 Restoring (gravity)
 
@@ -528,7 +528,7 @@ Note: the table shows factors at $s = 1$ (first oscillation cycle). The retracti
 
 3. **Bounded by limit.** $\Delta \leq L$ always (Theorem 10 below) — the limit never more than doubles or halves in a single evaluation.
 
-4. **Sensor-actuator lockstep.** The convergence rate $1/H$ matches the EWMA sensor's absorption rate. After each halfLife evaluation, the dLogWBar sensor has absorbed $\sim 63\%$ of the previous adjustment's effect before the next decision. The actuator never outpaces the sensor.
+4. **Sensor-actuator lockstep.** The convergence rate $1/H$ matches the EWMA sensor's absorption rate. After each time constant evaluation, the dLogWBar sensor has absorbed $\sim 63\%$ of the previous adjustment's effect before the next decision. The actuator never outpaces the sensor.
 
 5. **Asymmetric phase transitions.** Increasing→Retracting: walk back growth in reverse (proportional correction). Retracting/Decreasing→Increasing: no retraction, start cautious growth from depth 0 (the decrease was warranted).
 
@@ -556,7 +556,7 @@ Note: the table shows factors at $s = 1$ (first oscillation cycle). The retracti
 
 **Fresh decrease:** $\Delta \approx L$, so $L_{k+1} \approx \max(L_{\min}, 0)$ — drives to floor in one step.
 
-halfLife evaluations occur every $H \cdot W$ ms, and it takes $\sim H$ depths to reach convergence. The ramp phase adds $H \cdot H \cdot W = H^2 \cdot W$ wall-clock time.
+Time constant evaluations occur every $H \cdot W$ ms, and it takes $\sim H$ depths to reach convergence. The ramp phase adds $H \cdot H \cdot W = H^2 \cdot W$ wall-clock time.
 
 For $H = 9$ and $W = 100\text{ms}$: the ramp takes $\sim 8.1\text{s}$. After ramp, each doubling takes $\sim 900\text{ms}$. $\square$
 
@@ -566,7 +566,7 @@ For $H = 9$ and $W = 100\text{ms}$: the ramp takes $\sim 8.1\text{s}$. After ram
 
 1. The regulator transitions to $\Phi = \texttt{Retracting}$.
 2. It computes $\Delta(d_{\text{peak}})$ and applies $L \leftarrow L - \Delta$. Sets $d \leftarrow d_{\text{peak}} - 1$.
-3. On the next halfLife evaluation (if still $\widehat{\text{d}\bar{m}} > \theta$), $\Phi = \texttt{Retracting}$ and $d = d_{\text{peak}} - 1 > 0$. It computes $\Delta(d_{\text{peak}} - 1)$ and sets $d \leftarrow d_{\text{peak}} - 2$.
+3. On the next time constant evaluation (if still $\widehat{\text{d}\bar{m}} > \theta$), $\Phi = \texttt{Retracting}$ and $d = d_{\text{peak}} - 1 > 0$. It computes $\Delta(d_{\text{peak}} - 1)$ and sets $d \leftarrow d_{\text{peak}} - 2$.
 4. This continues: $\Delta(d_{\text{peak}} - 2), \Delta(d_{\text{peak}} - 3), \ldots$
 5. When $d = 1$: computes $\Delta(1)$, sets $d \leftarrow 0$.
 6. When $d = 0$: transitions to $\Phi = \texttt{Decreasing}$, sets $d \leftarrow 1$, fresh ramp begins.
@@ -632,5 +632,5 @@ ProDel never writes to regulator state; the regulator never writes to ProDel sta
 | **Probabilistic error decrease** | Systemic errors cause probabilistic decrease (P = errorRate); per-lane shedding filters localized errors (§4.3.2) |
 | **Gradual restoring** | Convergent steps toward baseline from either direction; no discontinuous snaps (§4.4.4) |
 | **Bisection convergence** | Each increase→retract→cooling cycle halves stepScale; $O(\log L)$ cycles to equilibrium (§4.5) |
-| **One-eval cooling** | After a decrease sequence, one halfLife evaluation pause before allowing increases; stepScale halved (§4.4.1) |
+| **One-eval cooling** | After a decrease sequence, one time constant evaluation pause before allowing increases; stepScale halved (§4.4.1) |
 | **Log-space robustness** | Log-transform compresses error-spike contamination of latency signal (§4.2) |

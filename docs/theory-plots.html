@@ -52,7 +52,7 @@ Compare against the <a href="../simulations/executor-simulation-live.html">live 
 
 <h3>&sect;4.1 Time-Weighted EWMA Alpha</h3>
 <p class="description">
-    &alpha; = 1 &minus; exp(&minus;&Delta;t / (HALF_LIFE &times; W)). Shown for HALF_LIFE = 9 and W = 100ms.
+    &alpha; = 1 &minus; exp(&minus;&Delta;t / (TIME_CONSTANT &times; W)). Shown for TIME_CONSTANT = 9 and W = 100ms.
     On-time windows (&Delta;t = 100ms) get &alpha; &approx; 0.105.
     Long-delayed windows get more weight (staler data discounted).
 </p>
@@ -86,7 +86,7 @@ Compare against the <a href="../simulations/executor-simulation-live.html">live 
 
 <h3>&sect;4.4 Step Formula: Increase f(d) vs Retraction f/(1+f)</h3>
 <p class="description">
-    Both increase and retraction use the convergent factor f(d) = 1 &minus; exp(&minus;d/HALF_LIFE).
+    Both increase and retraction use the convergent factor f(d) = 1 &minus; exp(&minus;d/TIME_CONSTANT).
     Increase multiplies L by (1+f); retraction divides by (1+f) using f/(1+f).
     At convergence (d &rarr; &infin;): increase doubles (f &rarr; 1), retraction halves (f/(1+f) &rarr; 0.5).
     Retraction is the exact multiplicative inverse of increase.
@@ -129,7 +129,7 @@ Compare against the <a href="../simulations/executor-simulation-live.html">live 
 <script>
 const Z = 2;
 const Z2 = Z * Z;
-const HALF_LIFE = Math.round(2 / (1 - Math.exp(-1 / Z2)));
+const TIME_CONSTANT = Math.round(2 / (1 - Math.exp(-1 / Z2)));
 
 function shrinkage(n) { return n / (n + Z2); }
 function range(start, end, step) {
@@ -226,9 +226,9 @@ const chartDefaults = {
         data: {
             labels: dts,
             datasets: [
-                { label: 'HALF_LIFE = 4 (Z = 1)', data: dts.map(dt => 1 - Math.exp(-dt / (4 * W))), borderColor: '#2ecc71' },
-                { label: 'HALF_LIFE = 9 (Z = 2)', data: dts.map(dt => 1 - Math.exp(-dt / (9 * W))), borderColor: '#3498db' },
-                { label: 'HALF_LIFE = 19 (Z = 3)', data: dts.map(dt => 1 - Math.exp(-dt / (19 * W))), borderColor: '#e74c3c' }
+                { label: 'TIME_CONSTANT = 4 (Z = 1)', data: dts.map(dt => 1 - Math.exp(-dt / (4 * W))), borderColor: '#2ecc71' },
+                { label: 'TIME_CONSTANT = 9 (Z = 2)', data: dts.map(dt => 1 - Math.exp(-dt / (9 * W))), borderColor: '#3498db' },
+                { label: 'TIME_CONSTANT = 19 (Z = 3)', data: dts.map(dt => 1 - Math.exp(-dt / (19 * W))), borderColor: '#e74c3c' }
             ]
         },
         options: { ...chartDefaults,
@@ -265,7 +265,7 @@ const chartDefaults = {
 // 4.2 Effective Level Alpha (shrinkage-dampened)
 (() => {
     const ns = range(1, 50, 1);
-    const alpha0 = 1 - Math.exp(-1 / HALF_LIFE);
+    const alpha0 = 1 - Math.exp(-1 / TIME_CONSTANT);
     new Chart(document.getElementById('level-alpha'), {
         type: 'line',
         data: {
@@ -290,7 +290,7 @@ const chartDefaults = {
     const totalWindows = 60;
     const idleAt = 20; // idle gap occurs at window 20
     const labels = range(1, totalWindows, 1);
-    const alpha0 = 1 - Math.exp(-1 / HALF_LIFE);
+    const alpha0 = 1 - Math.exp(-1 / TIME_CONSTANT);
     const steadyState = alpha0 / (2 - alpha0);
 
     function simulate(idleAlpha) {
@@ -347,10 +347,10 @@ const chartDefaults = {
             labels: ds,
             datasets: [
                 { label: 'f(d) = 1 - exp(-d/HL)  [increase & fresh decrease]',
-                  data: ds.map(d => 1 - Math.exp(-d / HALF_LIFE)),
+                  data: ds.map(d => 1 - Math.exp(-d / TIME_CONSTANT)),
                   borderColor: '#3498db' },
                 { label: 'f/(1+f)  [retraction, exact inverse]',
-                  data: ds.map(d => { const f = 1 - Math.exp(-d / HALF_LIFE); return f / (1 + f); }),
+                  data: ds.map(d => { const f = 1 - Math.exp(-d / TIME_CONSTANT); return f / (1 + f); }),
                   borderColor: '#e74c3c' },
                 { label: '0.5 (halving limit)',
                   data: ds.map(() => 0.5),
@@ -376,10 +376,10 @@ const chartDefaults = {
             labels: ds,
             datasets: [
                 { label: 'Increase step = ceil(L x f)',
-                  data: ds.map(d => Math.max(1, Math.ceil(L * (1 - Math.exp(-d / HALF_LIFE))))),
+                  data: ds.map(d => Math.max(1, Math.ceil(L * (1 - Math.exp(-d / TIME_CONSTANT))))),
                   borderColor: '#3498db' },
                 { label: 'Retraction step = ceil(L x f/(1+f))',
-                  data: ds.map(d => { const f = 1 - Math.exp(-d / HALF_LIFE); return Math.max(1, Math.ceil(L * f / (1 + f))); }),
+                  data: ds.map(d => { const f = 1 - Math.exp(-d / TIME_CONSTANT); return Math.max(1, Math.ceil(L * f / (1 + f))); }),
                   borderColor: '#e74c3c' }
             ]
         },
@@ -397,7 +397,7 @@ const chartDefaults = {
 (() => {
     const cycles = range(0, 10, 1);
     const L = 1000;
-    const f1 = 1 - Math.exp(-1 / HALF_LIFE);
+    const f1 = 1 - Math.exp(-1 / TIME_CONSTANT);
     new Chart(document.getElementById('bisection'), {
         type: 'line',
         data: {
@@ -425,7 +425,7 @@ const chartDefaults = {
 (() => {
     // Simulate SM = EWMA(x^2) for N(0, sigma^2) noise with sigma=1
     const windows = range(1, 50, 1);
-    const alpha0 = 1 - Math.exp(-1 / HALF_LIFE);
+    const alpha0 = 1 - Math.exp(-1 / TIME_CONSTANT);
 
     // Deterministic: show the expected convergence E[SM] = sigma^2 = 1
     // SM_k = (1-alpha)*SM_{k-1} + alpha*x_k^2
