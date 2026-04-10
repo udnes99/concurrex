@@ -27,13 +27,13 @@ A formal treatment of the mechanisms in the Executor: **ProDel** (Probabilistic 
 - $\hat\delta_k$ — EWMA of drop rate (`dropRateEwma`)
 - $n_w$ — total elapsed windows (`elapsedWindows`)
 
-**WoLF-EWMA state (latency detection).** Per window:
+**EWMA state (latency detection).** Per window:
 
 - $\hat{L}_k$ — EWMA of in-flight count (`inFlightEwma`)
-- $\bar{m}_k$ — WoLF-filtered $\log(W)$ level (`logWBar`)
-- $P_k$ — Kalman state uncertainty (`logWBarP`)
-- $\widehat{\text{d}\bar{m}}_k$ — EWMA of $\text{d}\bar{m} = \bar{m}_k - \bar{m}_{k-1}$ (`dLogWBarEwma`)
-- $\hat\sigma^2_{\text{d}\bar{m},k}$ — Welford variance of $\text{d}\bar{m}$ (`dLogWBarVariance`)
+- $\bar{m}_k$ — shrinkage-dampened EWMA of $\log(W)$ (`logWBar`)
+- $\hat{v}_k$ — EWMA of trend $v = (\bar{m}_k - \bar{m}_{k-1})/\Delta t$ (`dLogWBarEwma`)
+- $S_k^{(2)}$ — second moment of trend $\text{EWMA}(v^2)$ (`dLogWBarSM`)
+- $W_k^{(2)}$ — sum of squared EWMA weights (`ewmaSumW2`)
 
 **Error tracking state.** Per window:
 
@@ -56,7 +56,7 @@ A formal treatment of the mechanisms in the Executor: **ProDel** (Probabilistic 
 **Constants:**
 
 - $\sigma_D$ — `zScoreThreshold` (default: 2, configurable globally and per-pool). Number of standard errors for significance. The single tunable constant from which all other statistical parameters are derived.
-- $Z^2 = \sigma_D^2$ — `z2`. The Bayesian prior strength in pseudo-observations. Also the IMQ soft threshold ($c^2$) for WoLF outlier downweighting in log-space. At $\sigma_D = 2$: $Z^2 = 4$.
+- $Z^2 = \sigma_D^2$ — `z2`. The Bayesian prior strength in pseudo-observations. At $\sigma_D = 2$: $Z^2 = 4$.
 - $H = \text{round}(2 / (1 - e^{-1/\sigma_D^2}))$ — `halfLife`. EWMA half-life in control windows: decay constant, warm-up threshold, and evaluation cadence. At $\sigma_D = 2$: $H = 9$.
 
 ---
@@ -204,7 +204,7 @@ Early shed handles the **flow rate** (preventing queue growth); ProDel handles t
 
 **Definition.** The smoothing factor for window $k$ with actual elapsed time $\Delta t_k$ is:
 
-$$\alpha_k = 1 - \exp\!\left(\frac{-\Delta t_k}{H \cdot W}\right)$$
+$$\alpha_k = 1 - \exp\left(\frac{-\Delta t_k}{H \cdot W}\right)$$
 
 where $H = \text{round}(2 / (1 - e^{-1/\sigma_D^2}))$ is the EWMA half-life and $\sigma_D = 2$ (zScoreThreshold).
 
@@ -246,13 +246,12 @@ where $n$ is the observation count backing the current window's measurement, and
 | 50 | 0.93 |
 | 100 | 0.96 |
 
-**Where applied:** completion rate, drop rate, error rate, WoLF Kalman gain, dLogWBar trend, and early shedding probability. The relevant $n$ differs per signal:
+**Where applied:** completion rate, drop rate, error rate, log(W) level EWMA, and early shedding probability. The relevant $n$ differs per signal:
 
 | Signal | $n$ |
 |--------|-----|
 | Completion rate, drop rate, error rate | `completionsThisWindow` |
-| WoLF Kalman gain | via $R_\text{effective} = R / (w \times \text{shrinkage})$ — power-likelihood weighting; fewer completions → higher noise → lower gain |
-| dLogWBar trend | `completionsThisWindow` (shrinkage-scaled alpha on trend EWMA) |
+| log(W) level EWMA | `completionsThisWindow` (shrinkage-scaled alpha dampens noisy low-throughput windows) |
 | Early shedding | `completionRateEwma` (smoothed throughput) |
 | Per-lane error rate | $c_\ell$ (lane's cumulative completions) |
 
@@ -279,52 +278,49 @@ $$W_k = \frac{\int_0^{\Delta t_k} N(t)\,dt}{r_k} \quad (\text{when } r_k > 0)$$
 
 where $\int N(t)\,dt$ is the accumulated in-flight-milliseconds (`inFlightMs`) over the window and $r_k$ is completions. This is the exact finite-interval operational Little's Law — no approximation. The integral is updated on every in-flight change (admission and completion), so it captures the true area under the in-flight curve.
 
-**WoLF-EWMA on $\log(W)$:**
+**Shrinkage-dampened EWMA on $\log(W)$:**
 
-The WoLF (Weighted-Observation Likelihood Filter) robustly smooths $\log(W)$ using IMQ-weighted Kalman updates. Outlier observations (error spikes that inflate $W$) are automatically downweighted. The z-test on $\text{d}\bar{m}$ (change in filtered state) detects sustained trends on the already-clean signal. All parameters derive from `zScoreThreshold`.
+The level EWMA smooths $\log(W)$ with throughput-aware dampening. At low throughput, Bayesian shrinkage reduces the update weight (fewer completions produce noisier $W$, so the prior is trusted more). The z-test on $\text{d}\bar{m}$ (change in filtered level) detects sustained upward trends. All parameters derive from `zScoreThreshold`.
 
 Instantaneous log-latency per window:
 
-$$m_k = \log(W_k) = \log\!\left(\frac{\int N(t)\,dt}{r_k}\right)$$
+$$m_k = \log(W_k) = \log\left(\frac{\int N(t)\,dt}{r_k}\right)$$
 
-WoLF Kalman predict step:
+Level EWMA update (shrinkage-dampened):
 
-$$\hat{m}_k^- = \bar{m}_{k-1}, \quad P_k^- = P_{k-1} + Q$$
+$$\bar{m}_k = \bar{m}_{k-1} + (\alpha_k \times \text{shrinkage}(r_k)) \times (m_k - \bar{m}_{k-1})$$
 
-Innovation and IMQ weight ($c^2 = Z^2$):
+where $\text{shrinkage}(r_k) = r_k / (r_k + Z^2)$ dampens the update for low-throughput windows.
 
-$$\nu_k = m_k - \hat{m}_k^-, \quad w_k = \frac{1}{\sqrt{1 + \nu_k^2 / Z^2}}$$
+**Derivative of filtered state (trend signal):**
 
-Effective measurement noise (power-likelihood weighting + shrinkage):
+The dt-normalized rate of change in the EWMA-filtered level:
 
-$$R_{\text{eff},k} = \frac{R}{w_k \times \text{shrinkage}(r_k)}$$
+$$v_k = \frac{\bar{m}_k - \bar{m}_{k-1}}{\Delta t_k}, \quad \Delta t_k = \frac{t_k - t_{k-1}}{W}$$
 
-Kalman update:
+where $W$ is `controlWindow`. Dividing by $\Delta t$ prevents idle gaps from producing a large trend signal — a one-time level shift spread over many windows is not a sustained per-window trend.
 
-$$S_k = P_k^- + R_{\text{eff},k}, \quad K_k = \frac{P_k^-}{S_k}$$
+**EWMA of trend:**
 
-$$\bar{m}_k = \hat{m}_k^- + K_k \nu_k, \quad P_k = (1 - K_k) P_k^-$$
+$$\hat{v}_k = \hat{v}_{k-1} + \alpha_k (v_k - \hat{v}_{k-1})$$
 
-**Trend on filtered state (dLogWBar):**
+where $\alpha_k = 1 - e^{-\Delta t_k / H}$ is the time-weighted EWMA alpha. After idle ($\Delta t \gg 1$), $\alpha \to 1$ and the EWMA resets to the current observation.
 
-$$\text{d}\bar{m}_k = \bar{m}_k - \bar{m}_{k-1}$$
+**Second moment of trend (variance estimator under $H_0$):**
 
-EWMA of $\text{d}\bar{m}$ with shrinkage-scaled alpha:
+$$S_k^{(2)} = (1 - \alpha_k) S_{k-1}^{(2)} + \alpha_k v_k^2$$
 
-$$\alpha_t = \alpha_k \times \text{shrinkage}(r_k)$$
-$$\widehat{\text{d}\bar{m}}_k = \widehat{\text{d}\bar{m}}_{k-1} + \alpha_t (\text{d}\bar{m}_k - \widehat{\text{d}\bar{m}}_{k-1})$$
+This tracks $E[v^2]$, the second moment of the trend signal. Under the null hypothesis $H_0: E[v] = 0$ (latency is stable), the second moment equals the variance: $E[v^2] = \text{Var}(v) = \sigma^2$. This is the key insight: when the expected value is zero, the second moment is an unbiased estimator of variance without needing to subtract a mean. Under $H_1$ ($E[v] = \mu > 0$), $E[S^{(2)}] = \sigma^2 + \mu^2$, which keeps the denominator elevated and causes the z-score to saturate at $\sqrt{(2-\alpha)/\alpha} \approx 4.25$ — sufficient for binary detection.
 
-**dLogWBar variance (Welford / Roberts 1959 EWMS):**
+**Effective sample size ($W^{(2)}$ recursion):**
 
-$$\hat\sigma^2_{\text{d}\bar{m},k} = (1 - \alpha_t)\bigl(\hat\sigma^2_{\text{d}\bar{m},k-1} + \alpha_t (\text{d}\bar{m}_k - \widehat{\text{d}\bar{m}}_{k-1})^2\bigr)$$
+With time-varying $\alpha$ (due to irregular window timing and idle gaps), the standard EWMA variance $\alpha/(2-\alpha)$ does not apply. Instead, the sum of squared weights is tracked exactly:
 
-**Why WoLF on log-space?** Error spikes cause a few tasks to complete very slowly (or not at all within the window), inflating $W$ by orders of magnitude. In linear space, a single outlier $W$ contaminates the EWMA and inflates the variance tracker, desensitizing the z-test for many windows. Log-space compresses these spikes, and the IMQ weight further downweights any remaining outliers. The result: the Welford variance on $\text{d}\bar{m}$ stays stable (not contaminated by error-induced latency spikes), and the standard z-test can detect genuine capacity degradation reliably.
+$$W_k^{(2)} = (1-\alpha_k)^2 W_{k-1}^{(2)} + \alpha_k^2$$
 
-**Kalman constants.** $Q$, $R$, and the IMQ threshold $c^2$ are all derived from `zScoreThreshold`:
+This generalizes $\alpha/(2-\alpha)$ to time-varying $\alpha$. After idle ($\alpha \to 1$), $W^{(2)} \approx 1$ (one effective sample, wide SE). After many normal windows, $W^{(2)} \to \alpha/(2-\alpha)$ (standard result).
 
-- Base alpha: $\alpha_0 = 1 - e^{-1/H}$ (same time constant as all other EWMAs)
-- $R = Z^2$, $Q = \alpha_0^2 R / (1 - \alpha_0)$ — chosen so steady-state gain $K \to \alpha_0$
-- $c^2 = Z^2$ — innovations within $Z$ log-units get full weight; outliers beyond are suppressed
+**Why log-space?** Error spikes inflate $W$ by orders of magnitude. In linear space, a single outlier contaminates the EWMA and the variance tracker. Log-space compresses these spikes, making the EWMA robust to occasional extreme observations.
 
 **Error rate (error ratio — errors/completions):**
 
@@ -336,7 +332,7 @@ where $\alpha_c = \alpha_k \times r_k / (r_k + Z^2)$ (Bayesian shrinkage-scaled 
 
 Each lane's error rate is updated on completion with a time-weighted alpha based on elapsed time since the lane's last completion, scaled by Bayesian shrinkage:
 
-$$\alpha_\ell^{\text{time}} = 1 - \exp\!\left(\frac{-\max(1, t - t_\ell)}{H \cdot W}\right)$$
+$$\alpha_\ell^{\text{time}} = 1 - \exp\left(\frac{-\max(1, t - t_\ell)}{H \cdot W}\right)$$
 
 $$\alpha_\ell = \alpha_\ell^{\text{time}} \times \frac{c_\ell}{c_\ell + Z^2}$$
 
@@ -344,43 +340,31 @@ $$\hat{p}_\ell \leftarrow \hat{p}_\ell + \alpha_\ell \bigl([e] - \hat{p}_\ell\bi
 
 where $[e] = 1$ if the task errored, $0$ otherwise, and $c_\ell$ is the lane's cumulative completion count. The $\max(1, \cdot)$ ensures rapid completions at the same timestamp still contribute weight. The Bayesian shrinkage factor $c_\ell/(c_\ell + Z^2)$ dampens the update for lanes with few completions — a lane with 1 completion gets only 20% of the full alpha, a lane with 4 completions gets 50%, and a lane with 10 gets 71%, preventing noisy early estimates from causing aggressive per-lane shedding. This uses the same Bayesian framework as all other signals.
 
-**Theorem 6 (Variance steady-state bias).** *For a stationary process with true variance $\sigma^2$ and constant $\alpha$, the steady-state expectation of $\hat\sigma^2$ is:*
-
-$$E[\hat\sigma^2_\infty] = \frac{2(1-\alpha)}{2-\alpha}\sigma^2$$
-
-*Proof.* For a stationary process with $E[\text{d}\bar{m}_k] = 0$, the EWMA is unbiased: $E[\widehat{\text{d}\bar{m}}_\infty] = 0$. The prediction-error variance is:
-
-$$E[(\text{d}\bar{m}_k - \widehat{\text{d}\bar{m}}_{k-1})^2] = \text{Var}(\text{d}\bar{m}_k) + \text{Var}(\widehat{\text{d}\bar{m}}_{k-1})$$
-
-The EWMA variance: $\text{Var}(\widehat{\text{d}\bar{m}}) = \frac{\alpha}{2 - \alpha}\sigma^2$ (standard result for geometric weighted average).
-
-Therefore $E[\delta^2] = \sigma^2(1 + \frac{\alpha}{2-\alpha}) = \sigma^2 \cdot \frac{2}{2-\alpha}$.
-
-At steady state: $\hat\sigma^2_\infty = (1-\alpha)\hat\sigma^2_\infty + \alpha(1-\alpha)E[\delta^2]$
-
-$$\alpha\hat\sigma^2_\infty = \alpha(1-\alpha)\sigma^2 \cdot \frac{2}{2-\alpha}$$
-
-$$\hat\sigma^2_\infty = \frac{2(1-\alpha)}{2-\alpha}\sigma^2$$
-
-For $\alpha = 0.105$: $E[\hat\sigma^2_\infty] \approx 0.945\sigma^2$. The ~5.5% variance underestimate makes the SE $\approx 2.8\%$ smaller, producing a slightly tighter detection threshold than the nominal $\sigma_D = 2$ implies. The effective false-positive rate is marginally above $\Phi(-2) \approx 2.3\%$ — a negligible difference in practice. The code corrects for this by using $2(1-\alpha)$ instead of $(2-\alpha)$ in the SE denominator. $\square$
-
 ### 4.3 Detection Thresholds
 
-All detection thresholds use the same framework: $\text{signal} > \sigma_D \times \text{SE}(\text{signal})$, where SE is the standard error of the EWMA derived from its tracked variance. This produces an **adaptive threshold**: stable systems get tight thresholds; noisy systems get loose ones.
+#### 4.3.1 Latency Detection (Null Hypothesis z-Test)
 
-#### 4.3.1 Latency Detection (WoLF-EWMA + dLogWBar z-test)
+**Null hypothesis $H_0$:** latency is stable. The true $\log(W)$ level is constant. Therefore $E[v] = 0$ — the expected rate of change is zero.
 
-$$\text{SE}(\widehat{\text{d}\bar{m}}) = \sqrt{\frac{\hat\sigma^2_{\text{d}\bar{m}} \cdot \alpha}{2(1 - \alpha) \cdot \text{shrinkage}(n_w / H)}}$$
+**Alternative hypothesis $H_1$:** latency is degrading. $E[v] > 0$.
 
-where $n_w$ is `elapsedWindows` and $H$ is `halfLife`. The shrinkage factor $\text{shrinkage}(n_w/H) = (n_w/H) / (n_w/H + Z^2)$ inflates SE when the Welford variance has few effective observations. The variance converges slower than the EWMA mean (~$H$ half-lives), so early evaluations would otherwise produce artificially tight thresholds. After a few half-lives, shrinkage $\to 1$ and the correction vanishes.
+Under $H_0$, the trend signal $v_k$ is zero-mean noise with variance $\sigma^2$. The shrinkage-dampened EWMA produces approximately i.i.d. trend samples $N(0, \sigma^2)$. The EWMA of trend is a weighted average with weights $w_j$, so:
 
-Latency is degrading when $\widehat{\text{d}\bar{m}} > \sigma_D \cdot \text{SE}(\widehat{\text{d}\bar{m}})$.
+$$\text{Var}(\hat{v}) = \sigma^2 \sum_j w_j^2 = \sigma^2 \cdot W^{(2)}$$
 
-**Two-stage design.** The detection operates in two stages. First, the WoLF filter cleans the $\log(W)$ signal: outlier observations (caused by error spikes, GC pauses, or transient network hiccups) receive near-zero Kalman gain via the IMQ weight, so they barely move the filtered state $\bar{m}$. Second, the standard z-test on $\text{d}\bar{m}$ detects sustained upward trends in the clean signal.
+The standard error of the EWMA mean is:
 
-**Why this works.** Without WoLF, a single error spike inflating $W$ by 10x would inject a large positive $\text{d}W$ into the trend EWMA and inflate the Welford variance for many subsequent windows. The inflated variance desensitizes the z-test, masking genuine capacity degradation that follows. WoLF prevents this: the IMQ weight ($w = 1/\sqrt{1 + \nu^2/Z^2}$) suppresses outlier innovations, so neither the filtered state $\bar{m}$ nor its derivative $\text{d}\bar{m}$ are contaminated. The Welford variance on $\text{d}\bar{m}$ stays tight, and the z-test retains full sensitivity.
+$$\text{SE} = \sqrt{S^{(2)} \cdot W^{(2)}}$$
 
-**Source-side noise control.** Bayesian shrinkage enters through the Kalman gain, not as a separate alpha correction. At low throughput ($r_k$ small), the shrinkage factor is small, which inflates $R_\text{eff}$ (measurement noise), which reduces $K$ (Kalman gain). The filter trusts the prior state over a noisy observation. At high throughput, $R_\text{eff} \approx R$ and the filter tracks closely. This is mathematically equivalent to source-side dampening but flows through the Kalman equations correctly — $K$ remains the MMSE-optimal gain for the adjusted noise level.
+where $S^{(2)} = \text{EWMA}(v^2)$ estimates $\sigma^2$ under $H_0$ (since $E[v^2] = \text{Var}(v)$ when $E[v] = 0$), and $W^{(2)}$ is the effective sample size correction. The z-statistic:
+
+$$z = \frac{\hat{v}}{\text{SE}} \sim N(0, 1) \quad \text{under } H_0$$
+
+**Latency is degrading** when $z > \sigma_D$ (one-sided test). At $\sigma_D = 2$: false positive rate $\approx 2.3\%$ per halfLife evaluation.
+
+Bayesian shrinkage enters through the level EWMA alpha, not the z-test threshold. At low throughput, the shrinkage factor is small, so the level update is dampened, producing smaller derivatives $v$. This dampens both the EWMA numerator and $S^{(2)}$ equally, preserving $z \sim N(0,1)$ regardless of throughput.
+
+**Idle and sparse traffic handling.** Two mechanisms cooperate: (1) The time-weighted alpha $\alpha_k = 1 - e^{-\Delta t / (H \cdot W)}$ approaches 1 after long idle gaps, so the first observation after idle resets the EWMA to the current value. (2) The sum of squared weights $W^{(2)}$ correctly tracks the effective sample size under time-varying $\alpha$. After idle or irregular gaps, $W^{(2)}$ is large (few effective samples, wide SE), and gradually returns to $\alpha/(2-\alpha)$ as normal observations accumulate.
 
 ##### 4.3.1.1 Per-lane error rate: Bayesian shrinkage
 
@@ -400,13 +384,24 @@ Pool-wide error detection (error spread significance, dErrorRate z-test) has bee
 
 **Why this replaces pool-wide error detection.** The previous design used error spread (proportion of lanes with errors) and dErrorRate (trend in error ratio) to detect systemic errors. This required tracking `laneKeysCompletedThisWindow`, `laneKeysErroredThisWindow`, `errorSpreadEwma`, `activeLanesEwma`, `dErrorRateEwma`, and `dErrorRateVariance`. The new design achieves the same goal — decreasing concurrency for systemic errors while ignoring localized ones — with zero additional state. Per-lane shedding naturally filters localized errors, so the aggregate `errorRateEwma` is already a reliable systemic signal.
 
-**Theorem 7 (False positive rate).** *For a stationary process where $\text{d}\bar{m}_k$ is approximately normally distributed:*
-- *At high $L$: $P(\text{false positive}) \approx \Phi(-\sigma_D) \approx 0.0228$ per halfLife evaluation.*
-- *At low $L$: $P(\text{false positive}) < 0.0228$ due to the WoLF Kalman gain reduction at low throughput (§4.3.1).*
+**Theorem 7 (False positive rate).** *Under $H_0$, $z \sim N(0,1)$. Therefore:*
+- *$P(\text{false positive}) = \Phi(-\sigma_D) \approx 0.0228$ per halfLife evaluation, independent of throughput.*
+- *Bayesian shrinkage scales both the trend signal and its second moment equally — the shrinkage factor cancels in the z-score.*
 
-**Theorem 8 (Warm-up guard prevents early false positives).** *No concurrency adjustment occurs for the first $H$ windows after pool creation.*
+**Theorem 8 (Detection under $H_1$: the test cannot miss severe degradation).** *Under $H_1$ ($E[v] = \mu > 0$), the second moment $S^{(2)} \to \sigma^2 + \mu^2$. The z-score becomes:*
 
-*Proof.* The halfLife evaluation requires $n_w \geq H$. $n_w$ starts at 0 and increments once per window evaluation. Therefore at least halfLife windows ($\geq H \cdot W$ ms) must pass before the first evaluation. During this period, the dLogWBar EWMA and variance accumulate halfLife data points, providing a reliable baseline. $\square$
+$$z = \frac{\mu}{\sqrt{(\sigma^2 + \mu^2) \cdot W^{(2)}}} = \sqrt{\frac{1}{W^{(2)}}} \cdot \frac{\mu}{\sqrt{\sigma^2 + \mu^2}}$$
+
+*Three regimes:*
+- *Small signal ($\mu < 0.53\sigma$): $z < \sigma_D$ — not detected. The signal is below the noise floor; no test could reliably detect it.*
+- *Moderate signal ($\mu \approx \sigma$): $z \approx 3$ — detected. The trend exceeds the noise level.*
+- *Severe degradation ($\mu \gg \sigma$): $z \to \sqrt{(2-\alpha)/\alpha} \approx 4.25$ — always detected. The z-score saturates because $S^{(2)}$ includes $\mu^2$, but the saturation value exceeds $\sigma_D = 2$, so detection is guaranteed.*
+
+*The saturation means the z-score indicates presence of degradation (binary), not severity. Severity is encoded through persistence: sustained degradation keeps the z-test firing across halfLife evaluations, incrementing the regulation depth and producing progressively larger concurrency decreases.*
+
+**Theorem 9 (Warm-up guard prevents early false positives).** *No concurrency adjustment occurs for the first $H$ windows after pool creation.*
+
+*Proof.* The halfLife evaluation requires $n_w \geq H$. $n_w$ starts at 0 and increments once per window evaluation. Therefore at least halfLife windows ($\geq H \cdot W$ ms) must pass before the first evaluation. During this period, the trend EWMA and second moment accumulate data, providing a reliable baseline. $\square$
 
 ### 4.4 Regulation Phases and Step Formula
 
@@ -531,7 +526,7 @@ Note: the table shows factors at $s = 1$ (first oscillation cycle). The retracti
 
 2. **Self-scaling.** The step is proportional to the *current* limit $L$, not a lagging EWMA. A pool at $L = 50$ takes steps of $\sim 32$ at convergence; a pool at $L = 10$ takes steps of $\sim 6$.
 
-3. **Bounded by limit.** $\Delta \leq L$ always (Theorem 9 below) — the limit never more than doubles or halves in a single evaluation.
+3. **Bounded by limit.** $\Delta \leq L$ always (Theorem 10 below) — the limit never more than doubles or halves in a single evaluation.
 
 4. **Sensor-actuator lockstep.** The convergence rate $1/H$ matches the EWMA sensor's absorption rate. After each halfLife evaluation, the dLogWBar sensor has absorbed $\sim 63\%$ of the previous adjustment's effect before the next decision. The actuator never outpaces the sensor.
 
@@ -547,7 +542,7 @@ Note: the table shows factors at $s = 1$ (first oscillation cycle). The retracti
 
 ### 4.6 Theorems
 
-**Theorem 9 (Convergent step is bounded).** *$\Delta(d) \leq L$ for all $d \geq 1$ and $L \geq 1$.*
+**Theorem 10 (Convergent step is bounded).** *$\Delta(d) \leq L$ for all $d \geq 1$ and $L \geq 1$.*
 
 *Proof.* $1 - e^{-d/H} \leq 1$ for all $d \geq 0$, with equality only at $d = \infty$. Therefore $L \cdot (1 - e^{-d/H}) \leq L$, so $\lceil L \cdot (1 - e^{-d/H}) \rceil \leq L$. Since $L \geq L_{\min} \geq 1$, the $\max(1, \cdot)$ floor preserves $\Delta \leq L$. Equality ($\Delta = L$) is possible at very high $d$ when the product approaches $L$ from below and ceiling rounds up. $\square$
 
@@ -619,9 +614,9 @@ ProDel never writes to regulator state; the regulator never writes to ProDel sta
 | **No fresh drops** | Entries with sojourn $< \tau$ are never dropped (Theorem 1) |
 | **No wasted drops** | P = 1 - τ/s ensures staleness is verified for every drop (Theorem 1) |
 | **Bounded limit** | $L \in [L_{\min}, L_{\max}]$ always (Theorem 14) |
-| **No false positives during warm-up** | Evaluation gated on $n_w \geq H$ (Theorem 8) |
-| **Conservative at low concurrency** | WoLF Kalman gain reduced at low throughput via shrinkage-scaled $R_\text{eff}$ (§4.3.1) |
-| **Step bounded** | Each step $\leq L$ (Theorem 9) |
+| **No false positives during warm-up** | Evaluation gated on $n_w \geq H$ (Theorem 9) |
+| **Conservative at low concurrency** | Shrinkage-dampened EWMA reduces update weight at low throughput (§4.1.1, §4.2) |
+| **Step bounded** | Each step $\leq L$ (Theorem 10) |
 | **Retraction mirrors growth** | Decrease walks back growth in reverse order (Theorem 11) |
 | **Retraction is exact inverse** | Full retraction returns L to original value (Theorem 12) |
 | **Finite convergence to floor** | Decrease reaches $L_{\min}$ in $O(L_0)$ steps (Theorem 13) |
@@ -638,4 +633,4 @@ ProDel never writes to regulator state; the regulator never writes to ProDel sta
 | **Gradual restoring** | Convergent steps toward baseline from either direction; no discontinuous snaps (§4.4.4) |
 | **Bisection convergence** | Each increase→retract→cooling cycle halves stepScale; $O(\log L)$ cycles to equilibrium (§4.5) |
 | **One-eval cooling** | After a decrease sequence, one halfLife evaluation pause before allowing increases; stepScale halved (§4.4.1) |
-| **WoLF outlier robustness** | IMQ-weighted Kalman suppresses error-spike contamination of latency signal (§4.3.1) |
+| **Log-space robustness** | Log-transform compresses error-spike contamination of latency signal (§4.2) |

@@ -10,7 +10,7 @@
 import { writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Executor } from "../../src/Executor.js";
+import { Executor } from "../src/Executor.js";
 
 // ── Seeded PRNG (xorshift128+) ──────────────────────────────────────
 // Deterministic random numbers so charts look the same every run.
@@ -323,15 +323,14 @@ async function scenarioThroughputDegradation(): Promise<Scenario> {
     restoreFakeTime();
 
     return {
-        name: "Throughput Degradation & Recovery",
+        name: "Latency Step Change & Recovery",
         description:
             "Baseline: 10, min: 2, delayThreshold: 500ms, controlWindow: 100ms. " +
             "0\u20131500ms: healthy phase \u2014 150 tasks arriving every ~10ms, each taking ~15ms. EWMA warms up. " +
             "~1500\u20133500ms: backend degrades \u2014 tasks slow to ~200ms (arrival slows to ~40ms). " +
-            "Throughput monitor detects the completion rate drop and MD progressively cuts the concurrency limit. " +
-            "EWMA is frozen during the first ESS degraded windows, giving MD time for corrective action. " +
+            "Z-test detects the latency step change and the regulator decreases concurrency. " +
             "~3500\u20136000ms: backend recovers \u2014 tasks return to ~15ms. Queue drains, baseline gravity restores the limit. " +
-            "CoDel may activate briefly if MD cuts capacity below arrival rate.",
+            "CoDel may activate briefly if capacity drops below arrival rate.",
         data
     };
 }
@@ -388,7 +387,7 @@ async function scenarioDemandSpikeHealthy(): Promise<Scenario> {
             "0\u2013500ms: baseline established with 50 tasks arriving every ~10ms, each taking ~10ms. " +
             "~500ms: 500 tasks dumped at once. Queue spikes to ~490. Processing speed unchanged (~10ms). " +
             "500\u201310000ms: AI grows the limit as tasks complete with queue work. CoDel drops stale entries whose sojourn exceeds 50ms. " +
-            "Key point: MD does NOT fire \u2014 throughput (completions/window) stays healthy. " +
+            "Key point: z-test does NOT fire \u2014 throughput (completions/window) stays healthy. " +
             "A long queue is a demand problem, not a processing problem. The cashier doesn't slow down because the line is long.",
         data
     };
@@ -454,7 +453,7 @@ async function scenarioActualDegradationUnderLoad(): Promise<Scenario> {
             "0\u2013500ms: baseline established with 50 tasks, same as the healthy demand spike. " +
             "~500ms: 200 slow tasks (~150ms each) dumped at once. Queue spikes to ~190. " +
             "500\u20135500ms: AI grows the limit (tasks complete with queue work), CoDel drops stale entries. " +
-            "MD does NOT fire \u2014 the short baseline phase (~5 windows) doesn't accumulate enough variance samples for detection (requires ESS \u2248 9). " +
+            "z-test does NOT fire \u2014 the short baseline phase (~5 windows) doesn't accumulate enough variance samples for detection (requires ESS \u2248 9). " +
             "This is a one-shot burst, not sustained degradation. Compare with the healthy demand spike: same shape, but slower processing means CoDel drops more aggressively. " +
             "5500\u201311000ms: 100 fast recovery tasks (~10ms) drain remaining queue.",
         data
@@ -490,8 +489,8 @@ async function scenarioFullOverload(): Promise<Scenario> {
     // Phase 2: sustained backend degradation — same arrival rate, tasks now take ~300ms
     // Capacity: 10 slots / 300ms ≈ 33/sec. Arrival 100/sec >> capacity.
     // Queue grows rapidly → entries age past 100ms threshold → CoDel activates.
-    // Completion rate drops from ~10/window to ~3/window → MD fires.
-    // Both mechanisms cooperate: MD reduces concurrency to protect the backend,
+    // Completion rate drops from ~10/window to ~3/window → z-test fires.
+    // Both mechanisms cooperate: regulator reduces concurrency to protect the backend,
     // CoDel sheds excess demand from the queue.
     for (let i = 0; i < 200; i++) {
         const duration = rng.erlang(300);
@@ -516,14 +515,14 @@ async function scenarioFullOverload(): Promise<Scenario> {
     restoreFakeTime();
 
     return {
-        name: "Full Overload (CoDel + MD)",
+        name: "Full Overload (CoDel + Regulator Decrease)",
         description:
             "Baseline: 10, min: 2, max: 15, delayThreshold: 100ms, controlWindow: 100ms. " +
             "0\u20131500ms: healthy phase \u2014 150 tasks arriving every ~10ms, each taking ~15ms. EWMA warms up (~15 windows). " +
             "~1500\u20133500ms: sustained backend degradation \u2014 tasks slow to ~300ms, arrival unchanged at ~10ms. " +
             "Capacity drops well below arrival (100/sec). AI grows the limit but hits the cap (15) \u2014 not enough to compensate. " +
             "Queue grows, entries age past 100ms. " +
-            "Both mechanisms activate: MD detects the throughput drop and cuts concurrency to reduce backend pressure. " +
+            "Both mechanisms activate: z-test detects the latency change and cuts concurrency to reduce backend pressure. " +
             "CoDel detects stale queue entries and sheds excess demand. " +
             "~3500\u20135500ms: backend recovers \u2014 tasks return to ~15ms. CoDel exits dropping, " +
             "baseline gravity and AI restore the concurrency limit.",
@@ -559,7 +558,7 @@ async function main(): Promise<void> {
             `    Peak queue: ${maxQueue}, Peak in-flight: ${maxInFlight}, Peak limit: ${maxLimit}`
         );
         console.log(
-            `    CoDel drops: ${hadDrops ? "yes" : "no"}, MD fired: ${hadDegradation ? "yes" : "no"}\n`
+            `    CoDel drops: ${hadDrops ? "yes" : "no"}, Degradation detected: ${hadDegradation ? "yes" : "no"}\n`
         );
     }
 

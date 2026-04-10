@@ -18,8 +18,8 @@
 </head>
 <body>
 <h1>Executor: Theoretical Curves</h1>
-<p class="subtitle">Pure mathematical plots for each section of <a href="../../../src/Infrastructure/Executor/THEORY.md">THEORY.md</a>.
-Compare against the <a href="executor-simulation-live.html">live simulation</a>.</p>
+<p class="subtitle">Pure mathematical plots for each section of <a href="THEORY.md">THEORY.md</a>.
+Compare against the <a href="../simulations/executor-simulation-live.html">live simulation</a>.</p>
 
 <h2>&sect;2. ProDel: Probabilistic Delay Load-shedding</h2>
 
@@ -66,31 +66,23 @@ Compare against the <a href="executor-simulation-live.html">live simulation</a>.
 </p>
 <div class="chart-container"><canvas id="shrinkage"></canvas></div>
 
-<h3>&sect;4.2 WoLF: IMQ Weight Function</h3>
+<h3>&sect;4.2 Shrinkage-Dampened EWMA: Effective Level Alpha</h3>
 <p class="description">
-    w = 1/&radic;(1 + &nu;&sup2;/Z&sup2;). The Inverse Multiquadric (IMQ) kernel downweights outlier innovations.
-    At &nu; = 0: full weight (w = 1). At &nu; = Z = 2: w = 1/&radic;2 &approx; 0.71 (half-weight point in variance terms).
-    At &nu; = 6: w &approx; 0.32. Never reaches zero &mdash; even extreme outliers get some weight.
+    levelAlpha = &alpha; &times; shrinkage(completions, Z&sup2;). At low throughput (few completions),
+    shrinkage reduces the EWMA update weight &mdash; noisier observations get less trust.
+    Three curves show how completions affect the effective alpha.
 </p>
-<div class="chart-container"><canvas id="imq-weight"></canvas></div>
+<div class="chart-container"><canvas id="level-alpha"></canvas></div>
 
-<h3>&sect;4.2 WoLF: Effective Kalman Gain vs Innovation</h3>
+<h3>&sect;4.3 sumW2: Effective Sample Size for Time-Varying &alpha;</h3>
 <p class="description">
-    K<sub>eff</sub> = K &times; w, showing how the Kalman gain drops for outlier innovations.
-    At steady state with full shrinkage, K &approx; &alpha;<sub>0</sub> &approx; 0.105 for clean observations.
-    An outlier at &nu; = 4 gets K<sub>eff</sub> &approx; 0.03 &mdash; barely moves the filtered state.
-    Three curves show the effect of shrinkage (1, 4, and 20 completions).
+    sumW2 = &Sigma;w&sup2; tracks the sum of squared EWMA weights via the exact recursion
+    (1&minus;&alpha;)&sup2; &times; sumW2 + &alpha;&sup2;. For constant &alpha;, converges to &alpha;/(2&minus;&alpha;).
+    After idle (&alpha; &rarr; 1), sumW2 jumps toward 1 (one effective sample) and gradually decays
+    back to steady state. Longer idle &rarr; larger &alpha; &rarr; higher sumW2 spike &rarr; wider SE.
+    A 30s idle (&alpha; &approx; 0.999) takes ~15 windows to recover; a 3s idle (&alpha; &approx; 0.97) recovers in ~10.
 </p>
-<div class="chart-container"><canvas id="kalman-gain"></canvas></div>
-
-<h3>&sect;4.3.1 Variance Convergence Inflation</h3>
-<p class="description">
-    SE is inflated by 1/&radic;shrinkage(elapsedWindows/HALF_LIFE) to account for
-    the Welford variance not having converged. After 1 half-life: 2.24&times; inflation.
-    After 5 half-lives: 1.34&times;. After 20: 1.10&times;. Prevents false positives from
-    an underestimated variance during early operation.
-</p>
-<div class="chart-container"><canvas id="variance-inflation"></canvas></div>
+<div class="chart-container"><canvas id="sumw2-convergence"></canvas></div>
 
 <h3>&sect;4.4 Step Formula: Increase f(d) vs Retraction f/(1+f)</h3>
 <p class="description">
@@ -118,13 +110,13 @@ Compare against the <a href="executor-simulation-live.html">live simulation</a>.
 </p>
 <div class="chart-container"><canvas id="bisection"></canvas></div>
 
-<h3>&sect;4.6 Welford Variance Bias: 2(1&minus;&alpha;)/(2&minus;&alpha;)</h3>
+<h3>&sect;4.3 Second Moment: E[X&sup2;] = &sigma;&sup2; under H0</h3>
 <p class="description">
-    The Welford EWMS underestimates the true process variance &sigma;&sup2;.
-    At &alpha; = 0.105 (HALF_LIFE = 9): bias factor &approx; 0.945 (5.5% underestimate).
-    The SE formula corrects for this via the (2(1&minus;&alpha;)) denominator.
+    Under H0 (E[dLogWBarRate] = 0), the second moment SM = EWMA(x&sup2;) is an unbiased estimator
+    of &sigma;&sup2;: when E[X] = 0, E[X&sup2;] = Var(X) = &sigma;&sup2;. No bias correction needed.
+    SE = &radic;(SM &times; sumW2) = &sigma;/&radic;n<sub>eff</sub>, giving z ~ N(0,1) under H0.
 </p>
-<div class="chart-container"><canvas id="welford-bias"></canvas></div>
+<div class="chart-container"><canvas id="second-moment"></canvas></div>
 
 <h3>Per-Lane Error Rate: Bayesian Shrinkage</h3>
 <p class="description">
@@ -270,86 +262,77 @@ const chartDefaults = {
     });
 })();
 
-// 4.2 IMQ Weight
+// 4.2 Effective Level Alpha (shrinkage-dampened)
 (() => {
-    const vs = range(0, 8, 0.1);
-    new Chart(document.getElementById('imq-weight'), {
+    const ns = range(1, 50, 1);
+    const alpha0 = 1 - Math.exp(-1 / HALF_LIFE);
+    new Chart(document.getElementById('level-alpha'), {
         type: 'line',
         data: {
-            labels: vs.map(v => v.toFixed(1)),
+            labels: ns,
             datasets: [
-                { label: 'w = 1/sqrt(1 + v^2/Z^2)  [likelihood weight]', data: vs.map(v => 1 / Math.sqrt(1 + v * v / Z2)), borderColor: '#3498db' },
-                { label: 'w^2  [variance weight, not used]', data: vs.map(v => 1 / (1 + v * v / Z2)), borderColor: '#e67e22', borderDash: [5, 3] }
+                { label: 'levelAlpha (Z=1)', data: ns.map(n => (1 - Math.exp(-1/4)) * n/(n+1)), borderColor: '#2ecc71', borderDash: [5, 3] },
+                { label: 'levelAlpha (Z=2)', data: ns.map(n => alpha0 * shrinkage(n)), borderColor: '#3498db' },
+                { label: 'levelAlpha (Z=3)', data: ns.map(n => (1 - Math.exp(-1/19)) * n/(n+9)), borderColor: '#e74c3c', borderDash: [5, 3] }
             ]
         },
         options: { ...chartDefaults,
             scales: {
-                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Innovation v (log-units)' }, ticks: { maxTicksLimit: 10 } },
-                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Weight' }, min: 0, max: 1 }
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Completions per window (n)' }, ticks: { maxTicksLimit: 10 } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Effective level alpha' }, min: 0, max: 0.25 }
             }
         }
     });
 })();
 
-// 4.2 Effective Kalman Gain
+// 4.3 sumW2 Convergence — shows steady state then idle jump then recovery
 (() => {
-    const vs = range(0, 8, 0.1);
+    const totalWindows = 60;
+    const idleAt = 20; // idle gap occurs at window 20
+    const labels = range(1, totalWindows, 1);
     const alpha0 = 1 - Math.exp(-1 / HALF_LIFE);
-    const R = Z2;
-    const Q = alpha0 * alpha0 * R / (1 - alpha0);
+    const steadyState = alpha0 / (2 - alpha0);
 
-    function kEff(nu, completions) {
-        const w = 1 / Math.sqrt(1 + nu * nu / Z2);
-        const s = shrinkage(completions);
-        const rEff = R / (w * s);
-        const P = alpha0 * R / (1 - alpha0);
-        const pPred = P + Q;
-        const S = pPred + rEff;
-        return pPred / S;
+    function simulate(idleAlpha) {
+        const data = [];
+        let sw2 = 1; // first observation
+        for (let i = 1; i <= totalWindows; i++) {
+            if (i <= idleAt) {
+                // Normal operation — converges to steady state
+                sw2 = (1 - alpha0) * (1 - alpha0) * sw2 + alpha0 * alpha0;
+            } else if (i === idleAt + 1) {
+                // First window after idle — alpha is large
+                sw2 = (1 - idleAlpha) * (1 - idleAlpha) * sw2 + idleAlpha * idleAlpha;
+            } else {
+                // Recovery — normal alpha again
+                sw2 = (1 - alpha0) * (1 - alpha0) * sw2 + alpha0 * alpha0;
+            }
+            data.push(sw2);
+        }
+        return data;
     }
 
-    new Chart(document.getElementById('kalman-gain'), {
+    new Chart(document.getElementById('sumw2-convergence'), {
         type: 'line',
         data: {
-            labels: vs.map(v => v.toFixed(1)),
+            labels,
             datasets: [
-                { label: 'K_eff (n=20, high confidence)', data: vs.map(v => kEff(v, 20)), borderColor: '#3498db' },
-                { label: 'K_eff (n=4, medium)', data: vs.map(v => kEff(v, 4)), borderColor: '#e67e22' },
-                { label: 'K_eff (n=1, low confidence)', data: vs.map(v => kEff(v, 1)), borderColor: '#e74c3c', borderDash: [5, 3] }
+                { label: 'No idle (steady state)', data: simulate(alpha0), borderColor: '#3498db' },
+                { label: '3s idle at window 20 (α=0.97)', data: simulate(0.97), borderColor: '#e67e22' },
+                { label: '30s idle at window 20 (α=0.999)', data: simulate(0.999), borderColor: '#e74c3c' },
+                { label: 'Steady state: α/(2-α) ≈ 0.055', data: labels.map(() => steadyState), borderColor: '#999', borderDash: [3, 3], borderWidth: 1 }
             ]
         },
         options: { ...chartDefaults,
+            plugins: { ...chartDefaults.plugins,
+                annotation: { annotations: {
+                    idleLine: { type: 'line', xMin: idleAt, xMax: idleAt, borderColor: 'rgba(0,0,0,0.2)', borderDash: [4,4],
+                        label: { display: true, content: 'idle gap', position: 'start', backgroundColor: 'rgba(255,255,255,0.8)', color: '#666', font: { size: 11 } } }
+                }}
+            },
             scales: {
-                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Innovation v (log-units)' }, ticks: { maxTicksLimit: 10 } },
-                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Effective Kalman gain K' }, min: 0 }
-            }
-        }
-    });
-})();
-
-// 4.3.1 Variance Convergence Inflation
-(() => {
-    const halflives = range(0.5, 30, 0.25);
-    new Chart(document.getElementById('variance-inflation'), {
-        type: 'line',
-        data: {
-            labels: halflives.map(h => h.toFixed(1)),
-            datasets: [
-                { label: 'SE inflation = 1/sqrt(shrinkage(n/HL))',
-                  data: halflives.map(h => 1 / Math.sqrt(shrinkage(h))),
-                  borderColor: '#3498db' },
-                { label: 'Effective z (Z=2)',
-                  data: halflives.map(h => 2 / Math.sqrt(shrinkage(h))),
-                  borderColor: '#e67e22', borderDash: [5, 3] },
-                { label: 'Effective z (Z=3)',
-                  data: halflives.map(h => 3 / Math.sqrt(shrinkage(h))),
-                  borderColor: '#e74c3c', borderDash: [5, 3] }
-            ]
-        },
-        options: { ...chartDefaults,
-            scales: {
-                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Half-lives elapsed' }, ticks: { maxTicksLimit: 15 } },
-                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Multiplier' }, min: 0, max: 10 }
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Window number' } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'sumW2 (Σw²) — higher = fewer effective samples' }, min: 0, max: 1 }
             }
         }
     });
@@ -438,28 +421,54 @@ const chartDefaults = {
     });
 })();
 
-// 4.6 Welford Bias
+// 4.3 Second Moment convergence — SM tracks sigma^2 under H0
 (() => {
-    const alphas = range(0.01, 0.5, 0.005);
-    new Chart(document.getElementById('welford-bias'), {
+    // Simulate SM = EWMA(x^2) for N(0, sigma^2) noise with sigma=1
+    const windows = range(1, 50, 1);
+    const alpha0 = 1 - Math.exp(-1 / HALF_LIFE);
+
+    // Deterministic: show the expected convergence E[SM] = sigma^2 = 1
+    // SM_k = (1-alpha)*SM_{k-1} + alpha*x_k^2
+    // E[SM] converges to E[x^2] = sigma^2 for any alpha
+    const smValues = [];
+    let sm = 0;
+    for (const _ of windows) {
+        // E[x^2] = 1 (unit variance), so SM converges to 1
+        sm = (1 - alpha0) * sm + alpha0 * 1;
+        smValues.push(sm);
+    }
+
+    // SE = sqrt(SM * sumW2), show n_eff = 1/sumW2 growing
+    const nEffValues = [];
+    let sw2 = 1;
+    for (const _ of windows) {
+        sw2 = (1 - alpha0) * (1 - alpha0) * sw2 + alpha0 * alpha0;
+        nEffValues.push(1 / sw2);
+    }
+
+    new Chart(document.getElementById('second-moment'), {
         type: 'line',
         data: {
-            labels: alphas.map(a => a.toFixed(3)),
+            labels: windows,
             datasets: [{
-                label: 'E[V] / sigma^2 = 2(1-a)/(2-a)',
-                data: alphas.map(a => 2 * (1 - a) / (2 - a)),
+                label: 'E[SM] → σ² = 1  (unbiased for any α)',
+                data: smValues,
                 borderColor: '#3498db',
-                fill: { target: { value: 1 }, above: 'rgba(231,76,60,0.05)', below: 'rgba(52,152,219,0.08)' }
             }, {
-                label: 'Unbiased (1.0)',
-                data: alphas.map(() => 1),
+                label: 'n_eff = 1/sumW2 (effective sample size)',
+                data: nEffValues,
+                borderColor: '#2ecc71', yAxisID: 'y1'
+            }, {
+                label: 'σ² = 1',
+                data: windows.map(() => 1),
                 borderColor: '#999', borderDash: [3, 3], borderWidth: 1
             }]
         },
         options: { ...chartDefaults,
             scales: {
-                x: { ...chartDefaults.scales.x, title: { display: true, text: 'EWMA smoothing parameter alpha' }, ticks: { maxTicksLimit: 10 } },
-                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Bias factor (V/sigma^2)' }, min: 0.6, max: 1.05 }
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Windows' } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'E[SM] / σ²' }, min: 0, max: 1.1, position: 'left' },
+                y1: { title: { display: true, text: 'Effective samples (1/sumW2)' }, min: 0, max: 20, position: 'right', grid: { drawOnChartArea: false } }
             }
         }
     });
