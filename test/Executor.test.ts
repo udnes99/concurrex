@@ -2727,7 +2727,7 @@ describe("Executor tests", () => {
         test("creates executor with custom zScoreThreshold", () => {
             const e = new Executor({ zScoreThreshold: 3 });
             expect(e.zScoreThreshold).toBe(3);
-            expect(e.halfLife).toBe(Math.round(2 / (1 - Math.exp(-1 / 9))));
+            expect(e.timeConstant).toBe(Math.round(2 / (1 - Math.exp(-1 / 9))));
         });
 
         test("throws for zScoreThreshold = 0", () => {
@@ -2794,7 +2794,7 @@ describe("Executor tests", () => {
         test("pool inherits executor-level z-score by default", () => {
             executor.registerPool("test");
             expect(executor.zScoreThreshold).toBe(2);
-            expect(executor.halfLife).toBe(Math.round(2 / (1 - Math.exp(-1 / 4))));
+            expect(executor.timeConstant).toBe(Math.round(2 / (1 - Math.exp(-1 / 4))));
         });
 
         test("pool can override z-score", () => {
@@ -2808,9 +2808,9 @@ describe("Executor tests", () => {
             expect(state2.elapsedWindows).toBe(0);
         });
 
-        test("per-pool z-score affects halfLife used for regulation", async () => {
-            // z=1 gives halfLife = round(2 / (1 - exp(-1/1))) = round(2 / 0.6321) = 3
-            // z=2 gives halfLife = round(2 / (1 - exp(-1/4))) = 9
+        test("per-pool z-score affects timeConstant used for regulation", async () => {
+            // z=1 gives timeConstant = round(2 / (1 - exp(-1/1))) = round(2 / 0.6321) = 3
+            // z=2 gives timeConstant = round(2 / (1 - exp(-1/4))) = 9
             executor.registerPool("fast", { zScoreThreshold: 1, baselineConcurrency: 5, controlWindow: 10 });
             executor.registerPool("slow", { zScoreThreshold: 2, baselineConcurrency: 5, controlWindow: 10 });
 

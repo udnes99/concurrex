@@ -170,7 +170,7 @@ async function submitAtRate(
 
 async function runDegradationScenario(zScore: number): Promise<Scenario> {
     console.log(
-        `\n  Running: z=${zScore} (HALF_LIFE=${Math.round(2 / (1 - Math.exp(-1 / (zScore * zScore))))})`
+        `\n  Running: z=${zScore} (TIME_CONSTANT=${Math.round(2 / (1 - Math.exp(-1 / (zScore * zScore))))})`
     );
     const executor = new Executor({ logger, zScoreThreshold: zScore });
     executor.start();
@@ -183,14 +183,14 @@ async function runDegradationScenario(zScore: number): Promise<Scenario> {
         controlWindow: 100
     });
 
-    // Warm-up: run 2×HALF_LIFE windows of steady traffic so all EWMAs
+    // Warm-up: run 2×TIME_CONSTANT windows of steady traffic so all EWMAs
     // and the second moment reach statistical steady state before
     // the actual test phases begin. Not recorded in charts.
     globalDelay = 10;
     backpressureEnabled = false;
     globalErrorProbability = 0;
-    const warmupMs = Math.max(5_000, 2 * executor.halfLife * 100 + 2_000);
-    console.log(`    Warm-up: ${warmupMs}ms (2×HALF_LIFE + buffer)...`);
+    const warmupMs = Math.max(5_000, 2 * executor.timeConstant * 100 + 2_000);
+    console.log(`    Warm-up: ${warmupMs}ms (2×TIME_CONSTANT + buffer)...`);
     completionCount = 0;
     errorCount = 0;
     const allTasks: Promise<unknown>[] = [];
@@ -228,11 +228,11 @@ async function runDegradationScenario(zScore: number): Promise<Scenario> {
     data.push(captureSnapshot(executor, pool, startTime, 0, 0));
     executor.stop();
 
-    const hl = executor.halfLife;
+    const tc = executor.timeConstant;
     return {
-        name: `z = ${zScore} (HALF_LIFE = ${hl}, false-positive ≈ ${(100 * (1 - normalCdf(zScore))).toFixed(1)}%)`,
+        name: `z = ${zScore} (TIME_CONSTANT = ${tc}, false-positive ≈ ${(100 * (1 - normalCdf(zScore))).toFixed(1)}%)`,
         description:
-            `zScoreThreshold=${zScore}, HALF_LIFE=${hl}. ` +
+            `zScoreThreshold=${zScore}, TIME_CONSTANT=${tc}. ` +
             `Baseline: 20, min: 2, max: 100, delayThreshold: 200ms. ` +
             `Warm-up: ${warmupMs}ms (not shown). ` +
             `Phase 1 (0–12s): 10ms backend. Phase 2 (12–24s): 500ms backend. Phase 3 (24–36s): 10ms recovery.`,
