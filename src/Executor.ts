@@ -256,7 +256,8 @@ export class Executor {
 
     /** Yield to the event loop between admitted tasks so CPU-bound work doesn't block I/O. */
     private schedule(fn: () => void): void {
-        typeof setImmediate === "function" ? setImmediate(fn) : queueMicrotask(fn);
+        const g = globalThis as Record<string, unknown>;
+        typeof g.setImmediate === "function" ? (g.setImmediate as (fn: () => void) => void)(fn) : queueMicrotask(fn);
     }
 
     constructor(options?: { logger?: Logger; zScoreThreshold?: number }) {
