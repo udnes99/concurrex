@@ -186,6 +186,14 @@ const DEFAULT_CONTROL_WINDOW = 100;
 const DEFAULT_Z_SCORE_THRESHOLD = 2;
 
 /**
+ * Deferred scheduling: yields to the event loop between admitted tasks so CPU-bound
+ * work doesn't block I/O or the regulator. setImmediate (Node) for true yielding
+ * to I/O; queueMicrotask (browser) as fallback where tasks are rarely CPU-bound.
+ */
+const schedule: (fn: () => void) => void =
+    typeof setImmediate === "function" ? setImmediate : queueMicrotask;
+
+/**
  * A ProDel-based executor with adaptive concurrency.
  *
  * Three independent mechanisms cooperate:
@@ -872,7 +880,7 @@ export class Executor {
         pool.lastInFlightChangeTime = now;
         pool.inFlight++;
         lane.inFlight++;
-        entry.callback.resolve();
+        schedule(() => this.running && entry.callback.resolve());
     }
 
     /**
