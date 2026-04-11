@@ -254,13 +254,10 @@ export class Executor {
     private readonly pools = new Map<string, Pool>();
     private transientLaneCounter = 0;
 
-    /**
-     * Deferred scheduling: yields to the event loop between admitted tasks so
-     * CPU-bound work doesn't block I/O or the regulator. setImmediate (Node)
-     * for true yielding; queueMicrotask (browser) as fallback.
-     */
-    private static readonly schedule: (fn: () => void) => void =
-        typeof setImmediate === "function" ? setImmediate : queueMicrotask;
+    /** Yield to the event loop between admitted tasks so CPU-bound work doesn't block I/O. */
+    private schedule(fn: () => void): void {
+        typeof setImmediate === "function" ? setImmediate(fn) : queueMicrotask(fn);
+    }
 
     constructor(options?: { logger?: Logger; zScoreThreshold?: number }) {
         this.logger = options?.logger ?? console;
@@ -880,7 +877,7 @@ export class Executor {
         pool.lastInFlightChangeTime = now;
         pool.inFlight++;
         lane.inFlight++;
-        Executor.schedule(() => this.running && entry.callback.resolve());
+        this.schedule(() => this.running && entry.callback.resolve());
     }
 
     /**
