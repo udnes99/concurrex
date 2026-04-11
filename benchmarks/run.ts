@@ -134,6 +134,31 @@ function printTable(results: Map<string, BenchmarkRun>, modes: Mode[]) {
     console.log(rows.join("\n"));
 }
 
+// ── CSV report ───────────────────────────────────────────────────────
+
+function generateCsv(results: Map<string, BenchmarkRun>, modes: Mode[]): string {
+    const header = ["benchmark", "mode", "req_s_avg", "latency_p50_ms", "latency_p99_ms", "latency_max_ms", "2xx_pct", "errors"];
+    const rows: string[] = [header.join(",")];
+
+    for (const [name, run] of results) {
+        for (const mode of modes) {
+            const r = run[mode];
+            if (!r) continue;
+            rows.push([
+                name,
+                mode,
+                r.requests.average,
+                r.latency.p50,
+                r.latency.p99,
+                r.latency.max,
+                pct2xx(r).toFixed(1),
+                r.errors,
+            ].join(","));
+        }
+    }
+    return rows.join("\n") + "\n";
+}
+
 // ── HTML report ──────────────────────────────────────────────────────
 
 function generateHtml(results: Map<string, BenchmarkRun>, modes: Mode[]): string {
@@ -260,9 +285,14 @@ async function main() {
     console.log("\n");
     printTable(results, modes);
 
-    const htmlPath = path.join(root, "benchmarks", "results.html");
+    const outDir = path.join(root, "benchmarks");
+    const htmlPath = path.join(outDir, "results.html");
     writeFileSync(htmlPath, generateHtml(results, modes));
     console.log(`\nHTML report: ${htmlPath}`);
+
+    const csvPath = path.join(outDir, "results.csv");
+    writeFileSync(csvPath, generateCsv(results, modes));
+    console.log(`CSV report:  ${csvPath}`);
 }
 
 main().catch((err) => {

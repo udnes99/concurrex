@@ -4,3 +4,4 @@ dist/
 *.tgz
 simulations/*.html
 benchmarks/results.html
+benchmarks/results.csv
