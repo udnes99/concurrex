@@ -4,6 +4,9 @@ import type { Logger } from "../src/logger.js";
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Yield to the real event loop, flushing pending setImmediate callbacks (deferred admissions). */
+const drain = () => new Promise<void>(resolve => setImmediate(resolve));
+
 const logger: Logger = {
     info() {},
     warn() {},
@@ -17,7 +20,7 @@ describe("Executor tests", () => {
         let randomSpy: ReturnType<typeof vi.spyOn>;
 
         beforeAll(() => {
-            vi.useFakeTimers();
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
             // Mock Math.random to always return 0 (< any severity > 0), making
             // MD deterministic in all tests. The probabilistic gating is tested
             // explicitly in its own describe block.
@@ -143,7 +146,7 @@ describe("Executor tests", () => {
                 const slot2 = executor.run("test", () => wait(200));
 
                 // Let tasks get admitted
-                await vi.advanceTimersByTimeAsync(0);
+                await drain();
 
                 // Queue tasks while both slots are busy. Each takes 100ms when admitted.
                 const queuedTasks = Array.from({ length: 5 }, (_, i) =>
@@ -482,7 +485,7 @@ describe("Executor tests", () => {
                 // Fill both slots with slow tasks
                 const task1 = executor.run("test", () => wait(100));
                 const task2 = executor.run("test", () => wait(100));
-                await vi.advanceTimersByTimeAsync(0);
+                await drain();
 
                 // Queue a third task — this creates pending work
                 const task3 = executor.run("test", async () => "third");
@@ -548,7 +551,7 @@ describe("Executor tests", () => {
                 const slot1 = executor.run("test", () => wait(100));
                 const slot2 = executor.run("test", () => wait(300));
                 const slot3 = executor.run("test", () => wait(300));
-                await vi.advanceTimersByTimeAsync(0);
+                await drain();
 
                 // Queue tasks while all slots busy
                 const queuedTasks = Array.from({ length: 5 }, (_, i) =>
@@ -609,7 +612,7 @@ describe("Executor tests", () => {
                 const v1 = executor.run("test", () => wait(10));
                 const v2 = executor.run("test", () => wait(10));
                 const v3 = executor.run("test", () => wait(10));
-                await vi.advanceTimersByTimeAsync(0);
+                await drain();
 
                 // These should all complete (limit is at or near baseline)
                 await vi.advanceTimersByTimeAsync(50);
@@ -632,7 +635,7 @@ describe("Executor tests", () => {
                 const slots = Array.from({ length: 5 }, () =>
                     executor.run("test", () => wait(100))
                 );
-                await vi.advanceTimersByTimeAsync(0);
+                await drain();
 
                 const overloadTasks = Array.from({ length: 5 }, () =>
                     executor.run("test", () => wait(50)).catch(() => {})
@@ -720,7 +723,7 @@ describe("Executor tests", () => {
 
                 // Fill the single slot with a slow task
                 const inFlight = executor.run("test", () => wait(1000));
-                await vi.advanceTimersByTimeAsync(0);
+                await drain();
 
                 // Queue 3 more tasks — they're waiting for the slot
                 const queued = Array.from({ length: 3 }, (_, i) => executor.run("test", () => i));
@@ -767,7 +770,7 @@ describe("Executor tests", () => {
         let perfSpy: ReturnType<typeof vi.spyOn>;
 
         beforeAll(() => {
-            vi.useFakeTimers();
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
         });
 
         beforeEach(() => {
@@ -810,8 +813,10 @@ describe("Executor tests", () => {
 
         /** Advance both currentTime and fake timers together. */
         async function advance(ms: number): Promise<void> {
+            await drain();
             currentTime += ms;
             await vi.advanceTimersByTimeAsync(ms);
+            await drain();
         }
 
         // ─── Scenarios ─────────────────────────────────────────────────
@@ -963,7 +968,7 @@ describe("Executor tests", () => {
                 const slot1 = executor.run("test", () => wait(100));
                 const slot2 = executor.run("test", () => wait(300));
                 const slot3 = executor.run("test", () => wait(300));
-                await vi.advanceTimersByTimeAsync(0);
+                await drain();
 
                 // Flood while all slots busy
                 const floodResults: TaskResult[] = [];
@@ -1007,7 +1012,7 @@ describe("Executor tests", () => {
                 const slots = Array.from({ length: 5 }, () =>
                     executor.run("test", () => wait(100))
                 );
-                await vi.advanceTimersByTimeAsync(0);
+                await drain();
                 const flood = Array.from({ length: 10 }, () =>
                     executor.run("test", () => wait(50)).catch(() => {})
                 );
@@ -1033,7 +1038,7 @@ describe("Executor tests", () => {
                     executor.run("test", () => wait(10))
                 );
                 currentTime += 100;
-                await vi.advanceTimersByTimeAsync(0);
+                await drain();
                 await vi.advanceTimersByTimeAsync(20);
                 await Promise.all(verify);
             });
@@ -1112,8 +1117,10 @@ describe("Executor tests", () => {
                 const phaseResults: { phase: string; ok: number; rejected: number }[] = [];
 
                 for (let cycle = 0; cycle < 4; cycle++) {
-                    // High phase: 10 concurrent tasks (2x baseline)
+                    // High phase: 10 concurrent tasks (2x baseline).
+                    // Two advance calls: deferred admission processes in waves.
                     const high = submitBatch("test", 10, 30);
+                    await advance(80);
                     await advance(80);
                     await Promise.allSettled(high.promises);
                     phaseResults.push({
@@ -1261,7 +1268,7 @@ describe("Executor tests", () => {
                     const slot1 = executor.run("test", () => wait(100));
                     const slot2 = executor.run("test", () => wait(300));
                     const slot3 = executor.run("test", () => wait(300));
-                    await vi.advanceTimersByTimeAsync(0);
+                    await drain();
 
                     const flood = Array.from({ length: 8 }, () =>
                         executor
@@ -1306,7 +1313,7 @@ describe("Executor tests", () => {
                     const slot1 = executor.run("test", () => wait(100));
                     const slot2 = executor.run("test", () => wait(300));
                     const slot3 = executor.run("test", () => wait(300));
-                    await vi.advanceTimersByTimeAsync(0);
+                    await drain();
 
                     const flood = Array.from({ length: 5 }, () =>
                         executor.run("test", () => wait(50)).catch(() => {})
@@ -1334,7 +1341,7 @@ describe("Executor tests", () => {
                     executor.run("test", () => wait(10))
                 );
                 currentTime += 100;
-                await vi.advanceTimersByTimeAsync(0);
+                await drain();
                 await vi.advanceTimersByTimeAsync(20);
                 await Promise.all(verify);
             });
@@ -1472,7 +1479,7 @@ describe("Executor tests", () => {
                 const cmd1 = executor.run("commands", () => wait(100));
                 const cmd2 = executor.run("commands", () => wait(300));
                 const cmd3 = executor.run("commands", () => wait(300));
-                await vi.advanceTimersByTimeAsync(0);
+                await drain();
 
                 let cmdRejected = 0;
                 const cmdFlood = Array.from({ length: 8 }, () =>
@@ -1584,11 +1591,15 @@ describe("Executor tests", () => {
                 }
 
                 // Sustain queue pressure across enough windows for ESS evaluation.
+                // Two advance() calls per window: deferred admission means tasks
+                // process in waves (first batch completes → second batch admitted
+                // → needs another advance to complete).
                 const allTasks: Promise<unknown>[] = [];
                 for (let w = 0; w < 12; w++) {
                     for (let i = 0; i < 6; i++) {
                         allTasks.push(executor.run("test", () => wait(50)));
                     }
+                    await advance(101);
                     await advance(101);
                     await Promise.allSettled(allTasks.filter(() => true));
                 }
@@ -1596,6 +1607,7 @@ describe("Executor tests", () => {
                 // After ESS evaluation with queue pressure, limit should be above baseline.
                 expect(executor.getConcurrencyLimit("test")).toBeGreaterThan(3);
 
+                await advance(2000);
                 await advance(2000);
                 await Promise.allSettled(allTasks);
             });
@@ -1615,7 +1627,7 @@ describe("Executor tests", () => {
                 const slots = Array.from({ length: 3 }, () =>
                     executor.run("test", () => wait(5000))
                 );
-                await vi.advanceTimersByTimeAsync(0);
+                await drain();
                 let rejected = 0;
 
                 // Continuously queue entries to keep queue non-empty through
@@ -1708,7 +1720,7 @@ describe("Executor tests", () => {
                 const slots = Array.from({ length: 5 }, () =>
                     executor.run("test", () => wait(100))
                 );
-                await vi.advanceTimersByTimeAsync(0);
+                await drain();
 
                 const flood = Array.from({ length: 10 }, () =>
                     executor.run("test", () => wait(50)).catch(() => {})
@@ -1746,9 +1758,10 @@ describe("Executor tests", () => {
                 );
                 await advance(0);
 
-                // 6 extras queue, regulator ramps limit as slow tasks complete
+                // 6 extras queue, regulator ramps limit as slow tasks complete.
+                // Extra advance calls: deferred admission processes in waves.
                 const extras = submitBatch("test", 6, 150);
-                // Advance in window-sized chunks so growth and gravity fire
+                await advance(250);
                 await advance(250);
                 await advance(250);
                 await Promise.allSettled([...slow, ...extras.promises]);
@@ -1872,7 +1885,7 @@ describe("Executor tests", () => {
                 for (let i = 0; i < 2; i++) {
                     catchAll.push(executor.run("test", () => wait(50)));
                 }
-                await vi.advanceTimersByTimeAsync(0);
+                await drain();
 
                 // Queue 20 entries — these sit in queue while all 10 slots are occupied
                 for (let i = 0; i < 20; i++) {
@@ -1922,7 +1935,7 @@ describe("Executor tests", () => {
                 for (let i = 0; i < 10; i++) {
                     catchAll.push(executor.run("test", () => wait(50000)));
                 }
-                await vi.advanceTimersByTimeAsync(0);
+                await drain();
 
                 // Queue stale entries
                 for (let i = 0; i < 10; i++) {
@@ -1956,7 +1969,7 @@ describe("Executor tests", () => {
                             rejected++;
                         })
                 );
-                await vi.advanceTimersByTimeAsync(0);
+                await drain();
 
                 // Fresh entry is in queue, not yet admitted
                 expect(executor.getQueueLength("test")).toBeGreaterThan(0);
@@ -1991,7 +2004,7 @@ describe("Executor tests", () => {
                 for (let i = 0; i < 5; i++) {
                     catchAll.push(executor.run("test", () => wait(50000)));
                 }
-                await vi.advanceTimersByTimeAsync(0);
+                await drain();
 
                 // Queue 10 entries — can't be admitted (inFlight=5, limit=5)
                 for (let i = 0; i < 10; i++) {
@@ -2052,8 +2065,10 @@ describe("Executor tests", () => {
                         allTasks.push(executor.run("test", () => wait(50)));
                     }
                     await advance(101);
+                    await advance(101);
                     await Promise.allSettled(allTasks.filter(() => true));
                 }
+                await advance(2000);
                 await advance(2000);
                 await Promise.allSettled(allTasks);
 
@@ -2087,7 +2102,7 @@ describe("Executor tests", () => {
         let currentTime: number;
 
         beforeAll(() => {
-            vi.useFakeTimers();
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
         });
 
         beforeEach(() => {
@@ -2108,8 +2123,10 @@ describe("Executor tests", () => {
         });
 
         async function advance(ms: number): Promise<void> {
+            await drain();
             currentTime += ms;
             await vi.advanceTimersByTimeAsync(ms);
+            await drain();
         }
 
         /**
@@ -2189,7 +2206,7 @@ describe("Executor tests", () => {
         let currentTime: number;
 
         beforeAll(() => {
-            vi.useFakeTimers();
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
         });
 
         beforeEach(() => {
@@ -2211,8 +2228,10 @@ describe("Executor tests", () => {
         });
 
         async function advance(ms: number): Promise<void> {
+            await drain();
             currentTime += ms;
             await vi.advanceTimersByTimeAsync(ms);
+            await drain();
         }
 
         test("regulator grows limit when latency is stable and queue has pressure", async () => {
@@ -2350,7 +2369,7 @@ describe("Executor tests", () => {
             expect(realExecutor.getConcurrencyLimit("test")).toBeGreaterThan(limitAfterDegrade);
             realExecutor.stop();
 
-            vi.useFakeTimers();
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
             vi.setSystemTime(0);
             currentTime = 0;
             vi.spyOn(performance, "now").mockImplementation(() => currentTime);
@@ -2365,7 +2384,7 @@ describe("Executor tests", () => {
         let randomValue: number;
 
         beforeAll(() => {
-            vi.useFakeTimers();
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
         });
 
         beforeEach(() => {
@@ -2388,8 +2407,10 @@ describe("Executor tests", () => {
         });
 
         async function advance(ms: number): Promise<void> {
+            await drain();
             currentTime += ms;
             await vi.advanceTimersByTimeAsync(ms);
+            await drain();
         }
 
         test("task errors are re-thrown to the caller", async () => {
@@ -2774,7 +2795,7 @@ describe("Executor tests", () => {
         let executor: Executor;
 
         beforeAll(() => {
-            vi.useFakeTimers();
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
         });
 
         beforeEach(() => {
@@ -2834,7 +2855,7 @@ describe("Executor tests", () => {
         let executor: Executor;
 
         beforeAll(() => {
-            vi.useFakeTimers();
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
         });
 
         beforeEach(() => {
@@ -2918,7 +2939,7 @@ describe("Executor tests", () => {
         let executor: Executor;
 
         beforeAll(() => {
-            vi.useFakeTimers();
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
         });
 
         beforeEach(() => {

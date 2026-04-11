@@ -3,3 +3,5 @@ dist/
 .context/
 *.tgz
 simulations/*.html
+benchmarks/results.html
+benchmarks/results.csv

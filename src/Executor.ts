@@ -254,6 +254,12 @@ export class Executor {
     private readonly pools = new Map<string, Pool>();
     private transientLaneCounter = 0;
 
+    /** Yield to the event loop between admitted tasks so CPU-bound work doesn't block I/O. */
+    private schedule(fn: () => void): void {
+        const g = globalThis as Record<string, unknown>;
+        typeof g.setImmediate === "function" ? (g.setImmediate as (fn: () => void) => void)(fn) : queueMicrotask(fn);
+    }
+
     constructor(options?: { logger?: Logger; zScoreThreshold?: number }) {
         this.logger = options?.logger ?? console;
         const z = options?.zScoreThreshold ?? DEFAULT_Z_SCORE_THRESHOLD;
@@ -872,7 +878,7 @@ export class Executor {
         pool.lastInFlightChangeTime = now;
         pool.inFlight++;
         lane.inFlight++;
-        entry.callback.resolve();
+        this.schedule(() => this.running && entry.callback.resolve());
     }
 
     /**
