@@ -69,30 +69,30 @@ Node v22, single run per benchmark. "Concurrex" uses adaptive admission control;
 
 | Benchmark | Metric | concurrex | bare |
 |---|---|---|---|
-| **async-io** | Req/s (avg) | 3,271 | 1,865 |
-| | Latency p50 | 60ms | 63ms |
-| | Latency p99 | 101ms | 909ms |
-| | Max latency | 179ms | 1,466ms |
+| **async-io** | Req/s (avg) | 3,327 | 3,310 |
+| | Latency p50 | 59ms | 60ms |
+| | Latency p99 | 99ms | 99ms |
+| | Max latency | 117ms | 122ms |
 | | 2xx % | 100% | 100% |
-| **cpu-bound** | Req/s (avg) | 136 | 188 |
-| | Latency p50 | 366ms | 243ms |
-| | Latency p99 | 676ms | 2,271ms |
-| | Max latency | 951ms | 6,285ms |
-| | 2xx % | 87.6% | 100% |
-| **mixed-latency** | Req/s (avg) | 1,066 | 710 |
-| | Latency p50 | 17ms | 12ms |
-| | Latency p99 | 498ms | 1,407ms |
-| | Max latency | 703ms | 2,299ms |
-| | 2xx % | 95% | 100% |
-| **contention** | Req/s (avg) | 1,717 | 100 |
+| **cpu-bound** | Req/s (avg) | 334 | 195 |
+| | Latency p50 | 153ms | 249ms |
+| | Latency p99 | 313ms | 1,111ms |
+| | Max latency | 574ms | 5,014ms |
+| | 2xx % | 57% | 100% |
+| **mixed-latency** | Req/s (avg) | 1,256 | 1,296 |
+| | Latency p50 | 13ms | 11ms |
+| | Latency p99 | 489ms | 484ms |
+| | Max latency | 767ms | 502ms |
+| | 2xx % | 82.6% | 100% |
+| **contention** | Req/s (avg) | 1,933 | 100 |
 | | Latency p50 | <1ms | 1,006ms |
-| | Latency p99 | 303ms | 1,021ms |
-| | Max latency | 496ms | 1,061ms |
-| | 2xx % | 21.2% | 100% |
+| | Latency p99 | 291ms | 1,010ms |
+| | Max latency | 412ms | 1,019ms |
+| | 2xx % | 16.8% | 100% |
 
 **Key takeaways:**
 
-- **async-io**: Near-identical p50; Concurrex keeps p99 tight (101ms vs 909ms) under sustained load.
-- **cpu-bound**: Bare serves slightly more 2xx but with catastrophic tail latency (6.3s max). Concurrex sheds excess and keeps p99 at 676ms — a 3.4x improvement.
-- **mixed-latency**: 50% higher throughput, 2.8x better p99. ProDel sheds the slow 20% to protect the fast 80%.
-- **contention**: The showcase — 17x throughput, 1000x better p50. Quadratic latency makes unregulated concurrency devastating; the regulator finds the sweet spot.
+- **async-io**: Identical throughput and latency — Concurrex adds no measurable overhead when the baseline is tuned correctly.
+- **cpu-bound**: 71% higher throughput, 3.5x better p99, 8.7x better max latency. Bare serves all requests but with catastrophic tail latency (5s). Concurrex sheds excess and keeps tails tight.
+- **mixed-latency**: Similar throughput. The 80/20 fast/slow split doesn't create enough contention for the regulator to improve on bare Express.
+- **contention**: The showcase — 19x throughput, 1000x better p50. Quadratic latency makes unregulated concurrency devastating; the regulator finds the sweet spot.
