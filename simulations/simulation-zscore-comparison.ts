@@ -9,10 +9,9 @@
  * Then open the generated executor-zscore-comparison.html file.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { Executor } from "../src/Executor.js";
+import { generateJsonOutput } from "./output.js";
+import { generateHtmlFromJson } from "./generate-html.js";
 
 const PORT = 9878;
 const SAMPLE_INTERVAL = 50;
@@ -275,132 +274,14 @@ async function main(): Promise<void> {
         );
     }
 
-    generateHtml(scenarios);
+    const jsonPath = generateJsonOutput(import.meta.url, "simulation-zscore-comparison", scenarios, {
+        title: "Z-Score Threshold Comparison",
+        subtitle: "Same scenario (throughput degradation + recovery) with different zScoreThreshold values. Lower z = more sensitive, higher false-positive rate."
+    });
+    generateHtmlFromJson(jsonPath);
 
     server.close();
     console.log("\nDone.");
-}
-
-function generateHtml(scenarios: Scenario[]): void {
-    const scenarioBlocks = scenarios
-        .map(
-            (s, i) =>
-                '<div class="scenario">' +
-                "<h2>" +
-                s.name +
-                "</h2>" +
-                "<p>" +
-                s.description +
-                "</p>" +
-                '<div class="chart-container"><canvas id="chart-' +
-                i +
-                '"></canvas></div>' +
-                '<div class="legend-note">Shaded red = ProDel dropping &middot; Shaded orange = throughput degraded &middot; Dashed red = error rate</div>' +
-                '<div class="chart-label">EWMA Filter State &mdash; log(W) where W = &int;N(t)dt / completions (Little&rsquo;s Law latency)</div>' +
-                '<div class="chart-description">Gray dashed = raw log(W) per window (noisy). Blue = EWMA-filtered level (shrinkage-dampened). ' +
-                "When the backend degrades, raw log(W) jumps; the filter tracks the genuine shift while dampening noise.</div>" +
-                '<div class="chart-container-sm"><canvas id="ewma-' +
-                i +
-                '"></canvas></div>' +
-                '<div class="chart-label">Latency Trend z-Test &mdash; dLogW&#x0304; (change in filtered state per window)</div>' +
-                '<div class="chart-description">Green = EWMA of dLogW&#x0304; (trend signal). Gold dashed = &plusmn;1 SE band (second-moment noise level). ' +
-                "Red dashed = z &times; SE threshold. Red dots = DEGRADING (z-test fires). " +
-                "The test detects sustained upward trends in the EWMA output &mdash; transient spikes are dampened by the filter before reaching this stage.</div>" +
-                '<div class="chart-container-sm"><canvas id="ztest-' +
-                i +
-                '"></canvas></div>' +
-                "</div>"
-        )
-        .join("\n");
-
-    const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Z-Score Comparison</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
-<style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #c9d1d9; padding: 24px; }
-    h1 { font-size: 24px; margin-bottom: 8px; color: #f0f6fc; }
-    .subtitle { font-size: 14px; color: #8b949e; margin-bottom: 32px; }
-    .scenario { margin-bottom: 48px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 24px; }
-    .scenario h2 { font-size: 18px; color: #f0f6fc; margin-bottom: 4px; }
-    .scenario p { font-size: 13px; color: #8b949e; margin-bottom: 16px; line-height: 1.5; }
-    .chart-container { position: relative; height: 300px; }
-    .chart-container-sm { position: relative; height: 200px; margin-top: 16px; }
-    .chart-label { font-size: 12px; color: #8b949e; margin-top: 16px; margin-bottom: 4px; font-weight: 500; }
-    .legend-note { font-size: 11px; color: #484f58; margin-top: 8px; }
-    .chart-description { font-size: 11px; color: #6e7681; margin-bottom: 8px; line-height: 1.5; }
-</style>
-</head>
-<body>
-<h1>Z-Score Threshold Comparison</h1>
-<p class="subtitle">Same scenario (throughput degradation + recovery) with different zScoreThreshold values. Lower z = more sensitive, higher false-positive rate.</p>
-${scenarioBlocks}
-<script>
-const scenarios = ${JSON.stringify(scenarios)};
-const COLORS = { queue: '#d29922', inFlight: '#3fb950', limit: '#58a6ff', rps: '#bc8cff', errorRate: '#f85149', dropping: 'rgba(248, 81, 73, 0.15)', degraded: 'rgba(210, 153, 34, 0.10)' };
-scenarios.forEach((scenario, i) => {
-    const labels = scenario.data.map(d => d.time);
-    new Chart(document.getElementById('chart-' + i).getContext('2d'), {
-        type: 'line',
-        data: { labels, datasets: [
-            { label: 'Queue Length', data: scenario.data.map(d => d.queueLength), borderColor: COLORS.queue, borderWidth: 1.5, pointRadius: 0, yAxisID: 'y' },
-            { label: 'In-Flight', data: scenario.data.map(d => d.inFlight), borderColor: COLORS.inFlight, borderWidth: 1.5, pointRadius: 0, yAxisID: 'y' },
-            { label: 'Concurrency Limit', data: scenario.data.map(d => d.concurrencyLimit), borderColor: COLORS.limit, borderWidth: 2, pointRadius: 0, yAxisID: 'y' },
-            { label: 'Throughput', data: scenario.data.map(d => d.requestsPerSec), borderColor: COLORS.rps, borderWidth: 1, pointRadius: 0, borderDash: [4, 2], yAxisID: 'y2' },
-            { label: 'Error Rate', data: scenario.data.map(d => d.errorRate), borderColor: COLORS.errorRate, borderWidth: 1, pointRadius: 0, borderDash: [2, 2], yAxisID: 'y3' },
-            { label: 'Dropping', data: scenario.data.map(d => d.dropping ? 1 : null), backgroundColor: COLORS.dropping, fill: true, borderWidth: 0, pointRadius: 0, yAxisID: 'y4' },
-            { label: 'Degraded', data: scenario.data.map(d => d.throughputDegraded ? 1 : null), backgroundColor: COLORS.degraded, fill: true, borderWidth: 0, pointRadius: 0, yAxisID: 'y4' },
-        ]},
-        options: {
-            responsive: true, maintainAspectRatio: false, animation: false, interaction: { mode: 'index', intersect: false },
-            scales: {
-                x: { ticks: { color: '#8b949e', maxTicksLimit: 20, callback: v => scenario.data[v]?.time + 'ms' }, grid: { color: '#21262d' } },
-                y: { position: 'left', title: { display: true, text: 'Tasks', color: '#8b949e' }, ticks: { color: '#8b949e' }, grid: { color: '#21262d' } },
-                y2: { position: 'right', title: { display: true, text: 'req/s', color: '#8b949e' }, ticks: { color: '#8b949e' }, grid: { display: false } },
-                y3: { display: false, min: 0, max: 1 }, y4: { display: false, min: 0, max: 1 },
-            },
-            plugins: { legend: { labels: { color: '#c9d1d9', usePointStyle: true, pointStyle: 'line' } } },
-        },
-    });
-    new Chart(document.getElementById('ewma-' + i).getContext('2d'), {
-        type: 'line',
-        data: { labels, datasets: [
-            { label: 'log(W) raw', data: scenario.data.map(d => d.logW), borderColor: '#8b949e', borderWidth: 1, pointRadius: 0, borderDash: [3, 3] },
-            { label: 'logWBar (filtered)', data: scenario.data.map(d => d.logWBar), borderColor: '#58a6ff', borderWidth: 2, pointRadius: 0 },
-        ]},
-        options: {
-            responsive: true, maintainAspectRatio: false, animation: false, interaction: { mode: 'index', intersect: false },
-            scales: { x: { ticks: { color: '#8b949e', maxTicksLimit: 20, callback: v => scenario.data[v]?.time + 'ms' }, grid: { color: '#21262d' } }, y: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' } } },
-            plugins: { legend: { labels: { color: '#c9d1d9', usePointStyle: true, pointStyle: 'line' } } },
-        },
-    });
-    new Chart(document.getElementById('ztest-' + i).getContext('2d'), {
-        type: 'line',
-        data: { labels, datasets: [
-            { label: 'dLogWBar EWMA', data: scenario.data.map(d => d.dLogWBarEwma), borderColor: '#3fb950', borderWidth: 1.5, pointRadius: 0 },
-            { label: '+SE band', data: scenario.data.map(d => d.se > 0 ? d.se : null), borderColor: '#d29922', borderWidth: 1, pointRadius: 0, borderDash: [4, 2] },
-            { label: '-SE band', data: scenario.data.map(d => d.se > 0 ? -d.se : null), borderColor: '#d29922', borderWidth: 1, pointRadius: 0, borderDash: [4, 2] },
-            { label: 'DEGRADING', data: scenario.data.map(d => d.throughputDegraded ? d.dLogWBarEwma : null), borderColor: '#f85149', borderWidth: 0, pointRadius: 4, pointBackgroundColor: '#f85149' },
-        ]},
-        options: {
-            responsive: true, maintainAspectRatio: false, animation: false, interaction: { mode: 'index', intersect: false },
-            scales: { x: { ticks: { color: '#8b949e', maxTicksLimit: 20, callback: v => scenario.data[v]?.time + 'ms' }, grid: { color: '#21262d' } }, y: { ticks: { color: '#8b949e' }, grid: { color: '#21262d' } } },
-            plugins: { legend: { labels: { color: '#c9d1d9', usePointStyle: true, pointStyle: 'line' } } },
-        },
-    });
-});
-</script>
-</body>
-</html>`;
-
-    const dir = dirname(fileURLToPath(import.meta.url));
-    const outPath = join(dir, "executor-zscore-comparison.html");
-    writeFileSync(outPath, html);
-    console.log(`\n  Output: ${outPath}`);
 }
 
 main().catch(console.error);

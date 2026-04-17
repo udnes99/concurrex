@@ -1,16 +1,15 @@
 /**
  * Executor simulation that captures time-series data and generates
- * an HTML visualization with charts. This is a standalone script, not a test.
+ * JSON + HTML visualizations with charts. This is a standalone script, not a test.
  *
  * Run with:
- *   npx tsx libs/kernel/test/Infrastructure/Executor/simulation.ts
+ *   npx tsx simulations/simulation.ts
  *
- * Then open the generated executor-simulation.html file.
+ * Then open the generated simulation.html file.
  */
-import { writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { Executor } from "../src/Executor.js";
+import { generateJsonOutput } from "./output.js";
+import { generateHtmlFromJson } from "./generate-html.js";
 
 // ── Seeded PRNG (xorshift128+) ──────────────────────────────────────
 // Deterministic random numbers so charts look the same every run.
@@ -562,177 +561,11 @@ async function main(): Promise<void> {
         );
     }
 
-    generateHtml(scenarios);
-}
-
-// ── HTML generation ─────────────────────────────────────────────────
-
-function generateHtml(scenarios: Scenario[]): void {
-    const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Executor Simulation Results</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
-<style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #c9d1d9; padding: 24px; }
-    h1 { font-size: 24px; margin-bottom: 8px; color: #f0f6fc; }
-    .subtitle { font-size: 14px; color: #8b949e; margin-bottom: 32px; }
-    .scenario { margin-bottom: 48px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 24px; }
-    .scenario h2 { font-size: 18px; color: #f0f6fc; margin-bottom: 4px; }
-    .scenario p { font-size: 13px; color: #8b949e; margin-bottom: 16px; line-height: 1.5; }
-    .chart-container { position: relative; height: 300px; }
-    .legend-note { font-size: 11px; color: #484f58; margin-top: 8px; }
-</style>
-</head>
-<body>
-<h1>Executor &ndash; Adaptive Concurrency Simulation</h1>
-<p class="subtitle">CoDel queue management + throughput-driven AIMD concurrency regulation</p>
-
-${scenarios
-    .map(
-        (s, i) => `
-<div class="scenario">
-    <h2>${s.name}</h2>
-    <p>${s.description}</p>
-    <div class="chart-container"><canvas id="chart-${i}"></canvas></div>
-    <div class="legend-note">
-        Shaded red = CoDel dropping (load shedding) &middot; Shaded orange = throughput degraded (MD active)
-    </div>
-</div>
-`
-    )
-    .join("\n")}
-
-<script>
-const scenarios = ${JSON.stringify(scenarios)};
-
-const COLORS = {
-    queue: '#d29922',
-    inFlight: '#3fb950',
-    limit: '#58a6ff',
-    dropping: 'rgba(248, 81, 73, 0.15)',
-    degraded: 'rgba(210, 153, 34, 0.10)',
-};
-
-scenarios.forEach((scenario, i) => {
-    const ctx = document.getElementById('chart-' + i).getContext('2d');
-    const labels = scenario.data.map(d => d.time);
-
-    new Chart(ctx, {
-        type: 'line',
-        data: {
-            labels,
-            datasets: [
-                {
-                    label: 'Queue Length',
-                    data: scenario.data.map(d => d.queueLength),
-                    borderColor: COLORS.queue,
-                    borderWidth: 1.5,
-                    pointRadius: 0,
-                    tension: 0.1,
-                    fill: false,
-                    order: 3,
-                },
-                {
-                    label: 'In-Flight',
-                    data: scenario.data.map(d => d.inFlight),
-                    borderColor: COLORS.inFlight,
-                    borderWidth: 1.5,
-                    pointRadius: 0,
-                    tension: 0.1,
-                    fill: false,
-                    order: 2,
-                },
-                {
-                    label: 'Concurrency Limit',
-                    data: scenario.data.map(d => d.concurrencyLimit),
-                    borderColor: COLORS.limit,
-                    borderWidth: 2,
-                    pointRadius: 0,
-                    tension: 0.1,
-                    fill: false,
-                    order: 1,
-                },
-                {
-                    label: 'CoDel Dropping',
-                    data: scenario.data.map(d => d.dropping ? 1 : null),
-                    backgroundColor: COLORS.dropping,
-                    borderWidth: 0,
-                    pointRadius: 0,
-                    fill: 'origin',
-                    spanGaps: false,
-                    yAxisID: 'yBand',
-                    order: 5,
-                },
-                {
-                    label: 'Throughput Degraded',
-                    data: scenario.data.map(d => d.throughputDegraded ? 1 : null),
-                    backgroundColor: COLORS.degraded,
-                    borderWidth: 0,
-                    pointRadius: 0,
-                    fill: 'origin',
-                    spanGaps: false,
-                    yAxisID: 'yBand',
-                    order: 4,
-                },
-            ],
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            interaction: { mode: 'index', intersect: false },
-            plugins: {
-                legend: {
-                    labels: { color: '#8b949e', usePointStyle: true, pointStyle: 'line', font: { size: 11 } },
-                },
-                tooltip: {
-                    backgroundColor: '#1c2128',
-                    titleColor: '#f0f6fc',
-                    bodyColor: '#c9d1d9',
-                    borderColor: '#30363d',
-                    borderWidth: 1,
-                    callbacks: {
-                        title: (items) => 't = ' + items[0].label + 'ms',
-                        label: (item) => {
-                            if (item.datasetIndex === 3) return item.raw ? '\\u{1F534} CoDel dropping' : null;
-                            if (item.datasetIndex === 4) return item.raw ? '\\u{1F7E1} Throughput degraded' : null;
-                            return item.dataset.label + ': ' + item.formattedValue;
-                        },
-                    },
-                },
-            },
-            scales: {
-                x: {
-                    title: { display: true, text: 'Time (ms)', color: '#484f58' },
-                    ticks: { color: '#484f58', maxTicksLimit: 20 },
-                    grid: { color: '#21262d' },
-                },
-                y: {
-                    title: { display: true, text: 'Count', color: '#484f58' },
-                    ticks: { color: '#484f58' },
-                    grid: { color: '#21262d' },
-                    suggestedMin: 0,
-                },
-                yBand: {
-                    display: false,
-                    min: 0,
-                    max: 1,
-                },
-            },
-        },
+    const jsonPath = generateJsonOutput(import.meta.url, "simulation", scenarios, {
+        title: "Executor \u2013 Adaptive Concurrency Simulation",
+        subtitle: "CoDel queue management + throughput-driven AIMD concurrency regulation"
     });
-});
-</script>
-</body>
-</html>`;
-
-    const __dirname = dirname(fileURLToPath(import.meta.url));
-    const outPath = join(__dirname, "executor-simulation.html");
-    writeFileSync(outPath, html);
-    console.log(`Chart written to:\n  ${outPath}\n`);
+    generateHtmlFromJson(jsonPath);
 }
 
 main().catch((err: unknown) => {
