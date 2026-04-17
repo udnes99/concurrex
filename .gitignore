@@ -3,5 +3,6 @@ dist/
 .context/
 *.tgz
 simulations/*.html
+simulations/*.json
 benchmarks/results.html
 benchmarks/results.csv
