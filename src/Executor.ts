@@ -1,6 +1,15 @@
 import type { Logger } from "./logger.js";
 import { ArgumentError, ResourceExhaustedError, ExecutorNotRunningError } from "./errors.js";
 import { type Callback, createCallback } from "./callback.js";
+import {
+    type AdmitInfo,
+    type CompletionInfo,
+    type EvaluateInfo,
+    type RegulatorContext,
+    type Signal,
+    type SignalContext,
+    LatencyDrift
+} from "./signals.js";
 
 /** Throughput regulator phase — tracks the current regulation direction. */
 enum RegulationPhase {
@@ -77,18 +86,10 @@ type Pool = {
     dropCount: number;
     dropNext: number;
 
-    // Operational Little's Law integral: ∫N(t)dt (Kim & Whitt, 2013).
-    // Accumulated every time inFlight changes. W = ∫N(t)dt / C.
-    inFlightMs: number;
-    lastInFlightChangeTime: number;
-
     // Throughput monitor state (capacity regulation)
     windowStart: number;
     completionsThisWindow: number;
-    /** Admissions this window — tasks that entered in-flight. Used with
-     *  completions to compute the flow ratio r = admRate/compRate.
-     *  Used as a gate in isLatencyDegrading: when the queue is draining
-     *  (r < 1), we don't trust the latency test regardless of z-score. */
+    /** Admissions this window — tasks that entered in-flight. */
     admissionsThisWindow: number;
     admissionRateEwma: number | null;
     completionRateEwma: number | null;
@@ -97,26 +98,12 @@ type Pool = {
     elapsedWindows: number;
 
     // Error tracking (downstream health) — pool-wide error rate is tracked
-    // for observability. Per-lane shedding handles error response; pool-wide
-    // concurrency regulation is driven solely by latency.
+    // for observability. Per-lane shedding handles error response.
     errorsThisWindow: number;
     errorRateEwma: number | null;
 
-    // Last computed EWMA alpha — stored so query methods can use the
-    // same time-weighted alpha as the control loop. null until first
-    // window evaluation has run.
-    alpha: number | null;
-
-    // Latency detection: EWMA on log(W) + trend z-test.
-    // W = ∫N(t)dt / C (operational Little's Law). Shrinkage-dampened
-    // EWMA smooths log(W). Z-test on trend detects degradation.
+    // EWMA of in-flight count (for observability).
     inFlightEwma: number | null;
-    lastLogW: number | null; // Raw log(W) from the last completed window
-    logWBar: number | null; // EWMA-filtered log(W) level
-    dLogWBarEwma: number | null; // EWMA of dLogWBar rate (trend per window), shrunk input
-    dLogWBarVarianceEstimate: number; // EWMA of (v_n − v_{n−1})²/2 — von Neumann's δ² (= MSSD/2), drift-invariant σ² estimator
-    lastDLogWBarRate: number | null; // Previous window's dLogWBarRate (for the δ² pairwise diff)
-    ewmaSumW2: number; // Sum of squared EWMA weights (effective sample size)
 
     // Convergent throughput regulator state
     regulationDepth: number;
@@ -127,6 +114,10 @@ type Pool = {
 
     // Deferred re-evaluation timer
     processQueueTimer: ReturnType<typeof setTimeout> | null;
+
+    // Backpressure signals — clones of executor/pool templates, owns
+    // its own per-pool state (latency tracking, custom statistics).
+    signals: ReadonlyArray<Signal>;
 };
 
 export type PoolOptions = {
@@ -142,42 +133,39 @@ export type PoolOptions = {
     maximumConcurrency?: number;
     /** Time window (ms) for both ProDel grace period and throughput measurement interval. Default: 100. */
     controlWindow?: number;
+    /** Backpressure signals for this pool. Each signal is checked once per
+     *  regulator evaluation cycle; if any returns `triggered() === true`, the
+     *  regulator decreases concurrency.
+     *
+     *  When omitted, the pool inherits the executor-level `signals`. When
+     *  provided (even as an empty array), the pool's signals **replace** the
+     *  executor defaults entirely — there is no merge. An empty array means
+     *  "never auto-decrease on backpressure" (gravity and queue pressure still
+     *  apply).
+     *
+     *  The instances passed are templates: they are cloned via `signal.clone()`
+     *  per pool, so the same template can be safely registered with multiple
+     *  pools without state interleaving.
+     *
+     *  Default executor-level signals: `[new LatencyDrift()]`. */
+    signals?: Signal[];
 };
 
+/**
+ * General-purpose regulator metrics for a pool. Signal-specific state
+ * (latency-test internals, custom signal statistics) is exposed separately
+ * via {@link Executor.getSignalState}.
+ *
+ * The `degrading` flag is true if any configured signal is currently
+ * triggered. To inspect *which* signal and its internals, use
+ * `executor.getSignalState(pool, signalName)`.
+ */
 export type RegulatorState = {
-    /** Raw log(W) from the most recent window (before EWMA smoothing). */
-    logW: number | null;
-    /** EWMA-filtered log(W) level (shrinkage-dampened). */
-    logWBar: number | null;
-    /** EWMA of dLogWBar rate (trend signal per window), shrunk input. */
-    dLogWBarEwma: number | null;
-    /** EWMA of (v_n − v_{n−1})²/2 — von Neumann lag-1 variance estimator.
-     *  Unbiased for σ² under both H₀ (no drift) and H₁ (sustained drift):
-     *  drift cancels in pairwise differences, so the noise floor stays
-     *  calibrated regardless of drift state and step transitions. */
-    dLogWBarVarianceEstimate: number;
-    /** Sum of squared EWMA weights — effective sample size for time-varying alpha. */
-    ewmaSumW2: number;
-    /** Standard error: sqrt(MSSD/2 × sumW2 / (1 + α/2)). MSSD/2 is von Neumann's
-     *  δ², a drift-invariant σ² estimator; (1 + α/2) corrects for the lag-1
-     *  negative autocorrelation that dLogW inherits as a derivative-of-EWMA. */
-    se: number;
-    /** Current z-statistic: dLogWBarEwma / SE. Degrading when > tCritical. */
-    zScore: number;
-    /** Student-t critical value at df = 1/sumW2 − 1 (Cornish-Fisher upper
-     *  bound). At moderate df ≈ Z; at low df diverges, gating the test off
-     *  during warm-up and post-idle. */
-    tCritical: number;
-    /** Firing threshold: tCritical × se. */
-    threshold: number;
-    /** Whether the z-test currently detects latency degradation. */
-    degrading: boolean;
     /** EWMA of in-flight count. */
     inFlightEwma: number | null;
     /** EWMA of completion rate (completions per window). */
     completionRateEwma: number | null;
-    /** EWMA of admission rate (admissions per window). Used with
-     *  completionRateEwma to form the flow ratio gate in the latency test. */
+    /** EWMA of admission rate (admissions per window). */
     admissionRateEwma: number | null;
     /** EWMA of drop rate (drops per window). */
     dropRateEwma: number | null;
@@ -189,8 +177,9 @@ export type RegulatorState = {
     regulationDepth: number;
     /** Number of elapsed control windows. */
     elapsedWindows: number;
-    /** Last computed EWMA alpha. null until the first window has been evaluated. */
-    alpha: number | null;
+    /** Whether any configured signal is currently triggered. Equivalent to
+     *  `executor.isThroughputDegraded(pool)`. */
+    degrading: boolean;
 };
 
 export type TaskRunOptions = {
@@ -271,6 +260,7 @@ export class Executor {
     public readonly timeConstant: number;
 
     private readonly defaults: Parameters;
+    private readonly defaultSignals: ReadonlyArray<Signal>;
     private readonly logger: Logger;
     private running = false;
 
@@ -283,7 +273,16 @@ export class Executor {
         typeof g.setImmediate === "function" ? (g.setImmediate as (fn: () => void) => void)(fn) : queueMicrotask(fn);
     }
 
-    constructor(options?: { logger?: Logger; zScoreThreshold?: number }) {
+    constructor(options?: {
+        logger?: Logger;
+        zScoreThreshold?: number;
+        /** Default backpressure signals for pools that do not override. The
+         *  templates passed are cloned per pool — the same instance can be
+         *  safely registered with multiple executors/pools.
+         *
+         *  When omitted, defaults to `[new LatencyDrift()]`. */
+        signals?: Signal[];
+    }) {
         this.logger = options?.logger ?? console;
         const z = options?.zScoreThreshold ?? DEFAULT_Z_SCORE_THRESHOLD;
         if (!Number.isFinite(z) || z <= 0) {
@@ -292,6 +291,9 @@ export class Executor {
         this.defaults = Executor.deriveParameters(z);
         this.zScoreThreshold = this.defaults.zScoreThreshold;
         this.timeConstant = this.defaults.timeConstant;
+        this.defaultSignals = Object.freeze(
+            (options?.signals ?? [new LatencyDrift()]).slice()
+        );
     }
 
     /** Derive all statistical parameters from a single z-score threshold. */
@@ -386,7 +388,12 @@ export class Executor {
         const parameters = options?.zScoreThreshold != null
             ? Executor.deriveParameters(options.zScoreThreshold)
             : null;
-        const zc = parameters ?? this.defaults;
+
+        // Pool-level signals replace executor defaults entirely (no merge).
+        // Each template is cloned to a fresh per-pool instance so state never
+        // interleaves across pools.
+        const templateSignals = options?.signals ?? this.defaultSignals;
+        const signals = Object.freeze(templateSignals.map((s) => s.clone()));
 
         this.pools.set(name, {
             name,
@@ -407,8 +414,6 @@ export class Executor {
             dropping: false,
             dropCount: 0,
             dropNext: 0,
-            inFlightMs: 0,
-            lastInFlightChangeTime: performance.now(),
             windowStart: performance.now(),
             completionsThisWindow: 0,
             admissionsThisWindow: 0,
@@ -419,18 +424,12 @@ export class Executor {
             elapsedWindows: 0,
             errorsThisWindow: 0,
             errorRateEwma: null,
-            alpha: null,
             inFlightEwma: null,
-            lastLogW: null,
-            logWBar: null,
-            dLogWBarEwma: null,
-            dLogWBarVarianceEstimate: 0,
-            lastDLogWBarRate: null,
-            ewmaSumW2: 0,
             regulationDepth: 0,
             regulationPhase: RegulationPhase.Idle,
             stepScale: 1,
-            processQueueTimer: null
+            processQueueTimer: null,
+            signals
         });
     }
 
@@ -446,13 +445,60 @@ export class Executor {
         return p.dropping;
     }
 
-    /** Returns whether throughput is degraded (latency worsening).
-     *  Warm-up is handled internally by the Student-t critical value:
-     *  small effective sample size → large critical value → cannot fire. */
+    /** Returns true if any of the pool's configured backpressure signals is
+     *  currently triggered. The default signal is `LatencyDrift` (the v1.x
+     *  Student-t trend test); pools may add `ErrorRateThreshold`,
+     *  `ProbabilisticErrorRate`, or any custom `Signal`. */
     public isThroughputDegraded(pool: string): boolean {
         const p = this.pools.get(pool);
         if (!p) throw new ArgumentError(`Pool "${pool}" does not exist.`);
-        return this.isLatencyDegrading(p);
+        return this.anySignalTriggered(p);
+    }
+
+    /** Returns the current state snapshot of a named signal on a pool, or
+     *  `undefined` if the signal is not configured on the pool or doesn't
+     *  expose state. Use this to inspect signal-specific metrics (e.g.
+     *  `LatencyDrift`'s zScore, dLogWBarVarianceEstimate, tCritical, etc.). */
+    public getSignalState(pool: string, signalName: string): Record<string, unknown> | undefined {
+        const p = this.pools.get(pool);
+        if (!p) throw new ArgumentError(`Pool "${pool}" does not exist.`);
+        const signal = p.signals.find((s) => s.name === signalName);
+        return signal?.state?.();
+    }
+
+    /** Iterate the pool's signals; return true on the first triggered one. */
+    private anySignalTriggered(pool: Pool): boolean {
+        if (pool.signals.length === 0) return false;
+        const ctx = this.buildSignalContext(pool);
+        for (const s of pool.signals) {
+            if (s.triggered(ctx)) return true;
+        }
+        return false;
+    }
+
+    /** Build a frozen SignalContext snapshot for a pool. */
+    private buildSignalContext(pool: Pool): SignalContext {
+        const params = pool.parameters ?? this.defaults;
+        const regulator: RegulatorContext = Object.freeze({
+            completionRateEwma: pool.completionRateEwma,
+            admissionRateEwma: pool.admissionRateEwma,
+            dropRateEwma: pool.dropRateEwma,
+            errorRateEwma: pool.errorRateEwma,
+            inFlightEwma: pool.inFlightEwma,
+            regulationPhase: RegulationPhase[pool.regulationPhase],
+            regulationDepth: pool.regulationDepth,
+            elapsedWindows: pool.elapsedWindows,
+            zScoreThreshold: params.zScoreThreshold,
+            timeConstant: params.timeConstant,
+            controlWindow: pool.controlWindow
+        });
+        return Object.freeze({
+            pool: pool.name,
+            concurrencyLimit: pool.concurrencyLimit,
+            inFlight: pool.inFlight,
+            queueLength: pool.queueLength,
+            regulator
+        });
     }
 
     /** Returns the number of tasks waiting in the queue for a pool. */
@@ -476,50 +522,13 @@ export class Executor {
         return p.concurrencyLimit;
     }
 
-    /** Returns a snapshot of the regulator's internal filter state for debugging
-     *  and visualization. Includes raw and filtered latency signals, z-test
-     *  components, EWMAs, and regulation phase. */
+    /** Returns a snapshot of the pool's general-purpose regulator metrics.
+     *  Signal-specific state (latency-test internals, custom signal counters)
+     *  is exposed via {@link Executor.getSignalState}. */
     public getRegulatorState(pool: string): RegulatorState {
         const p = this.pools.get(pool);
         if (!p) throw new ArgumentError(`Pool "${pool}" does not exist.`);
-
-        let se = 0;
-        let zScore = 0;
-        let tCritical = 0;
-        let threshold = 0;
-        if (
-            p.dLogWBarEwma !== null &&
-            p.dLogWBarVarianceEstimate > 0 &&
-            p.ewmaSumW2 > 0 &&
-            p.alpha !== null
-        ) {
-            // SE² = σ̂² × W² × (1+W²)/2 — the variance of an EWMA on the
-            // autocorrelated v sequence (ρ_h = −α(1−α)^(h−1)/2 from
-            // first-differencing an AR(1)-like EWMA). The (1+W²)/2 factor
-            // is the autocorrelation variance-reduction. σ̂² = δ²/(1+α/2)
-            // is the unbiased noise estimator (δ² is biased by (1+α/2)
-            // because pairwise diffs have variance 2σ²(1−ρ₁) = 2σ²(1+α/2)).
-            const sigmaSqEstimate = p.dLogWBarVarianceEstimate / (1 + p.alpha / 2);
-            se = Math.sqrt(sigmaSqEstimate * p.ewmaSumW2 * (1 + p.ewmaSumW2) / 2);
-            zScore = se > 0 ? p.dLogWBarEwma / se : 0;
-            // df = 1/sumW2 − 1. Student-t widens at low df, gating warm-up.
-            const df = 1 / p.ewmaSumW2 - 1;
-            const { zScoreThreshold } = this.params(p);
-            tCritical = this.tScore(zScoreThreshold, df);
-            threshold = tCritical * se;
-        }
-
         return {
-            logW: p.lastLogW,
-            logWBar: p.logWBar,
-            dLogWBarEwma: p.dLogWBarEwma,
-            dLogWBarVarianceEstimate: p.dLogWBarVarianceEstimate,
-            ewmaSumW2: p.ewmaSumW2,
-            se,
-            zScore,
-            tCritical,
-            threshold,
-            degrading: this.isLatencyDegrading(p),
             inFlightEwma: p.inFlightEwma,
             completionRateEwma: p.completionRateEwma,
             admissionRateEwma: p.admissionRateEwma,
@@ -528,7 +537,7 @@ export class Executor {
             regulationPhase: RegulationPhase[p.regulationPhase],
             regulationDepth: p.regulationDepth,
             elapsedWindows: p.elapsedWindows,
-            alpha: p.alpha
+            degrading: this.anySignalTriggered(p)
         };
     }
 
@@ -969,11 +978,17 @@ export class Executor {
         const entry = (pool.dropping ? lane.entries.pop() : lane.entries.shift())!;
         pool.queueLength--;
         const now = performance.now();
-        pool.inFlightMs += pool.inFlight * (now - pool.lastInFlightChangeTime);
-        pool.lastInFlightChangeTime = now;
         pool.inFlight++;
         lane.inFlight++;
         pool.admissionsThisWindow++;
+
+        // Notify signals after the inFlight count is updated.
+        if (pool.signals.length > 0) {
+            const ctx = this.buildSignalContext(pool);
+            const info: AdmitInfo = { lane: lane.key, admitTime: now };
+            for (const s of pool.signals) s.onAdmit?.(ctx, info);
+        }
+
         // If stop() is called between here and the scheduled callback firing,
         // reject with ExecutorNotRunningError rather than silently dropping the
         // promise — otherwise the caller's run() hangs forever.
@@ -1045,9 +1060,8 @@ export class Executor {
         const rate = pool.completionsThisWindow;
         const { timeConstant, z2 } = this.params(pool);
 
-        // Time-weighted EWMA: alpha derived from elapsed time.
+        // Time-weighted EWMA alpha — used for general per-window EWMAs.
         const alpha = 1 - Math.exp(-elapsed / (timeConstant * pool.controlWindow));
-        pool.alpha = alpha;
 
         // Bayesian shrinkage: n/(n+z²) weights the observation against a prior
         // of strength z² = 4 pseudo-observations. At n=1: 20% weight (sparse
@@ -1062,10 +1076,7 @@ export class Executor {
             pool.completionRateEwma = (1 - countAlpha) * pool.completionRateEwma + countAlpha * rate;
         }
 
-        // Update admission rate EWMA — tracked alongside completionRateEwma
-        // so their ratio can be used as a flow-balance gate in the latency
-        // test (see isLatencyDegrading). Uses raw alpha (no shrinkage) since
-        // this is a count-based rate tracked per window, like drops.
+        // Update admission rate EWMA.
         const admissions = pool.admissionsThisWindow;
         if (pool.admissionRateEwma === null) {
             pool.admissionRateEwma = admissions;
@@ -1083,8 +1094,8 @@ export class Executor {
         pool.dropsThisWindow = 0;
 
         // Update error rate EWMA (errors/completions). Tracked for observability
-        // and as input to the probabilistic error decrease branch in the
-        // regulation loop. Uses the same countAlpha as completion/drop rates.
+        // and read by built-in error signals (ErrorRateThreshold,
+        // ProbabilisticErrorRate).
         if (pool.completionsThisWindow > 0) {
             const instantErrorRate = pool.errorsThisWindow / pool.completionsThisWindow;
             if (pool.errorRateEwma === null) {
@@ -1097,125 +1108,49 @@ export class Executor {
         pool.errorsThisWindow = 0;
         pool.elapsedWindows++;
 
-        // ── Little's Law latency trend ──
+        // Update in-flight count EWMA (observability).
         pool.inFlightEwma =
             pool.inFlightEwma === null
                 ? pool.inFlight
                 : (1 - alpha) * pool.inFlightEwma + alpha * pool.inFlight;
 
-        // ── Pure finite-interval Little's Law: W = ∫N(t)dt / C ──
-        // Exact operational Little's Law (Kim & Whitt, 2013).
-        const evalNow = performance.now();
-        pool.inFlightMs += pool.inFlight * (evalNow - pool.lastInFlightChangeTime);
-        pool.lastInFlightChangeTime = evalNow;
-
-        if (pool.completionsThisWindow > 0 && pool.inFlightMs > 0) {
-            const instantW = pool.inFlightMs / pool.completionsThisWindow;
-            const logInstantW = Math.log(instantW);
-            pool.lastLogW = logInstantW;
-
-            // ── Shrinkage-dampened EWMA on log(W) (level estimation) ──
-            // Bayesian shrinkage is the conjugate-prior treatment for parameter
-            // estimation: at low throughput, fewer completions → noisier W →
-            // trust prior (current logWBar) more. This is estimation, not
-            // hypothesis testing.
-            const shrinkageFactor = this.shrinkage(pool.completionsThisWindow, z2);
-
-            if (pool.logWBar === null) {
-                pool.logWBar = logInstantW;
-            } else {
-                const previousState = pool.logWBar;
-                // Level EWMA update: shrinkage-dampened only.
-                const levelAlpha = alpha * shrinkageFactor;
-                pool.logWBar = (1 - levelAlpha) * pool.logWBar + levelAlpha * logInstantW;
-
-                // dLogWBar = change in filtered state, normalized by dt.
-                const dt = elapsed / pool.controlWindow;
-                const dLogWBarRate = (pool.logWBar - previousState) / dt;
-                if (pool.dLogWBarEwma === null) {
-                    // First observation: seed the trend EWMA with the shrunk
-                    // derivative. δ² stays 0; the Student-t critical value
-                    // diverges at small df and gates the test off until enough
-                    // effective samples have accumulated.
-                    pool.dLogWBarEwma = dLogWBarRate * shrinkageFactor;
-                    pool.ewmaSumW2 = 1; // first observation has weight 1
-                } else {
-                    // Asymmetric shrinkage on the trend numerator: at low
-                    // throughput (small s) the trend is damped while δ²
-                    // stays honest → z is conservative.
-                    pool.dLogWBarEwma =
-                        (1 - alpha) * pool.dLogWBarEwma + alpha * (dLogWBarRate * shrinkageFactor);
-                    // MSSD/2 = EWMA((v_n − v_{n−1})²/2) — von Neumann's δ²
-                    // estimator. Drift cancels in pairwise differences, so
-                    // it stays calibrated as a σ² estimate regardless of
-                    // drift state. Post-idle (α→1) briefly clobbers the
-                    // estimate with a spurious cross-discontinuity diff, but
-                    // sumW2 → 1 → df → 0 → tCritical → ∞ gates the test
-                    // off that window. Subsequent windows recalibrate via
-                    // normal EWMA dynamics — no special handling needed.
-                    if (pool.lastDLogWBarRate !== null) {
-                        const diff = dLogWBarRate - pool.lastDLogWBarRate;
-                        pool.dLogWBarVarianceEstimate =
-                            (1 - alpha) * pool.dLogWBarVarianceEstimate + alpha * (diff * diff) / 2;
-                    }
-                    pool.ewmaSumW2 =
-                        (1 - alpha) * (1 - alpha) * pool.ewmaSumW2 + alpha * alpha;
-                }
-                pool.lastDLogWBarRate = dLogWBarRate;
-            }
+        // ── Notify signals at window boundary ──
+        // Each signal updates its own derived state (e.g., LatencyDrift's
+        // operational-LL integral, log/EWMA/dLogW/δ²/SE pipeline).
+        if (pool.signals.length > 0) {
+            const ctx = this.buildSignalContext(pool);
+            const evalInfo: EvaluateInfo = {
+                windowStart: pool.windowStart,
+                windowEnd: now,
+                elapsed,
+                completions: pool.completionsThisWindow,
+                admissions
+            };
+            for (const s of pool.signals) s.onEvaluate?.(ctx, evalInfo);
         }
 
-        pool.inFlightMs = 0;
-
         // ── Periodic convergent throughput regulation + gravity ──
-        // Fires every TIME_CONSTANT windows so dW has time (~63% absorption) to
-        // reflect the previous adjustment before the next decision.
-        //
-        // Step formula: step = ceil(L × (1 - e^(-depth/TIME_CONSTANT)))
-        // Severity encoded through persistence: sustained signal →
-        // depth keeps incrementing → steps grow naturally.
-        //
-        // Warm-up is handled inside isLatencyDegrading via the Student-t
-        // critical value: at low effective sample size (small df), the
-        // critical value grows large and the test cannot fire spuriously.
-        // No separate elapsedWindows-based guard is needed here.
-        //
-        // Phase transitions: Increasing→Retracting (walk back growth),
-        // Retracting→Decreasing (fresh ramp), any→Idle (cooling).
+        // Fires every TIME_CONSTANT windows so signals have time (~63%
+        // absorption) to reflect the previous adjustment before the next
+        // decision. Phase transitions: Increasing→Retracting (walk back
+        // growth), Retracting→Decreasing (fresh ramp), any→Idle (cooling).
         if (pool.elapsedWindows > 0 && pool.elapsedWindows % timeConstant === 0) {
-            if (this.isLatencyDegrading(pool)) {
+            if (this.anySignalTriggered(pool)) {
+                // A backpressure signal fired — decrease.
                 this.applyDecrease(pool);
             } else if (
                 pool.regulationPhase === RegulationPhase.Retracting ||
                 pool.regulationPhase === RegulationPhase.Decreasing
             ) {
-                // Cooling: one TIME_CONSTANT eval after a decrease sequence before
-                // allowing increases. The phase acts as natural momentum —
-                // prevents immediate flip-flop between latency-decrease and
-                // queue-increase. Reset to Idle so the next action starts
-                // cautiously from depth 0. Bisection: halve stepScale so the
-                // next increase cycle uses finer steps, converging to within
-                // ±1 of the true equilibrium over O(log L) cycles.
+                // Cooling: one TIME_CONSTANT eval pause after a decrease sequence
+                // before allowing increases. Bisection: halve stepScale so the
+                // next increase cycle uses finer steps.
                 pool.regulationPhase = RegulationPhase.Idle;
                 pool.regulationDepth = 0;
-                // Floor at 1/L: once stepScale × L = 1, all steps are 1 (the
-                // minimum). Halving below this is wasted state drift.
                 pool.stepScale = Math.max(pool.stepScale * 0.5, 1 / pool.concurrencyLimit);
             } else if (pool.queueLength > 0) {
-                // Queue pressure: increase to meet demand. Only fires when
-                // not in a decrease sequence (Idle, Increasing, or Restoring).
+                // Queue pressure: increase to meet demand.
                 this.applyIncrease(pool);
-            } else if (
-                pool.errorRateEwma !== null &&
-                pool.errorRateEwma > 0 &&
-                Math.random() < pool.errorRateEwma
-            ) {
-                // Probabilistic error decrease: fires with P = errorRate.
-                // At low rates (5% localized): barely fires, gravity recovers.
-                // At high rates (80% systemic): fires most evals, aggressive.
-                // Per-lane shedding keeps aggregate error rate low for
-                // localized failures, so this only fires for systemic issues.
-                this.applyDecrease(pool);
             } else if (pool.concurrencyLimit !== pool.baselineConcurrency) {
                 // Restoring: converge toward baseline from either direction.
                 // Uses convergent steps — small initially, growing with depth.
@@ -1259,6 +1194,9 @@ export class Executor {
     }
 
     private async executeTask<T>(pool: Pool, laneKey: string, task: () => T): Promise<T> {
+        // Capture admit time at task entry so signals can compute service time.
+        // This is a tiny offset (~1 microqueue tick) from the actual admit() call.
+        const admitTime = performance.now();
         let errored = false;
         try {
             return await task();
@@ -1271,11 +1209,22 @@ export class Executor {
             }
             pool.completionsThisWindow++;
 
-            // Accumulate Little's Law integral before changing inFlight.
             const completionNow = performance.now();
-            pool.inFlightMs += pool.inFlight * (completionNow - pool.lastInFlightChangeTime);
-            pool.lastInFlightChangeTime = completionNow;
             pool.inFlight--;
+
+            // Notify signals after the inFlight count is decremented.
+            if (pool.signals.length > 0) {
+                const ctx = this.buildSignalContext(pool);
+                const info: CompletionInfo = {
+                    lane: laneKey,
+                    admitTime,
+                    completionTime: completionNow,
+                    serviceTime: completionNow - admitTime,
+                    errored
+                };
+                for (const s of pool.signals) s.onComplete?.(ctx, info);
+            }
+
             const lane = pool.lanes.get(laneKey);
             if (lane) {
                 lane.inFlight--;
@@ -1315,72 +1264,9 @@ export class Executor {
         return n / (n + z2);
     }
 
-    /** One-sided Student-t critical value (safe upper bound) at upper-tail
-     *  probability Φ(-z), df ν.
-     *
-     *  4th-order Cornish-Fisher inverse-t series (Hill 1970):
-     *    t_ν ≈ z + g₁/ν + g₂/ν² + g₃/ν³ + g₄/ν⁴
-     *  Plus an asymptotic-series truncation bound 2·|g₄/ν⁴|. As ν → 0 the
-     *  bound diverges, naturally gating the test off — no clamp needed. */
-    private tScore(z: number, df: number): number {
-        const z2 = z * z;
-        const z4 = z2 * z2;
-        const z6 = z4 * z2;
-        const z8 = z4 * z4;
-        const g1 = (z * (z2 + 1)) / 4;
-        const g2 = (z * (5 * z4 + 16 * z2 + 3)) / 96;
-        const g3 = (z * (3 * z6 + 19 * z4 + 17 * z2 - 15)) / 384;
-        const g4 = (z * (79 * z8 + 776 * z6 + 1482 * z4 - 1920 * z2 - 945)) / 92160;
-        const df2 = df * df;
-        const df3 = df2 * df;
-        const df4 = df3 * df;
-        const tApprox = z + g1 / df + g2 / df2 + g3 / df3 + g4 / df4;
-        const errorBound = 2 * Math.abs(g4 / df4);
-        return tApprox + errorBound;
-    }
-
-    /**
-     * Trend hypothesis test: is latency trending upward?
-     *
-     * H₀: μ_v = 0 (latency stable). H₁: μ_v > 0 (degrading).
-     *
-     * Asymmetric shrinkage construction:
-     *   numerator: v̂ = EWMA(v · s)                 where s = n/(n+Z²) is the per-window shrinkage
-     *   denominator: δ² = EWMA((v_n − v_{n−1})²/2) von Neumann's δ² (= MSSD/2)
-     *   SE = sqrt(δ² × sumW2 / (1 + α/2))
-     *
-     * δ² is unbiased for σ² under both H₀ and H₁: drift cancels in pairwise
-     * differences, so the noise floor stays calibrated regardless of drift
-     * state and step transitions. Decouples noise estimation from trend
-     * estimation.
-     *
-     * Test statistic t = v̂ / SE compared to Student-t critical value at
-     * df = 1/sumW2 − 1. At moderate df ≈ Z; at low df (warm-up, post-idle)
-     * tCritical widens, gating the test continuously. As df → 0 the truncation
-     * bound diverges, gating off entirely.
-     */
-    private isLatencyDegrading(pool: Pool): boolean {
-        if (
-            pool.dLogWBarEwma === null ||
-            pool.dLogWBarVarianceEstimate === 0 ||
-            pool.ewmaSumW2 === 0 ||
-            pool.alpha === null
-        ) {
-            return false;
-        }
-        // SE² = σ̂² × W² × (1+W²)/2 — variance of an EWMA on autocorrelated v
-        // (ρ_h = −α(1−α)^(h−1)/2 from first-differencing an AR(1)-like EWMA).
-        // (1+W²)/2 is the autocorrelation variance-reduction factor.
-        // σ̂² = δ²/(1+α/2) is the unbiased noise estimator: δ² is biased high
-        // by (1+α/2) because pairwise diffs have variance 2σ²(1−ρ₁).
-        const sigmaSqEstimate = pool.dLogWBarVarianceEstimate / (1 + pool.alpha / 2);
-        const se = Math.sqrt(sigmaSqEstimate * pool.ewmaSumW2 * (1 + pool.ewmaSumW2) / 2);
-        if (se === 0) return false;
-        const { zScoreThreshold } = this.params(pool);
-        const df = 1 / pool.ewmaSumW2 - 1;
-        const critical = this.tScore(zScoreThreshold, df);
-        return pool.dLogWBarEwma > critical * se;
-    }
+    // Note: tScore and isLatencyDegrading have been moved into the
+    // LatencyDrift signal class (see src/signals.ts). The executor no
+    // longer implements detection logic — signals own their state.
 
     /**
      * Convergent decrease: retract previous growth first, then fresh ramp.
