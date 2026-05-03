@@ -15,3 +15,18 @@ export {
     ArgumentError,
     ExecutorNotRunningError,
 } from "./errors.js";
+
+export {
+    type Signal,
+    type SignalContext,
+    type RegulatorContext,
+    type AdmitInfo,
+    type CompletionInfo,
+    type EvaluateInfo,
+    type LatencyDriftOptions,
+    type ErrorRateThresholdOptions,
+    BaseSignal,
+    LatencyDrift,
+    ErrorRateThreshold,
+    ProbabilisticErrorRate,
+} from "./signals.js";
