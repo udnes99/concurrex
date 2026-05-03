@@ -1,6 +1,7 @@
 import type { Logger } from "./logger.js";
 import { ArgumentError, ResourceExhaustedError, ExecutorNotRunningError } from "./errors.js";
 import { type Callback, createCallback } from "./callback.js";
+import { type Signal, type SignalContext, LatencyDrift } from "./signals.js";
 
 /** Throughput regulator phase — tracks the current regulation direction. */
 enum RegulationPhase {
@@ -127,6 +128,10 @@ type Pool = {
 
     // Deferred re-evaluation timer
     processQueueTimer: ReturnType<typeof setTimeout> | null;
+
+    // Backpressure signals — checked once per regulator evaluation cycle.
+    // Resolved at registerPool: pool's `signals` if provided, else executor's.
+    signals: ReadonlyArray<Signal>;
 };
 
 export type PoolOptions = {
@@ -142,6 +147,16 @@ export type PoolOptions = {
     maximumConcurrency?: number;
     /** Time window (ms) for both ProDel grace period and throughput measurement interval. Default: 100. */
     controlWindow?: number;
+    /** Backpressure signals for this pool. Each signal is checked once per regulator
+     *  evaluation cycle; if any returns `triggered() === true`, concurrency is decreased.
+     *
+     *  When omitted, the pool inherits the executor-level `signals`. When provided
+     *  (even as an empty array), the pool's signals *replace* the executor defaults
+     *  for this pool — there is no merge. An empty array means "never auto-decrease
+     *  on backpressure" (gravity and queue pressure still apply).
+     *
+     *  Default executor-level signals: `[new LatencyDrift()]`. */
+    signals?: Signal[];
 };
 
 export type RegulatorState = {
@@ -170,7 +185,11 @@ export type RegulatorState = {
     tCritical: number;
     /** Firing threshold: tCritical × se. */
     threshold: number;
-    /** Whether the z-test currently detects latency degradation. */
+    /** Whether the latency-trend Student-t test currently detects degradation.
+     *  This is the value the built-in `LatencyDrift` signal reads. Note: this is
+     *  *not* the same as `isThroughputDegraded(pool)` — that returns true if any
+     *  configured signal is triggered, while this field reflects only the
+     *  latency-trend test result. */
     degrading: boolean;
     /** EWMA of in-flight count. */
     inFlightEwma: number | null;
@@ -271,6 +290,7 @@ export class Executor {
     public readonly timeConstant: number;
 
     private readonly defaults: Parameters;
+    private readonly defaultSignals: ReadonlyArray<Signal>;
     private readonly logger: Logger;
     private running = false;
 
@@ -283,7 +303,16 @@ export class Executor {
         typeof g.setImmediate === "function" ? (g.setImmediate as (fn: () => void) => void)(fn) : queueMicrotask(fn);
     }
 
-    constructor(options?: { logger?: Logger; zScoreThreshold?: number }) {
+    constructor(options?: {
+        logger?: Logger;
+        zScoreThreshold?: number;
+        /** Default backpressure signals applied to every pool that does not override.
+         *  When omitted, defaults to `[new LatencyDrift()]` — pools auto-decrease on
+         *  sustained latency drift only. Pool-level `signals` *replace* these
+         *  defaults entirely; pass `signals: []` at the pool level to disable
+         *  backpressure-driven decreases for that pool. */
+        signals?: Signal[];
+    }) {
         this.logger = options?.logger ?? console;
         const z = options?.zScoreThreshold ?? DEFAULT_Z_SCORE_THRESHOLD;
         if (!Number.isFinite(z) || z <= 0) {
@@ -292,6 +321,9 @@ export class Executor {
         this.defaults = Executor.deriveParameters(z);
         this.zScoreThreshold = this.defaults.zScoreThreshold;
         this.timeConstant = this.defaults.timeConstant;
+        this.defaultSignals = Object.freeze(
+            (options?.signals ?? [new LatencyDrift()]).slice()
+        );
     }
 
     /** Derive all statistical parameters from a single z-score threshold. */
@@ -388,6 +420,12 @@ export class Executor {
             : null;
         const zc = parameters ?? this.defaults;
 
+        // Pool-level signals replace executor defaults entirely (no merge).
+        // Omitted = inherit; provided (even empty) = use exactly that list.
+        const signals = Object.freeze(
+            (options?.signals ?? this.defaultSignals).slice()
+        );
+
         this.pools.set(name, {
             name,
             parameters,
@@ -430,7 +468,8 @@ export class Executor {
             regulationDepth: 0,
             regulationPhase: RegulationPhase.Idle,
             stepScale: 1,
-            processQueueTimer: null
+            processQueueTimer: null,
+            signals
         });
     }
 
@@ -446,13 +485,36 @@ export class Executor {
         return p.dropping;
     }
 
-    /** Returns whether throughput is degraded (latency worsening).
-     *  Warm-up is handled internally by the Student-t critical value:
-     *  small effective sample size → large critical value → cannot fire. */
+    /** Returns whether any backpressure signal is currently triggered for the pool.
+     *  By default this is the latency-trend test (`LatencyDrift`); pools can
+     *  configure additional signals via `signals` in `PoolOptions`. Returns true
+     *  if *any* configured signal returns `triggered() === true`. */
     public isThroughputDegraded(pool: string): boolean {
         const p = this.pools.get(pool);
         if (!p) throw new ArgumentError(`Pool "${pool}" does not exist.`);
-        return this.isLatencyDegrading(p);
+        return this.anySignalTriggered(p);
+    }
+
+    /** Iterate the pool's signals and return true if any is triggered.
+     *  Short-circuits on the first true. */
+    private anySignalTriggered(pool: Pool): boolean {
+        if (pool.signals.length === 0) return false;
+        const ctx = this.buildSignalContext(pool);
+        for (const signal of pool.signals) {
+            if (signal.triggered(ctx)) return true;
+        }
+        return false;
+    }
+
+    /** Build a frozen SignalContext snapshot for a pool. */
+    private buildSignalContext(pool: Pool): SignalContext {
+        return Object.freeze({
+            pool: pool.name,
+            concurrencyLimit: pool.concurrencyLimit,
+            inFlight: pool.inFlight,
+            queueLength: pool.queueLength,
+            regulator: this.getRegulatorState(pool.name)
+        });
     }
 
     /** Returns the number of tasks waiting in the queue for a pool. */
@@ -1183,7 +1245,11 @@ export class Executor {
         // Phase transitions: Increasing→Retracting (walk back growth),
         // Retracting→Decreasing (fresh ramp), any→Idle (cooling).
         if (pool.elapsedWindows > 0 && pool.elapsedWindows % timeConstant === 0) {
-            if (this.isLatencyDegrading(pool)) {
+            if (this.anySignalTriggered(pool)) {
+                // Backpressure signal fired — decrease concurrency. The default
+                // signal is LatencyDrift (wraps the v1.2 isLatencyDegrading
+                // test). Pools may also opt into ProbabilisticErrorRate,
+                // ErrorRateThreshold, or custom Signal implementations.
                 this.applyDecrease(pool);
             } else if (
                 pool.regulationPhase === RegulationPhase.Retracting ||
@@ -1205,17 +1271,6 @@ export class Executor {
                 // Queue pressure: increase to meet demand. Only fires when
                 // not in a decrease sequence (Idle, Increasing, or Restoring).
                 this.applyIncrease(pool);
-            } else if (
-                pool.errorRateEwma !== null &&
-                pool.errorRateEwma > 0 &&
-                Math.random() < pool.errorRateEwma
-            ) {
-                // Probabilistic error decrease: fires with P = errorRate.
-                // At low rates (5% localized): barely fires, gravity recovers.
-                // At high rates (80% systemic): fires most evals, aggressive.
-                // Per-lane shedding keeps aggregate error rate low for
-                // localized failures, so this only fires for systemic issues.
-                this.applyDecrease(pool);
             } else if (pool.concurrencyLimit !== pool.baselineConcurrency) {
                 // Restoring: converge toward baseline from either direction.
                 // Uses convergent steps — small initially, growing with depth.

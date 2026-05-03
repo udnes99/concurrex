@@ -1,5 +1,6 @@
 import { ResourceExhaustedError, ExecutorNotRunningError, ArgumentError, ConcurrexError } from "../src/errors.js";
 import { DebounceMode, Executor } from "../src/Executor.js";
+import { ErrorRateThreshold, LatencyDrift, ProbabilisticErrorRate } from "../src/signals.js";
 import type { Logger } from "../src/logger.js";
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -2553,7 +2554,13 @@ describe("Executor tests", () => {
             randomValue = 0.99; // Default: high random → shedding doesn't fire
             vi.spyOn(performance, "now").mockImplementation(() => currentTime);
             vi.spyOn(Math, "random").mockImplementation(() => randomValue);
-            executor = new Executor({ logger });
+            // These tests exercise v1.2's probabilistic-error-decrease behavior.
+            // In v1.3 that's an opt-in signal; include it explicitly so the
+            // existing tests still validate the intended semantics.
+            executor = new Executor({
+                logger,
+                signals: [new LatencyDrift(), new ProbabilisticErrorRate()]
+            });
             executor.start();
         });
 
@@ -3140,6 +3147,194 @@ describe("Executor tests", () => {
             vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
             vi.setSystemTime(0);
         }, 10_000);
+    });
+
+    describe("Backpressure signals", () => {
+        let executor: Executor;
+
+        beforeAll(() => {
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
+        });
+
+        beforeEach(() => {
+            vi.setSystemTime(0);
+            executor = new Executor({ logger });
+            executor.start();
+        });
+
+        afterEach(() => {
+            executor.stop();
+        });
+
+        afterAll(() => {
+            vi.useRealTimers();
+        });
+
+        test("default signals are [LatencyDrift] when none specified", () => {
+            executor.registerPool("test");
+            expect(executor.isThroughputDegraded("test")).toBe(false);
+        });
+
+        test("always-firing signal causes concurrency to decrease", async () => {
+            const fireSignal = { name: "fire", triggered: () => true };
+            executor.registerPool("test", {
+                baselineConcurrency: 100,
+                controlWindow: 10,
+                signals: [fireSignal]
+            });
+            const initial = executor.getConcurrencyLimit("test");
+            for (let i = 0; i < 30; i++) {
+                vi.advanceTimersByTime(10);
+                await executor.run("test", () => {});
+            }
+            expect(executor.getConcurrencyLimit("test")).toBeLessThan(initial);
+        });
+
+        test("never-firing signal leaves concurrency at baseline", async () => {
+            const quietSignal = { name: "quiet", triggered: () => false };
+            executor.registerPool("test", {
+                baselineConcurrency: 100,
+                controlWindow: 10,
+                signals: [quietSignal]
+            });
+            const initial = executor.getConcurrencyLimit("test");
+            for (let i = 0; i < 30; i++) {
+                vi.advanceTimersByTime(10);
+                await executor.run("test", () => {});
+            }
+            expect(executor.getConcurrencyLimit("test")).toBe(initial);
+        });
+
+        test("empty signals array disables backpressure-driven decrease", async () => {
+            const alwaysFire = { name: "always-fire", triggered: () => true };
+            executor.stop();
+            executor = new Executor({ logger, signals: [alwaysFire] });
+            executor.start();
+            executor.registerPool("test", {
+                baselineConcurrency: 50,
+                controlWindow: 10,
+                signals: []
+            });
+            const initial = executor.getConcurrencyLimit("test");
+            for (let i = 0; i < 30; i++) {
+                vi.advanceTimersByTime(10);
+                await executor.run("test", () => {});
+            }
+            expect(executor.getConcurrencyLimit("test")).toBe(initial);
+        });
+
+        test("pool inherits executor signals when not specified", async () => {
+            const fireSignal = { name: "fire", triggered: () => true };
+            executor.stop();
+            executor = new Executor({ logger, signals: [fireSignal] });
+            executor.start();
+            executor.registerPool("test", {
+                baselineConcurrency: 50,
+                controlWindow: 10
+                // No pool-level signals → inherits [fireSignal]
+            });
+            const initial = executor.getConcurrencyLimit("test");
+            for (let i = 0; i < 30; i++) {
+                vi.advanceTimersByTime(10);
+                await executor.run("test", () => {});
+            }
+            expect(executor.getConcurrencyLimit("test")).toBeLessThan(initial);
+        });
+
+        test("ProbabilisticErrorRate fires with P = errorRateEwma", () => {
+            const signal = new ProbabilisticErrorRate();
+            // No errors yet → never fires
+            const baseCtx = {
+                pool: "test",
+                concurrencyLimit: 10,
+                inFlight: 0,
+                queueLength: 0
+            };
+            expect(signal.triggered({
+                ...baseCtx,
+                regulator: { errorRateEwma: null } as any
+            })).toBe(false);
+            expect(signal.triggered({
+                ...baseCtx,
+                regulator: { errorRateEwma: 0 } as any
+            })).toBe(false);
+            // With error rate = 1, Math.random() < 1 always → fires.
+            expect(signal.triggered({
+                ...baseCtx,
+                regulator: { errorRateEwma: 1 } as any
+            })).toBe(true);
+        });
+
+        test("ErrorRateThreshold fires above threshold, not below", () => {
+            const signal = new ErrorRateThreshold({ threshold: 0.5 });
+            const baseCtx = {
+                pool: "test",
+                concurrencyLimit: 10,
+                inFlight: 0,
+                queueLength: 0
+            };
+            expect(signal.triggered({
+                ...baseCtx,
+                regulator: { errorRateEwma: 0.4 } as any
+            })).toBe(false);
+            expect(signal.triggered({
+                ...baseCtx,
+                regulator: { errorRateEwma: 0.5 } as any
+            })).toBe(false); // not strictly greater
+            expect(signal.triggered({
+                ...baseCtx,
+                regulator: { errorRateEwma: 0.6 } as any
+            })).toBe(true);
+            expect(signal.triggered({
+                ...baseCtx,
+                regulator: { errorRateEwma: null } as any
+            })).toBe(false);
+        });
+
+        test("ErrorRateThreshold validates threshold in [0,1]", () => {
+            expect(() => new ErrorRateThreshold({ threshold: -0.1 })).toThrow();
+            expect(() => new ErrorRateThreshold({ threshold: 1.5 })).toThrow();
+            expect(() => new ErrorRateThreshold({ threshold: NaN })).toThrow();
+            expect(() => new ErrorRateThreshold({ threshold: 0 })).not.toThrow();
+            expect(() => new ErrorRateThreshold({ threshold: 1 })).not.toThrow();
+        });
+
+        test("LatencyDrift wraps regulator.degrading", () => {
+            const signal = new LatencyDrift();
+            const baseCtx = {
+                pool: "test",
+                concurrencyLimit: 10,
+                inFlight: 0,
+                queueLength: 0
+            };
+            expect(signal.triggered({
+                ...baseCtx,
+                regulator: { degrading: false } as any
+            })).toBe(false);
+            expect(signal.triggered({
+                ...baseCtx,
+                regulator: { degrading: true } as any
+            })).toBe(true);
+        });
+
+        test("any signal triggering causes decrease (OR semantics)", async () => {
+            const sig1 = { name: "s1", triggered: () => false };
+            const sig2 = { name: "s2", triggered: () => true };
+            const sig3 = { name: "s3", triggered: () => false };
+
+            executor.registerPool("test", {
+                baselineConcurrency: 50,
+                controlWindow: 10,
+                signals: [sig1, sig2, sig3]
+            });
+
+            const initial = executor.getConcurrencyLimit("test");
+            for (let i = 0; i < 30; i++) {
+                vi.advanceTimersByTime(10);
+                await executor.run("test", () => {});
+            }
+            expect(executor.getConcurrencyLimit("test")).toBeLessThan(initial);
+        });
     });
 
     describe("Error class hierarchy", () => {

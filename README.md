@@ -41,13 +41,14 @@ Multiple pools let you isolate different workloads (e.g. user-facing commands vs
 
 ## How It Works
 
-Five mechanisms cooperate:
+Six mechanisms cooperate:
 
 1. **ProDel** (Probabilistic Delay Load-shedding) — sojourn-based AQM. Drop probability `P = 1 - threshold/sojourn`. Adaptive LIFO/FIFO admission (FIFO when healthy, LIFO when dropping to protect fresh work).
 2. **Probabilistic early shedding** — rejects new arrivals at enqueue time with `P = dropRate/(dropRate+completionRate) * shrinkage` when ProDel is dropping and pool is at capacity. Instant rejections.
 3. **EWMA throughput regulator** — latency detection via operational Little's Law (`W = integral N(t)dt / completions`), log-transformed, smoothed by a shrinkage-dampened level EWMA. A Student-t hypothesis test on the trend detects sustained upward drift, with SE formula `√(δ² × W² × (1+W²) / (2 × (1+α/2)))` derived from von Neumann's lag-1 squared-difference noise estimator (drift-invariant) plus an autocorrelation variance-reduction factor for the EWMA. False-positive rate is upper-bounded by Φ(−Z) at steady state (≤2.3% at Z=2); small-sample conservatism comes from the Student-t critical value widening as effective sample size shrinks. Concurrency adjusted via a convergent step formula with bisection damping for O(log L) equilibrium convergence.
-4. **Per-lane error shedding** — each lane tracks its own error rate EWMA. High-error lanes probabilistically reject new requests without affecting pool-wide concurrency.
-5. **Fair lane scheduling** — round-robin across lanes (per-tenant, per-user, or shared). Prevents noisy neighbors from monopolizing capacity.
+4. **Pluggable backpressure signals** — pools auto-decrease concurrency when any configured signal triggers. The default is `LatencyDrift` (the trend test from #3). Opt-in built-ins include `ErrorRateThreshold`, `ProbabilisticErrorRate`, and users can implement custom `Signal`s for application-specific conditions (deadline pressure, memory usage, downstream health). Configurable globally on the executor and overridable per-pool.
+5. **Per-lane error shedding** — each lane tracks its own error rate EWMA. High-error lanes probabilistically reject new requests without affecting pool-wide concurrency.
+6. **Fair lane scheduling** — round-robin across lanes (per-tenant, per-user, or shared). Prevents noisy neighbors from monopolizing capacity.
 
 ## Single-Constant Design
 
@@ -84,6 +85,56 @@ executor.registerPool("commands", {
 | `minimumConcurrency` | 1 | Absolute floor for the concurrency limit |
 | `maximumConcurrency` | Infinity | Absolute ceiling for the concurrency limit |
 | `zScoreThreshold` | (inherit) | Detection sensitivity; overrides the executor-level default |
+| `signals` | (inherit) | Backpressure signals; replaces the executor-level list when specified |
+
+## Backpressure Signals
+
+Pools auto-decrease concurrency when any of their configured `Signal`s is triggered. The default is `[new LatencyDrift()]` — the v1.2 latency-trend test. Add or replace signals at the executor or pool level:
+
+```typescript
+import { Executor, LatencyDrift, ErrorRateThreshold, ProbabilisticErrorRate } from 'concurrex';
+
+// Executor-level default applies to every pool that doesn't override
+const executor = new Executor({
+    signals: [
+        new LatencyDrift(),                       // default
+        new ErrorRateThreshold({ threshold: 0.5 }) // also fire above 50% error rate
+    ]
+});
+
+// Per-pool override — replaces executor defaults entirely
+executor.registerPool("api", {
+    signals: [new LatencyDrift(), new ProbabilisticErrorRate()]
+});
+
+// Empty array = "never auto-decrease on backpressure"
+executor.registerPool("debug", { signals: [] });
+
+// Custom signal — implement the Signal interface
+const memoryPressure: Signal = {
+    name: "memory-pressure",
+    triggered: () => process.memoryUsage().heapUsed > 1_000_000_000
+};
+executor.registerPool("ingest", {
+    signals: [new LatencyDrift(), memoryPressure]
+});
+```
+
+Built-in signals:
+- **`LatencyDrift`** — fires when the trend test detects sustained upward latency drift. Default for every pool.
+- **`ErrorRateThreshold({ threshold })`** — fires when `errorRateEwma` exceeds the threshold ∈ [0, 1].
+- **`ProbabilisticErrorRate()`** — fires probabilistically with `P = errorRateEwma`. Self-scaling response to systemic errors. Preserves v1.2 default behavior; opt-in for v1.3+.
+
+Custom signals implement:
+
+```typescript
+interface Signal {
+    readonly name: string;
+    triggered(ctx: SignalContext): boolean;
+}
+```
+
+`SignalContext` exposes pool size, in-flight, queue length, and the full `RegulatorState` snapshot. Multiple signals are combined with OR semantics — any signal triggering causes a decrease.
 
 ## Lanes
 
