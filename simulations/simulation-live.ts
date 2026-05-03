@@ -37,8 +37,12 @@ type Snapshot = {
     logW: number | null;
     logWBar: number | null;
     dLogWBarEwma: number | null;
+    dLogWBarVarianceEstimate: number;
+    ewmaSumW2: number;
     se: number;
     zScore: number;
+    tCritical: number;
+    threshold: number;
     regulationPhase: string;
     regulationDepth: number;
 };
@@ -146,8 +150,12 @@ function captureSnapshot(
         logW: rs.logW,
         logWBar: rs.logWBar,
         dLogWBarEwma: rs.dLogWBarEwma,
+        dLogWBarVarianceEstimate: rs.dLogWBarVarianceEstimate,
+        ewmaSumW2: rs.ewmaSumW2,
         se: rs.se,
         zScore: rs.zScore,
+        tCritical: rs.tCritical,
+        threshold: rs.threshold,
         regulationPhase: rs.regulationPhase,
         regulationDepth: rs.regulationDepth
     };
@@ -214,7 +222,7 @@ async function scenarioSteadyState(): Promise<Scenario> {
 
     // Steady arrival for 15s: ~1 task every 10ms, each taking ~20ms.
     // Well within baseline capacity (10 slots / 20ms = 500/sec >> 100/sec arrival).
-    // Expect: limit stays at baseline, no regulator activation, no CoDel.
+    // Expect: limit stays at baseline, no regulator activation, no ProDel.
     globalDelay = 20;
     const tasks: Promise<unknown>[] = [];
     await submitAtRate(executor, pool, 10, 15_000, tasks);
@@ -232,7 +240,7 @@ async function scenarioSteadyState(): Promise<Scenario> {
             "1500 tasks arrive every ~10ms over 15s, each taking ~20ms. " +
             "Arrival rate (100/sec) well within capacity (500/sec at baseline). " +
             "Expect: limit stays at baseline, gravity pulls down any drift. " +
-            "~16 ESS evaluations. No CoDel, no regulator activation.",
+            "~16 ESS evaluations. No ProDel, no regulator activation.",
         data
     };
 }
@@ -264,7 +272,7 @@ async function scenarioBurstAbsorption(): Promise<Scenario> {
     // Phase 2: Sudden burst — 2000 tasks dumped at once on top of steady load.
     // Backend 100ms, baseline 10 → capacity = 100/sec → takes ~20s to drain 2000 tasks.
     // Convergent growth should ramp limit up significantly to absorb faster.
-    // High delayThreshold (30s) prevents CoDel from dropping — shows pure regulator growth.
+    // High delayThreshold (30s) prevents ProDel from dropping — shows pure regulator growth.
     console.log("    Burst: 2000 tasks at once...");
     for (let i = 0; i < 2000; i++) {
         allTasks.push(executor.run(pool, () => callBackend()).catch(() => {}));
@@ -287,7 +295,7 @@ async function scenarioBurstAbsorption(): Promise<Scenario> {
             "Phase 2: 2000 tasks dumped at once, backend still 100ms. " +
             "At baseline 10, draining 2000 takes ~20s — convergent growth should ramp up to absorb faster. " +
             "Phase 3 (burst+15s): steady load continues — gravity snaps limit back to baseline. " +
-            "CoDel disabled (30s threshold) — shows pure regulator growth without interference.",
+            "ProDel disabled (30s threshold) — shows pure regulator growth without interference.",
         data
     };
 }
@@ -348,10 +356,10 @@ async function scenarioThroughputDegradation(): Promise<Scenario> {
             "Continuous arrival at 200 req/sec for 36s, no gaps between phases. " +
             "Phase 1 (0–12s): backend 10ms — healthy, ~13 ESS evals. " +
             "Phase 2 (12–24s): backend 500ms — latency jumps 50×. A step change produces a transient derivative " +
-            "(not a sustained trend), so the z-test correctly does not trigger a decrease. CoDel handles immediate " +
+            "(not a sustained trend), so the z-test correctly does not trigger a decrease. ProDel handles immediate " +
             "queue shedding. The EWMA adapts to 500ms as the new baseline, then the system scales up to serve " +
             "demand at the new latency (500ms × 100 concurrent = 200/sec). " +
-            "Phase 3 (24–36s): backend 10ms — latency recovers, system restores. CoDel sheds stale entries during transitions.",
+            "Phase 3 (24–36s): backend 10ms — latency recovers, system restores. ProDel sheds stale entries during transitions.",
         data
     };
 }
@@ -389,7 +397,7 @@ async function scenarioDemandSpike(): Promise<Scenario> {
     // At baseline 10: capacity = 10/50ms × 1000 = 200/sec. Arrival = 1000/sec.
     // Must grow to ~50 concurrent to keep up.
     // 20s = ~22 ESS evaluations. Shows full convergent slow start growth.
-    // High delayThreshold prevents CoDel from interfering with the growth display.
+    // High delayThreshold prevents ProDel from interfering with the growth display.
     console.log("    Phase 2: Sustained high demand (1000 req/sec, 50ms backend, 20s)...");
     const spike: Promise<unknown>[] = [];
     await submitAtRate(executor, pool, 1, 20_000, spike);
@@ -421,7 +429,7 @@ async function scenarioDemandSpike(): Promise<Scenario> {
 }
 
 async function scenarioFullOverload(): Promise<Scenario> {
-    console.log("\n  Running: Full Overload (CoDel + Regulator Decrease)");
+    console.log("\n  Running: Full Overload (ProDel + Regulator Decrease)");
     const executor = new Executor({ logger });
     executor.start();
     const pool = "overload";
@@ -448,7 +456,7 @@ async function scenarioFullOverload(): Promise<Scenario> {
     // Phase 2 (12–30s): Sustained backend degradation + high arrival rate.
     // Backend 400ms, arrival every 10ms = 100/sec.
     // Capacity at 10 slots: 10/400ms × 1000 = 25/sec << 100/sec.
-    // Both CoDel and the regulator activate: CoDel sheds stale entries, regulator decreases concurrency.
+    // Both ProDel and the regulator activate: ProDel sheds stale entries, regulator decreases concurrency.
     // 18s = ~20 ESS evaluations. Shows retraction then fresh decrease.
     console.log("    Phase 2: Backend degrading (400ms, 18s)...");
     globalDelay = 400;
@@ -469,13 +477,13 @@ async function scenarioFullOverload(): Promise<Scenario> {
     executor.stop();
 
     return {
-        name: "Full Overload (CoDel + Regulator Decrease)",
+        name: "Full Overload (ProDel + Regulator Decrease)",
         description:
             "Baseline: 10, min: 2, max: 20, delayThreshold: 100ms, controlWindow: 100ms. " +
             "Phase 1 (0–12s): 100 req/sec at 15ms — EWMA warm-up (~13 ESS evals). " +
             "Phase 2 (12–30s): backend 400ms, 100 req/sec — max concurrency capped at 20, " +
             "so capacity (20/400ms = 50/sec) cannot meet arrival (100/sec). " +
-            "CoDel drops stale entries. Z-test detects the step change during transition. " +
+            "ProDel drops stale entries. Z-test detects the step change during transition. " +
             "Phase 3 (30–42s): backend 15ms — system restores. Shows recovery growth.",
         data
     };
@@ -868,13 +876,13 @@ async function main(): Promise<void> {
             `    Peak queue: ${maxQueue}, Peak in-flight: ${maxInFlight}, Limit: ${minLimit}–${maxLimit}`
         );
         console.log(
-            `    CoDel drops: ${hadDrops ? "yes" : "no"}, Latency degraded: ${hadDegradation ? "yes" : "no"}`
+            `    ProDel drops: ${hadDrops ? "yes" : "no"}, Latency degraded: ${hadDegradation ? "yes" : "no"}`
         );
     }
 
     const jsonPath = generateJsonOutput(import.meta.url, "simulation-live", scenarios, {
         title: "Executor \u2013 Live Simulation",
-        subtitle: "Real HTTP backend, real concurrency, real time. CoDel + Convergent Throughput Regulator (Little\u2019s Law + Error Rate)."
+        subtitle: "Real HTTP backend, real concurrency, real time. ProDel + Convergent Throughput Regulator (Little\u2019s Law + Error Rate)."
     });
     generateHtmlFromJson(jsonPath);
 

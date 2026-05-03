@@ -26,7 +26,7 @@ type ScenarioOutput = {
         peakInFlight: number;
         concurrencyLimitMin: number;
         concurrencyLimitMax: number;
-        codelDropsOccurred: boolean;
+        prodelDropsOccurred: boolean;
         throughputDegradationOccurred: boolean;
     };
     phases?: { timeMs: number; label: string }[];
@@ -61,7 +61,7 @@ function chartScript(scenarios: ScenarioOutput[]): string {
     const hasEwma = has(ts0, "logW", "logWBar");
     const hasZTest = has(ts0, "dLogWBarEwma", "se");
     const hasUncertainty = has(ts0, "ewmaSumW2", "threshold");
-    const hasVariance = has(ts0, "dLogWBarSM");
+    const hasVariance = has(ts0, "dLogWBarVarianceEstimate");
     const hasPhases = scenarios.some((s) => s.phases && s.phases.length > 0);
 
     return `
@@ -195,7 +195,7 @@ scenarios.forEach((scenario, i) => {
             order: 1,
         },
         {
-            label: 'CoDel Dropping',
+            label: 'ProDel Dropping',
             data: ts.dropping.map(v => v ? 1 : null),
             backgroundColor: COLORS.dropping,
             borderWidth: 0,
@@ -305,8 +305,8 @@ ${hasVariance ? `
                     yAxisID: 'yTrend',
                 },
                 {
-                    label: 'Variance (SM)',
-                    data: ts.dLogWBarSM,
+                    label: 'MSSD/2 (von Neumann δ²)',
+                    data: ts.dLogWBarVarianceEstimate,
                     borderColor: COLORS.variance,
                     borderWidth: 1.5,
                     pointRadius: 0,
@@ -336,15 +336,15 @@ ${hasVariance ? `
     });
 ` : ""}
 
-${hasZTest && !hasVariance ? `
-    // ── z-Test chart: dLogWBar trend with SE bands ──
+${hasZTest ? `
+    // ── z-Test chart: dLogWBar trend with firing threshold + DEGRADING dots ──
     new Chart(document.getElementById('chart-' + i + '-ztest').getContext('2d'), {
         type: 'line',
         data: {
             labels,
             datasets: [
                 {
-                    label: 'dLogW\\u0304 EWMA (trend)',
+                    label: 'dLogW\\u0304 EWMA (trend signal v\\u0302)',
                     data: ts.dLogWBarEwma,
                     borderColor: '#3fb950',
                     borderWidth: 2,
@@ -354,10 +354,13 @@ ${hasZTest && !hasVariance ? `
                     spanGaps: true,
                 },
                 {
-                    label: '+SE band',
-                    data: ts.se.map(v => v > 0 ? v : null),
-                    borderColor: 'rgba(210, 153, 34, 0.6)',
-                    borderWidth: 1,
+                    label: '+threshold (tCritical × SE)',
+                    data: ${has(ts0, "threshold") && has(ts0, "tCritical") ?
+                        "ts.threshold.map((v, i) => (v > 0 && ts.tCritical[i] > 0 && ts.tCritical[i] < 10) ? v : null)" :
+                        has(ts0, "threshold") ? "ts.threshold.map(v => v > 0 ? v : null)" :
+                        "ts.se.map(v => v > 0 ? v : null)"},
+                    borderColor: 'rgba(248, 81, 73, 0.7)',
+                    borderWidth: 1.5,
                     borderDash: [4, 2],
                     pointRadius: 0,
                     tension: 0.1,
@@ -365,10 +368,13 @@ ${hasZTest && !hasVariance ? `
                     spanGaps: true,
                 },
                 {
-                    label: '\\u2212SE band',
-                    data: ts.se.map(v => v > 0 ? -v : null),
-                    borderColor: 'rgba(210, 153, 34, 0.3)',
-                    borderWidth: 1,
+                    label: '\\u2212threshold',
+                    data: ${has(ts0, "threshold") && has(ts0, "tCritical") ?
+                        "ts.threshold.map((v, i) => (v > 0 && ts.tCritical[i] > 0 && ts.tCritical[i] < 10) ? -v : null)" :
+                        has(ts0, "threshold") ? "ts.threshold.map(v => v > 0 ? -v : null)" :
+                        "ts.se.map(v => v > 0 ? -v : null)"},
+                    borderColor: 'rgba(248, 81, 73, 0.3)',
+                    borderWidth: 1.5,
                     borderDash: [4, 2],
                     pointRadius: 0,
                     tension: 0.1,
@@ -389,7 +395,7 @@ ${hasZTest && !hasVariance ? `
                     backgroundColor: 'rgba(248, 81, 73, 0.2)',
                     borderColor: '#f85149',
                     borderWidth: 0,
-                    pointRadius: 4,
+                    pointRadius: 5,
                     pointBackgroundColor: '#f85149',
                     fill: false,
                     spanGaps: false,
@@ -441,14 +447,17 @@ ${hasUncertainty ? `
                     yAxisID: 'ySE',
                 },
                 {
-                    label: 'Threshold (Z \\u00d7 SE)',
-                    data: ts.threshold,
+                    label: 'Threshold (tCritical \\u00d7 SE)',
+                    data: ${has(ts0, "tCritical") ?
+                        "ts.threshold.map((v, i) => (ts.tCritical[i] > 0 && ts.tCritical[i] < 10) ? v : null)" :
+                        "ts.threshold"},
                     borderColor: COLORS.threshold,
                     borderWidth: 2,
                     borderDash: [5, 3],
                     pointRadius: 0,
                     tension: 0.1,
                     fill: false,
+                    spanGaps: true,
                     yAxisID: 'ySE',
                 },
                 ...(ts.completionRateEwma ? [{
@@ -498,10 +507,10 @@ function scenarioHtml(scenario: ScenarioOutput, index: number, ts0: TimeSeriesOu
     const hasEwma = has(ts0, "logW", "logWBar");
     const hasZTest = has(ts0, "dLogWBarEwma", "se");
     const hasUncertainty = has(ts0, "ewmaSumW2", "threshold");
-    const hasVariance = has(ts0, "dLogWBarSM");
+    const hasVariance = has(ts0, "dLogWBarVarianceEstimate");
 
     const legendParts = [
-        "Shaded red = CoDel dropping",
+        "Shaded red = ProDel dropping",
         "Shaded orange = throughput degraded",
     ];
     if (hasErrorRate) legendParts.push("Dashed red = error rate");
@@ -519,7 +528,7 @@ function scenarioHtml(scenario: ScenarioOutput, index: number, ts0: TimeSeriesOu
         <div class="chart-container-sm"><canvas id="chart-${index}-ewma"></canvas></div>`);
     }
 
-    if (hasZTest && !hasVariance) {
+    if (hasZTest) {
         charts.push(`
         <div class="chart-label">Latency Trend z-Test</div>
         <div class="chart-container-sm"><canvas id="chart-${index}-ztest"></canvas></div>`);
@@ -540,7 +549,7 @@ function scenarioHtml(scenario: ScenarioOutput, index: number, ts0: TimeSeriesOu
         `peak queue ${s.peakQueueLength}`,
         `peak in-flight ${s.peakInFlight}`,
     ];
-    if (s.codelDropsOccurred) stats.push("CoDel drops");
+    if (s.prodelDropsOccurred) stats.push("ProDel drops");
     if (s.throughputDegradationOccurred) stats.push("degradation detected");
 
     return `

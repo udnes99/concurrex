@@ -19,7 +19,7 @@
 <body>
 <h1>Executor: Theoretical Curves</h1>
 <p class="subtitle">Pure mathematical plots for each section of <a href="THEORY.md">THEORY.md</a>.
-Compare against the <a href="../simulations/executor-simulation-live.html">live simulation</a>.</p>
+Compare against the <a href="../simulations/simulation-live.html">live simulation</a>.</p>
 
 <h2>&sect;2. ProDel: Probabilistic Delay Load-shedding</h2>
 
@@ -50,6 +50,16 @@ Compare against the <a href="../simulations/executor-simulation-live.html">live 
 
 <h2>&sect;4. Throughput Regulator</h2>
 
+<h3>&sect;4.2.1 Operational Little's Law: W&#771; = &int;N(t)dt / r tracks W at any W/CW ratio</h3>
+<p class="description">
+    Per-window estimator W&#771; = &int;N(t)dt / r where the integral is `inFlightMs` and r is completions.
+    Plotted across W/controlWindow ratios from 0.1&times; to 10&times;, with concurrencyLimit = 100.
+    Steady state means &lambda; = L/W (Little's Law), so completions/window = (L/W)&times;CW = L&times;CW/W.
+    The estimator W&#771; = (L&times;CW)/(L&times;CW/W) = W &mdash; correct at every ratio.
+    The "cap" only binds when in-flight is sparse (low utilization); at capacity, the math is exact.
+</p>
+<div class="chart-container"><canvas id="little-tracking"></canvas></div>
+
 <h3>&sect;4.1 Time-Weighted EWMA Alpha</h3>
 <p class="description">
     &alpha; = 1 &minus; exp(&minus;&Delta;t / (TIME_CONSTANT &times; W)). Shown for TIME_CONSTANT = 9 and W = 100ms.
@@ -62,7 +72,6 @@ Compare against the <a href="../simulations/executor-simulation-live.html">live 
 <p class="description">
     Weights an observation of n samples against a prior of Z&sup2; = 4 pseudo-observations.
     At n = 1: 20% trust in new data. At n = 4: 50%. At n = 100: 96%.
-    Same denominator as the Wilson score interval.
 </p>
 <div class="chart-container"><canvas id="shrinkage"></canvas></div>
 
@@ -110,13 +119,36 @@ Compare against the <a href="../simulations/executor-simulation-live.html">live 
 </p>
 <div class="chart-container"><canvas id="bisection"></canvas></div>
 
-<h3>&sect;4.3 Second Moment: E[X&sup2;] = &sigma;&sup2; under H0</h3>
+<h3>&sect;4.2.6 Drift Invariance of MSSD/2 (von Neumann's &delta;&sup2;)</h3>
 <p class="description">
-    Under H0 (E[dLogWBarRate] = 0), the second moment SM = EWMA(v&sup2;) uses the <strong>raw</strong> (unshrunk)
-    derivative v, giving an unbiased estimator of &sigma;&sup2;. The trend EWMA input is shrinkage-dampened
-    (v &times; s), so z ~ N(0, s&sup2;) under H0 &mdash; conservative at low throughput (s &lt; 1).
+    &delta;&sup2;<sub>k</sub> = EWMA((v<sub>k</sub> &minus; v<sub>k-1</sub>)&sup2; / 2) is the lag-1 squared-difference noise estimator.
+    Under additive drift v<sub>k</sub> = &mu; + &epsilon;<sub>k</sub>, the drift cancels in pairwise differences:
+    v<sub>k</sub> &minus; v<sub>k-1</sub> = &epsilon;<sub>k</sub> &minus; &epsilon;<sub>k-1</sub>. So &delta;&sup2; tracks
+    the noise of &epsilon;<sub>k</sub> only, independent of &mu;. Compare against centered-variance estimators
+    (Welford-B, raw second moment), which inflate as &mu; grows &mdash; saturating the z-score.
+    The plot shows ensemble-averaged E[&delta;&sup2;] vs E[V<sub>Welford</sub>] vs E[S<sup>(2)</sup>] under
+    sustained drift; only &delta;&sup2; stays calibrated at &sigma;&sup2; = 1.
 </p>
-<div class="chart-container"><canvas id="second-moment"></canvas></div>
+<div class="chart-container"><canvas id="drift-invariance"></canvas></div>
+
+<h3>&sect;4.2.6 Autocorrelation Correction: 1 + &alpha;/2</h3>
+<p class="description">
+    Because v<sub>k</sub> is the first difference of an AR(1)-like EWMA, it carries known negative autocorrelation
+    &rho;<sub>1</sub> = &minus;&alpha;/2. The lag-1 squared difference therefore overestimates &sigma;&sup2;
+    by factor (1 + &alpha;/2). Dividing &delta;&sup2; by (1 + &alpha;/2) yields the unbiased &sigma;&sup2; estimator.
+    Plot shows the correction factor vs &alpha; for the three Z-thresholds.
+</p>
+<div class="chart-container"><canvas id="autocorr-correction"></canvas></div>
+
+<h3>&sect;4.3.1 Student-t Critical Value with Cornish-Fisher Truncation Bound</h3>
+<p class="description">
+    The implementation uses 4th-order Cornish-Fisher (Hill 1970) plus an asymptotic-series truncation bound
+    2&middot;|g<sub>4</sub>/&nu;<sup>4</sup>|. At &nu; &ge; 5 the bound is rigorous (geometric decay with ratio &le; &frac12;);
+    at smaller &nu; it is heuristically conservative via the 1/&nu;<sup>4</sup> growth.
+    As &nu; &rarr; 0 the bound diverges, naturally gating the test off &mdash; no df-clamp needed.
+    As &nu; &rarr; &infin; it converges to z = &sigma;<sub>D</sub>.
+</p>
+<div class="chart-container"><canvas id="t-critical"></canvas></div>
 
 <h3>Per-Lane Error Rate: Bayesian Shrinkage</h3>
 <p class="description">
@@ -212,6 +244,40 @@ const chartDefaults = {
             scales: {
                 x: { ...chartDefaults.scales.x, title: { display: true, text: 'Completion rate EWMA (mu)' }, ticks: { maxTicksLimit: 10 } },
                 y: { ...chartDefaults.scales.y, title: { display: true, text: 'Early shed probability P' }, min: 0, max: 1 }
+            }
+        }
+    });
+})();
+
+// 4.2.1 Operational Little's Law: W̃ tracks true W via inFlightMs/completions
+(() => {
+    const CW = 100; // controlWindow ms
+    const L = 100;  // concurrencyLimit
+    // Plot W̃ across true W from 0.1×CW to 100×CW
+    const Ws = [];
+    for (let exp = -1; exp <= 2; exp += 0.1) Ws.push(Math.pow(10, exp));
+    new Chart(document.getElementById('little-tracking'), {
+        type: 'line',
+        data: {
+            labels: Ws.map(w => w.toFixed(2)),
+            datasets: [
+                { label: 'W̃ at capacity (inFlight = L)',
+                  data: Ws.map(W => {
+                      const lambda = L / (W * CW); // per ms
+                      const completionsPerWindow = lambda * CW;
+                      const inFlightMs = L * CW;
+                      return inFlightMs / completionsPerWindow; // ms
+                  }),
+                  borderColor: '#3498db' },
+                { label: 'True W (reference)',
+                  data: Ws.map(W => W * CW),
+                  borderColor: '#999', borderDash: [3, 3], borderWidth: 1 }
+            ]
+        },
+        options: { ...chartDefaults,
+            scales: {
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'True W / controlWindow' } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'W̃ estimate (ms)' }, type: 'logarithmic' }
             }
         }
     });
@@ -421,54 +487,131 @@ const chartDefaults = {
     });
 })();
 
-// 4.3 Second Moment convergence — SM tracks sigma^2 under H0
+// 4.2.6 Drift invariance: δ² (MSSD/2) vs Welford V vs S² under sustained drift.
+// All three estimators see v_k = μ + ε_k with σ² = 1. Plot E[estimator] / σ² vs μ.
 (() => {
-    // Simulate SM = EWMA(x^2) for N(0, sigma^2) noise with sigma=1
-    const windows = range(1, 50, 1);
+    function mulberry(seed) { return () => { let t = seed += 0x6d2b79f5; t = Math.imul(t ^ t >>> 15, t | 1); t ^= t + Math.imul(t ^ t >>> 7, t | 61); return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+    function gauss(rand) { const u = 1 - rand(); const v = rand(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
     const alpha0 = 1 - Math.exp(-1 / TIME_CONSTANT);
+    const mus = range(0, 5, 0.25);
+    const N_TRIALS = 200;
+    const N_WINDOWS = 200; // long run so EWMAs converge to steady state
 
-    // Deterministic: show the expected convergence E[SM] = sigma^2 = 1
-    // SM_k = (1-alpha)*SM_{k-1} + alpha*x_k^2
-    // E[SM] converges to E[x^2] = sigma^2 for any alpha
-    const smValues = [];
-    let sm = 0;
-    for (const _ of windows) {
-        // E[x^2] = 1 (unit variance), so SM converges to 1
-        sm = (1 - alpha0) * sm + alpha0 * 1;
-        smValues.push(sm);
+    function simulate(mu) {
+        let totalDelta2 = 0, totalV = 0, totalS2 = 0;
+        for (let trial = 0; trial < N_TRIALS; trial++) {
+            const rand = mulberry(42 + trial);
+            let vHat = 0, vPrev = null;
+            let delta2 = 0, V = 0, S2 = 0;
+            for (let k = 0; k < N_WINDOWS; k++) {
+                const v = mu + gauss(rand); // drift + unit-variance noise
+                // δ² = EWMA((v_k - v_{k-1})² / 2) — von Neumann
+                if (vPrev !== null) {
+                    const diff = v - vPrev;
+                    delta2 = (1 - alpha0) * delta2 + alpha0 * (diff * diff) / 2;
+                }
+                // Welford-B V = EWMA((v_k - v̂_{k-1})²)
+                const residual = v - vHat;
+                V = (1 - alpha0) * V + alpha0 * residual * residual;
+                vHat = (1 - alpha0) * vHat + alpha0 * v;
+                // S² = EWMA(v²)
+                S2 = (1 - alpha0) * S2 + alpha0 * v * v;
+                vPrev = v;
+            }
+            totalDelta2 += delta2;
+            totalV += V;
+            totalS2 += S2;
+        }
+        // Apply autocorrelation correction to δ² to get σ̂² estimate
+        const sigmaHatDelta = (totalDelta2 / N_TRIALS) / (1 + alpha0 / 2);
+        return {
+            delta: sigmaHatDelta,
+            welford: totalV / N_TRIALS,
+            sm: totalS2 / N_TRIALS
+        };
     }
 
-    // SE = sqrt(SM * sumW2), show n_eff = 1/sumW2 growing
-    const nEffValues = [];
-    let sw2 = 1;
-    for (const _ of windows) {
-        sw2 = (1 - alpha0) * (1 - alpha0) * sw2 + alpha0 * alpha0;
-        nEffValues.push(1 / sw2);
-    }
-
-    new Chart(document.getElementById('second-moment'), {
+    const data = mus.map(simulate);
+    new Chart(document.getElementById('drift-invariance'), {
         type: 'line',
         data: {
-            labels: windows,
+            labels: mus,
+            datasets: [
+                { label: 'δ² / (1+α/2) = unbiased σ̂² (drift-invariant ✓)',
+                  data: data.map(d => d.delta), borderColor: '#3498db' },
+                { label: 'Welford V (centered) — absorbs μ²',
+                  data: data.map(d => d.welford), borderColor: '#e74c3c' },
+                { label: 'S² (raw second moment) — μ² + σ²',
+                  data: data.map(d => d.sm), borderColor: '#e67e22' },
+                { label: 'σ² = 1 (true noise)',
+                  data: mus.map(() => 1), borderColor: '#999', borderDash: [3, 3], borderWidth: 1 }
+            ]
+        },
+        options: { ...chartDefaults,
+            scales: {
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Drift μ (× σ)' } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'E[estimator] / σ²' }, min: 0, max: 30, type: 'logarithmic' }
+            }
+        }
+    });
+})();
+
+// 4.2.6 Autocorrelation correction factor (1 + α/2)
+(() => {
+    const alphas = range(0, 1, 0.01);
+    new Chart(document.getElementById('autocorr-correction'), {
+        type: 'line',
+        data: {
+            labels: alphas.map(a => a.toFixed(2)),
             datasets: [{
-                label: 'E[SM] → σ² = 1  (unbiased for any α)',
-                data: smValues,
-                borderColor: '#3498db',
+                label: '1 + α/2 (overestimation factor for δ²)',
+                data: alphas.map(a => 1 + a / 2),
+                borderColor: '#3498db'
             }, {
-                label: 'n_eff = 1/sumW2 (effective sample size)',
-                data: nEffValues,
-                borderColor: '#2ecc71', yAxisID: 'y1'
-            }, {
-                label: 'σ² = 1',
-                data: windows.map(() => 1),
-                borderColor: '#999', borderDash: [3, 3], borderWidth: 1
+                label: 'α = 0.105 (Z=2 steady state)',
+                data: alphas.map(a => Math.abs(a - (1 - Math.exp(-1/9))) < 0.005 ? 1 + a / 2 : null),
+                borderColor: '#e74c3c', pointRadius: 5
             }]
         },
         options: { ...chartDefaults,
             scales: {
-                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Windows' } },
-                y: { ...chartDefaults.scales.y, title: { display: true, text: 'E[SM] / σ²' }, min: 0, max: 1.1, position: 'left' },
-                y1: { title: { display: true, text: 'Effective samples (1/sumW2)' }, min: 0, max: 20, position: 'right', grid: { drawOnChartArea: false } }
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'α' }, ticks: { maxTicksLimit: 10 } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Correction factor' }, min: 1, max: 1.5 }
+            }
+        }
+    });
+})();
+
+// 4.3.1 Student-t critical value: 4th-order Cornish-Fisher + truncation bound vs df
+(() => {
+    function tScore(z, df) {
+        const z2 = z*z, z4 = z2*z2, z6 = z4*z2, z8 = z4*z4;
+        const g1 = (z * (z2 + 1)) / 4;
+        const g2 = (z * (5*z4 + 16*z2 + 3)) / 96;
+        const g3 = (z * (3*z6 + 19*z4 + 17*z2 - 15)) / 384;
+        const g4 = (z * (79*z8 + 776*z6 + 1482*z4 - 1920*z2 - 945)) / 92160;
+        const df2 = df*df, df3 = df2*df, df4 = df3*df;
+        const tApprox = z + g1/df + g2/df2 + g3/df3 + g4/df4;
+        const errorBound = 2 * Math.abs(g4/df4);
+        return tApprox + errorBound;
+    }
+    const dfs = range(1, 30, 0.5);
+    new Chart(document.getElementById('t-critical'), {
+        type: 'line',
+        data: {
+            labels: dfs.map(d => d.toFixed(1)),
+            datasets: [
+                { label: 'tScore(σ_D=1, ν) — Z=1', data: dfs.map(d => tScore(1, d)), borderColor: '#2ecc71', borderDash: [5, 3] },
+                { label: 'tScore(σ_D=2, ν) — Z=2', data: dfs.map(d => tScore(2, d)), borderColor: '#3498db' },
+                { label: 'tScore(σ_D=3, ν) — Z=3', data: dfs.map(d => tScore(3, d)), borderColor: '#e74c3c', borderDash: [5, 3] },
+                { label: 'z=2 (asymptote)', data: dfs.map(() => 2), borderColor: '#999', borderDash: [3, 3], borderWidth: 1 }
+            ]
+        },
+        options: { ...chartDefaults,
+            scales: {
+                x: { ...chartDefaults.scales.x, title: { display: true, text: 'Degrees of freedom ν = 1/sumW² − 1' }, ticks: { maxTicksLimit: 10 } },
+                y: { ...chartDefaults.scales.y, title: { display: true, text: 'Critical value' }, min: 1, max: 15 }
             }
         }
     });

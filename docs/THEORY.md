@@ -2,7 +2,7 @@
 
 A formal treatment of the mechanisms in the Executor: **ProDel** (Probabilistic Delay Load-shedding — queue management), **probabilistic early shedding**, and the **throughput regulator** (concurrency regulation). ProDel is a sojourn-based active queue management algorithm where drop probability is proportional to entry staleness. All theorem numbers, definitions, and proofs reference the implementation in `Executor.ts`.
 
-> **Interactive plots:** See [`theory-plots.html`](theory-plots.html) for Chart.js visualizations of every curve in this document — compare theory against the [live simulation](../test/simulations/simulation-live.html).
+> **Interactive plots:** See [`theory-plots.html`](theory-plots.html) for Chart.js visualizations of every curve in this document — compare theory against the [live simulation](../simulations/simulation-live.html).
 
 ---
 
@@ -31,9 +31,9 @@ A formal treatment of the mechanisms in the Executor: **ProDel** (Probabilistic 
 
 - $\hat{L}_k$ — EWMA of in-flight count (`inFlightEwma`)
 - $\bar{m}_k$ — shrinkage-dampened EWMA of $\log(W)$ (`logWBar`)
-- $\hat{v}_k$ — EWMA of shrinkage-dampened trend (`dLogWBarEwma`); input is $v_k \times s_k$ where $s_k$ is per-window shrinkage
-- $S_k^{(2)}$ — second moment of raw trend $\text{EWMA}(v_k^2)$ (`dLogWBarSM`); uses unshrunk $v_k$
-- $W_k^{(2)}$ — sum of squared EWMA weights (`ewmaSumW2`)
+- $\hat{v}_k$ — EWMA of shrunk derivative $v_k \cdot s_k$ (`dLogWBarEwma`); asymmetric shrinkage on input
+- $\delta^2_k$ — von Neumann's lag-1 squared-difference noise estimator $\text{EWMA}((v_k - v_{k-1})^2 / 2)$ (`dLogWBarVarianceEstimate`); drift-invariant
+- $W_k^{(2)}$ — sum of squared EWMA weights (`ewmaSumW2`); encodes effective sample size
 
 **Error tracking state.** Per window:
 
@@ -57,7 +57,7 @@ A formal treatment of the mechanisms in the Executor: **ProDel** (Probabilistic 
 
 - $\sigma_D$ — `zScoreThreshold` (default: 2, configurable globally and per-pool). Number of standard errors for significance. The single tunable constant from which all other statistical parameters are derived.
 - $Z^2 = \sigma_D^2$ — `z2`. The Bayesian prior strength in pseudo-observations. At $\sigma_D = 2$: $Z^2 = 4$.
-- $H = \text{round}(2 / (1 - e^{-1/\sigma_D^2}))$ — `timeConstant`. EWMA time constant in control windows: decay constant, warm-up threshold, and evaluation cadence. At $\sigma_D = 2$: $H = 9$.
+- $H = \text{round}(2 / (1 - e^{-1/\sigma_D^2}))$ — `timeConstant`. EWMA time constant in control windows: decay constant and evaluation cadence. Warm-up is handled implicitly by the Student-t critical value via effective sample size (§4.3.1). At $\sigma_D = 2$: $H = 9$.
 
 ---
 
@@ -234,7 +234,7 @@ where $n$ is the observation count backing the current window's measurement, and
 
 **Interpretation.** The shrinkage factor $n/(n+Z^2)$ is the optimal Bayesian weight for combining a prior of $Z^2$ pseudo-observations with $n$ new observations. When $n$ is small, the prior dominates and the EWMA update is dampened. When $n$ is large, the observation dominates and the EWMA tracks the signal closely.
 
-**Connection to Wilson score interval.** The Wilson interval's denominator is $n + z^2$ — the same expression. The shrinkage factor is the fraction of the Wilson denominator attributable to data (vs. prior).
+**Connection to Wilson score interval (proportions only).** When the signal is a binomial proportion (pool-wide or per-lane error rate), the shrunk center estimator $(n\hat{p} + 0.5 Z^2)/(n+Z^2)$ is *exactly* the Wilson (1927) interval's center under prior $p_0 = 0.5$. For our other shrunk signals (rates, level $\bar{m}$), the denominator $n + Z^2$ has the same algebraic shape but the underlying conjugate-prior is different (Gamma-Poisson for rates, Normal for the log-W level). So Wilson is the precise frequentist counterpart for the proportion case; for other signals, the connection is "same shrinkage shape, different prior."
 
 **Representative values:**
 
@@ -246,85 +246,147 @@ where $n$ is the observation count backing the current window's measurement, and
 | 50 | 0.93 |
 | 100 | 0.96 |
 
-**Where applied:** completion rate, drop rate, error rate, log(W) level EWMA, trend EWMA input, and early shedding probability. The relevant $n$ differs per signal:
+**Where applied:** completion rate, drop rate, error rate, log(W) level EWMA, and early shedding probability. Shrinkage is used for *parameter estimation* only; the trend hypothesis test uses Student-t instead (see §4.3.1.2 for the audit). The relevant $n$ differs per signal:
 
 | Signal | $n$ |
 |--------|-----|
 | Completion rate, drop rate, error rate | `completionsThisWindow` |
 | log(W) level EWMA | `completionsThisWindow` (shrinkage-scaled alpha dampens noisy low-throughput windows) |
-| Trend EWMA input | `completionsThisWindow` (shrinkage on the derivative value, not the alpha — see §4.3.1) |
 | Early shedding | `completionRateEwma` (smoothed throughput) |
 | Per-lane error rate | $c_\ell$ (lane's cumulative completions) |
 
-### 4.2 EWMA Update Equations
+### 4.2 The Latency Detection Pipeline
 
-Given completion count $r_k$ and drop count $d_k$ for window $k$, and $\alpha_c = \alpha_k \times n_k / (n_k + Z^2)$ where $n_k = r_k$ (Bayesian shrinkage-scaled alpha):
+The latency-trend hypothesis test composes seven layered estimators, each addressing a distinct statistical concern. Stages run in this order every window:
 
-**Completion rate update:**
+1. **Operational Little's Law**: instantaneous $W_k$ from accumulated in-flight integral (§4.2.1).
+2. **Log transform**: $m_k = \log W_k$, robust to multiplicative spikes (§4.2.2).
+3. **Level EWMA on $\log W$** with Bayesian-shrinkage-dampened α (§4.2.3).
+4. **dLogW** — dt-normalized derivative of the filtered level (§4.2.4).
+5. **Trend EWMA** with asymmetric shrinkage on the input (§4.2.5).
+6. **MSSD/2 noise estimator** (von Neumann's δ²) — drift-invariant by construction (§4.2.6).
+7. **Effective sample size** via exact $W^{(2)} = \sum w_j^2$ recursion (§4.2.7).
 
-$$\hat\mu_k = (1 - \alpha_c) \hat\mu_{k-1} + \alpha_c r_k$$
+The test itself is in §4.3.1: a Student-t z-test using $\hat{v}/\text{SE}$ against a Cornish-Fisher critical value at df = ESS − 1.
 
-**Drop rate update:**
+#### 4.2.1 Stage 1 — Operational Little's Law
 
-$$\hat\delta_k = (1 - \alpha_c) \hat\delta_{k-1} + \alpha_c d_k$$
+**Definition.** For window $k$ with elapsed time $\Delta t_k$ and completion count $r_k > 0$, the instantaneous mean-residence estimator is
 
-**In-flight EWMA update:**
+$$W_k = \frac{\int_{0}^{\Delta t_k} N(t)\, dt}{r_k} = \frac{\texttt{inFlightMs}_k}{r_k}$$
 
-$$\hat{L}_k = (1 - \alpha_k) \hat{L}_{k-1} + \alpha_k F_k$$
+The integral $\int N(t)\,dt$ is accumulated in `inFlightMs` and updated on every in-flight change (admission, completion, evaluation): `inFlightMs += inFlight × (now − lastChange)`.
 
-**Operational Little's Law latency (Kim & Whitt, 2013):**
+**Why this is correct (Kim & Whitt, 2013).** Operational Little's Law is an *identity*, not a steady-state asymptotic. For any finite interval $[0, T]$:
 
-$$W_k = \frac{\int_0^{\Delta t_k} N(t)\,dt}{r_k} \quad (\text{when } r_k > 0)$$
+$$\int_0^T N(t)\,dt = \sum_{i \in \mathcal{I}_T} R_i^{(T)}$$
 
-where $\int N(t)\,dt$ is the accumulated in-flight-milliseconds (`inFlightMs`) over the window and $r_k$ is completions. This is the exact finite-interval operational Little's Law — no approximation. The integral is updated on every in-flight change (admission and completion), so it captures the true area under the in-flight curve.
+where $\mathcal{I}_T$ is the set of tasks present in the interval and $R_i^{(T)} = \min(c_i, T) - \max(a_i, 0)$ is task $i$'s residence time *clipped to the interval*. Dividing by completions $r_k = |\{i : c_i \in [0,T]\}|$ gives a sample-average residence time over the window — exact, no approximation, no stationarity assumption.
 
-**Shrinkage-dampened EWMA on $\log(W)$:**
+The estimator is unbiased for the mean residence time $W$ whenever in-rate equals out-rate over the interval. Under transient flow imbalance (more arrivals than completions, or vice versa) the estimator is biased *high* (more in-flight integral, fewer completions to divide by) — but the bias is bounded by the in-flight integral, which is itself bounded by `inFlight × Δt`. The trend test is robust to this transient bias because (a) the bias is non-negative, so it cannot mask real degradation, and (b) §4.2.5's shrinkage dampens single-completion-per-window spikes proportionally to evidence.
 
-The level EWMA smooths $\log(W)$ with throughput-aware dampening. At low throughput, Bayesian shrinkage reduces the update weight (fewer completions produce noisier $W$, so the prior is trusted more). The z-test on $\text{d}\bar{m}$ (change in filtered level) detects sustained upward trends. All parameters derive from `zScoreThreshold`.
+**Why this is not just $L/\hat\mu$.** A naïve estimate $W \approx \hat{L} / \hat\mu$ multiplies two EWMAs of different signals — their estimation errors compound. Operational LL produces a single window-level sample with one source of variance ($r_k$ is an integer count, $\int N$ is exact), avoiding compounded errors.
 
-Instantaneous log-latency per window:
+**Robustness to the cap.** When $W \gg W_{\text{controlWindow}}$ (long tasks span multiple windows), most windows have $r_k = 0$ and are skipped via the gate `r_k > 0 ∧ inFlightMs > 0`. When a completion eventually arrives, `inFlightMs` has accumulated the integral *across all those skipped windows*, so $W_k = \text{(multi-window integral)} / r_k$ is still the correct sample-average residence by the same identity. The estimator handles arbitrary $W/W_{\text{cw}}$ ratios without modification.
 
-$$m_k = \log(W_k) = \log\left(\frac{\int N(t)\,dt}{r_k}\right)$$
+#### 4.2.2 Stage 2 — Log Transform
 
-Level EWMA update (shrinkage-dampened):
+$$m_k = \log W_k$$
 
-$$\alpha_{\text{level}} = \alpha_k \times \text{shrinkage}(r_k), \quad \bar{m}_k = (1 - \alpha_{\text{level}}) \bar{m}_{k-1} + \alpha_{\text{level}} \, m_k$$
+**Why log-space.** Latency degradations are typically multiplicative (a slow downstream makes everything 2× slower), and outlier spikes inflate $W$ by orders of magnitude. In linear space, a single outlier dominates an EWMA and corrupts variance estimates for many windows. The log transform converts multiplicative drift to additive drift and compresses spikes — a 10× outlier becomes $+\log 10 \approx 2.3$ instead of an arbitrary multiplier.
 
-where $\text{shrinkage}(r_k) = r_k / (r_k + Z^2)$ dampens the update for low-throughput windows.
+#### 4.2.3 Stage 3 — Level EWMA on $\log W$
 
-**Derivative of filtered state (trend signal):**
+The level estimator $\bar{m}_k$ is a Bayesian-shrinkage-dampened EWMA:
 
-The dt-normalized rate of change in the EWMA-filtered level:
+$$\alpha_{\text{level}} = \alpha_k \cdot s_k, \quad s_k = \frac{r_k}{r_k + Z^2}, \quad \bar{m}_k = (1 - \alpha_{\text{level}})\, \bar{m}_{k-1} + \alpha_{\text{level}}\, m_k$$
 
-$$v_k = \frac{\bar{m}_k - \bar{m}_{k-1}}{\Delta t_k}, \quad \Delta t_k = \frac{t_k - t_{k-1}}{W}$$
+**Why shrinkage applies here.** This is *parameter estimation* — we want a point estimate of $\log W$ at the current operating point. Bayesian shrinkage is the conjugate-prior treatment: $s_k = r_k/(r_k + Z^2)$ weights the new observation worth $r_k$ samples against a prior worth $Z^2 = 4$ pseudo-observations. At low throughput (sparse completions), the prior dominates; at high throughput, the observation dominates. Same mathematics as the Wilson score interval and the Gamma–Poisson posterior mean.
 
-where $W$ is `controlWindow`. Dividing by $\Delta t$ prevents idle gaps from producing a large trend signal — a one-time level shift spread over many windows is not a sustained per-window trend.
+**Where this matters.** Without shrinkage, a single-completion window after a stall produces a wildly inflated $m_k$ (because $W_k = \text{multi-window integral}/1$). The shrinkage $s_k = 1/(1+4) = 0.2$ caps the level update at 20% of full strength on that window — dampened to a fraction of one full EWMA step.
 
-**EWMA of trend (shrinkage-dampened input):**
+#### 4.2.4 Stage 4 — dLogW (filtered derivative)
 
-$$\hat{v}_k = (1 - \alpha_k) \hat{v}_{k-1} + \alpha_k \bigl(v_k \times s_k\bigr)$$
+The trend signal is the dt-normalized rate of change in the filtered level:
 
-where $\alpha_k = 1 - e^{-\Delta t_k / H}$ is the time-weighted EWMA alpha, and $s_k = r_k / (r_k + Z^2)$ is the per-window Bayesian shrinkage factor. The derivative $v_k$ is multiplied by the shrinkage factor before entering the trend EWMA. This intentionally breaks the shrinkage cancellation that holds for the level EWMA: at low throughput, the trend signal is dampened while the SE remains honest, making the z-test conservative (see §4.3.1 for the proof).
+$$v_k = \frac{\bar{m}_k - \bar{m}_{k-1}}{\widetilde{\Delta t}_k}, \quad \widetilde{\Delta t}_k = \frac{\Delta t_k}{W_{\text{cw}}}$$
 
-After idle ($\Delta t \gg 1$), $\alpha \to 1$ and the EWMA resets to the current (shrinkage-dampened) observation.
+where $W_{\text{cw}}$ is `controlWindow` and $\widetilde{\Delta t}_k$ is the window-normalized elapsed time (dimensionless, $\approx 1$ per on-time window).
 
-**Second moment of trend (variance estimator under $H_0$):**
+**Why dt-normalize.** A one-time level shift accumulated over $N$ idle windows is *not* a sustained per-window trend. Dividing by $\widetilde{\Delta t}$ converts the level diff to a per-window rate — the same "trend per window" semantics regardless of how long the elapsed gap was.
 
-$$S_k^{(2)} = (1 - \alpha_k) S_{k-1}^{(2)} + \alpha_k v_k^2$$
+**Why the filtered level rather than raw $m_k$.** Using $v_k = m_k - m_{k-1}$ would inherit the full per-window noise of $m_k$, which is large at sparse completions. Using $v_k = \Delta \bar{m}_k$ inherits only the *EWMA-smoothed* fluctuations, which scale with $\sqrt{W^{(2)}}$ — the right amount of noise dampening for the test statistic.
 
-Note: $S^{(2)}$ uses the **raw** derivative $v_k$, not the shrinkage-dampened value $v_k \times s_k$. This asymmetry is critical — it ensures $S^{(2)}$ honestly tracks the noise level of the derivative signal regardless of throughput, while the trend EWMA $\hat{v}$ is skeptical of low-throughput observations.
+#### 4.2.5 Stage 5 — Trend EWMA (asymmetric shrinkage)
 
-This tracks $E[v^2]$, the second moment of the trend signal. Under the null hypothesis $H_0: E[v] = 0$ (latency is stable), the second moment equals the variance: $E[v^2] = \text{Var}(v) = \sigma^2$. Under $H_1$ ($E[v] = \mu > 0$), $E[S^{(2)}] = \sigma^2 + \mu^2$, which keeps the denominator elevated — sufficient for binary detection.
+$$\hat{v}_k = (1 - \alpha_k)\, \hat{v}_{k-1} + \alpha_k\, (v_k \cdot s_k)$$
 
-**Effective sample size ($W^{(2)}$ recursion):**
+The derivative $v_k$ is multiplied by the per-window shrinkage $s_k = r_k/(r_k + Z^2)$ before entering the trend EWMA. The MSSD/2 noise estimator (§4.2.6) sees the *unshrunk* $v_k$. This is **asymmetric**: shrinkage on the numerator, raw signal on the denominator.
 
-With time-varying $\alpha$ (due to irregular window timing and idle gaps), the standard EWMA variance $\alpha/(2-\alpha)$ does not apply. Instead, the sum of squared weights is tracked exactly:
+**Why asymmetric.** Under $H_0$ ($E[v_k] = 0$), shrinkage on the numerator does not change FPR — multiplying zero-mean noise by $s_k \in [0,1]$ stays zero-mean. Under $H_1$ ($E[v_k] = \mu > 0$), low-throughput windows have small $s_k$, so the trend numerator $E[\hat{v}] = \mu \cdot E[s]$ is dampened — the test is *more conservative* at low throughput, requiring stronger evidence per window before firing. Detection delay grows at low throughput, FPR is preserved.
 
-$$W_k^{(2)} = (1-\alpha_k)^2 W_{k-1}^{(2)} + \alpha_k^2$$
+**Why MSSD/2 is unshrunk.** δ² is a noise-floor estimator, and we want it calibrated to actual noise (so SE is right). Shrinking δ² inputs would underestimate noise at low throughput, producing too-easy fires.
 
-This generalizes $\alpha/(2-\alpha)$ to time-varying $\alpha$. After idle ($\alpha \to 1$), $W^{(2)} \approx 1$ (one effective sample, wide SE). After many normal windows, $W^{(2)} \to \alpha/(2-\alpha)$ (standard result).
+#### 4.2.6 Stage 6 — MSSD/2 Noise Estimator (von Neumann's δ²)
 
-**Why log-space?** Error spikes inflate $W$ by orders of magnitude. In linear space, a single outlier contaminates the EWMA and the variance tracker. Log-space compresses these spikes, making the EWMA robust to occasional extreme observations.
+$$\delta^2_k = (1 - \alpha_k)\, \delta^2_{k-1} + \alpha_k \cdot \frac{(v_k - v_{k-1})^2}{2}$$
+
+This is the **mean squared successive difference**, halved — also known as von Neumann's δ². It estimates $\sigma_v^2$ via lag-1 squared differences.
+
+**Why δ² (and why halved).** For a stationary sequence with finite variance and small autocorrelation, $E[(v_k - v_{k-1})^2] = 2\,\text{Var}(v) - 2\,\text{Cov}(v_k, v_{k-1}) = 2\sigma_v^2(1 - \rho_1)$. Dividing by $2$ gives an unbiased estimator of $\sigma_v^2$ when $\rho_1 = 0$, and remains close to unbiased for moderate autocorrelation. The factor $1/2$ is what makes it called "δ²" rather than "MSSD".
+
+**Why it's drift-invariant.** A pure drift component $v_k = \mu + \epsilon_k$ has differences $v_k - v_{k-1} = \epsilon_k - \epsilon_{k-1}$ — the drift $\mu$ cancels exactly. So under $H_1$, δ² still tracks the noise of $\epsilon_k$, not the drift level. This is the **key property** that distinguishes δ² from any centered-variance estimator like Welford's: drift does not inflate the noise floor under $H_1$, so the test statistic $\hat{v}/\text{SE}$ grows linearly with $\mu$ — there is no saturation ceiling. Empirically validated against Welford-B and second-moment alternatives in v1.2.0 benchmarking; see `.changeset/statistical-rigor.md` for the comparative bench results.
+
+**Autocorrelation correction.** Since $v_k$ is the first difference of an AR(1)-like EWMA, it carries known lag-1 negative autocorrelation $\rho_1 = -\alpha/2$. This causes the lag-1 squared difference to *overestimate* $\sigma_v^2$ by factor $(1 + \alpha/2)$:
+
+$$E[\delta^2] = \sigma_v^2 \cdot (1 - \rho_1) = \sigma_v^2 \cdot (1 + \alpha/2)$$
+
+The unbiased $\sigma^2$ estimator divides out this factor:
+
+$$\hat\sigma_v^2 = \frac{\delta^2}{1 + \alpha/2}$$
+
+Under constant $\alpha$ this is exact; under smooth time-varying $\alpha$ it is a first-order approximation, accurate at steady state.
+
+#### 4.2.7 Stage 7 — Effective Sample Size ($W^{(2)}$ recursion)
+
+For an EWMA with time-varying weights $w_j$, the standard $\alpha/(2-\alpha)$ formula does not apply. Instead, $W^{(2)} = \sum_j w_j^2$ is tracked exactly:
+
+$$W_k^{(2)} = (1 - \alpha_k)^2\, W_{k-1}^{(2)} + \alpha_k^2$$
+
+**Properties.**
+- After the *first* observation, $W^{(2)} = 1$ (one weighted sample, full uncertainty).
+- After idle ($\alpha \to 1$), $W^{(2)} \to 1$ — the EWMA effectively resets, and the system reports only one effective sample, widening SE.
+- At steady state under constant $\alpha$, $W^{(2)} \to \alpha/(2-\alpha) \approx 0.055$ at $\alpha = 0.105$.
+
+**Why this is the right ESS.** $\text{Var}(\hat{v}) = \sigma^2 \cdot W^{(2)}$ for an EWMA of independent $v_k$. The Satterthwaite ESS — the equivalent number of equally-weighted observations — is $1/W^{(2)}$, and df $= 1/W^{(2)} - 1$ (Welch–Satterthwaite, equal-variance case). This is what the Student-t critical value uses in §4.3.1.
+
+#### 4.2.8 Other EWMA Updates (rates and counts)
+
+The remaining EWMAs are not part of the trend-test pipeline; they support observability and other regulator branches. All use the time-weighted $\alpha_k$ from §4.1, with shrinkage applied for parameter-estimation signals:
+
+**Rate signals** (Bayesian shrinkage on $\alpha$ scaled by per-window count $n_k = r_k$):
+
+$$\alpha_c = \alpha_k \cdot \frac{r_k}{r_k + Z^2}$$
+
+$$\hat\mu_k = (1 - \alpha_c) \hat\mu_{k-1} + \alpha_c r_k \quad (\text{completion rate})$$
+
+$$\hat\delta_k = (1 - \alpha_c) \hat\delta_{k-1} + \alpha_c d_k \quad (\text{drop rate})$$
+
+$$\hat{E}_k = (1 - \alpha_c) \hat{E}_{k-1} + \alpha_c \tfrac{e_k}{r_k} \quad (\text{error ratio})$$
+
+**Counts** (raw $\alpha_k$ — admissions are not rate-shrunk because they are exact admission events):
+
+$$\hat{a}_k = (1 - \alpha_k) \hat{a}_{k-1} + \alpha_k a_k \quad (\text{admission rate})$$
+
+$$\hat{L}_k = (1 - \alpha_k) \hat{L}_{k-1} + \alpha_k F_k \quad (\text{in-flight count})$$
+
+**Per-lane error rate** (time-weighted, with Bayesian shrinkage on the lane's cumulative completion count $c_\ell$):
+
+$$\alpha_\ell^{\text{time}} = 1 - \exp\left(\frac{-\max(1, t - t_\ell)}{H \cdot W}\right), \quad \alpha_\ell = \alpha_\ell^{\text{time}} \cdot \frac{c_\ell}{c_\ell + Z^2}$$
+
+$$\hat{p}_\ell \leftarrow (1 - \alpha_\ell) \hat{p}_\ell + \alpha_\ell\,[e]$$
+
+where $[e] = 1$ if the task errored. The $\max(1, \cdot)$ floor ensures rapid same-tick completions still contribute weight. The shrinkage $c_\ell/(c_\ell + Z^2)$ dampens noisy early estimates (1 completion: 20%, 4 completions: 50%, 10 completions: 71%).
 
 **Error rate (error ratio — errors/completions):**
 
@@ -346,62 +408,97 @@ where $[e] = 1$ if the task errored, $0$ otherwise, and $c_\ell$ is the lane's c
 
 ### 4.3 Detection Thresholds
 
-#### 4.3.1 Latency Detection (Null Hypothesis z-Test)
+#### 4.3.1 Latency Detection (Student-t Hypothesis Test)
 
-**Null hypothesis $H_0$:** latency is stable. The true $\log(W)$ level is constant. Therefore $E[v] = 0$ — the expected rate of change is zero.
+**Null hypothesis $H_0$:** latency is stable. $E[v] = 0$.
 
 **Alternative hypothesis $H_1$:** latency is degrading. $E[v] > 0$.
 
-Under $H_0$, the trend signal $v_k$ is zero-mean noise with variance $\sigma^2$. The shrinkage-dampened EWMA produces approximately i.i.d. trend samples $N(0, \sigma^2)$. The EWMA of trend is a weighted average with weights $w_j$, so:
+**Philosophy: shrinkage for estimation, Student-t for the test.** Bayesian shrinkage and Student-t address distinct sources of small-sample uncertainty:
 
-$$\text{Var}(\hat{v}) = \sigma^2 \sum_j w_j^2 = \sigma^2 \cdot W^{(2)}$$
+- **Shrinkage** (`n/(n + n_0)`) attenuates a parameter estimate toward a prior — the correct Bayesian treatment under a conjugate prior. Used for every *estimation* signal in the system: level, rates, proportions, lane error rates.
+- **Student-t** (critical value grows as df decreases) is the exact sampling distribution of a z-like statistic when $\sigma^2$ is replaced by an estimate $\hat\sigma^2$. Used for the one *hypothesis test* in the system.
 
-The standard error of the EWMA mean is:
+They solve different problems and are complementary, not substitutes. See §4.3.1.2 for the full audit.
 
-$$\text{SE} = \sqrt{S^{(2)} \cdot W^{(2)}}$$
+##### Test statistic and SE formula
 
-where $S^{(2)} = \text{EWMA}(v^2)$ estimates $\sigma^2$ under $H_0$ (since $E[v^2] = \text{Var}(v)$ when $E[v] = 0$), and $W^{(2)}$ is the effective sample size correction. The z-statistic:
+The test statistic is
 
-$$z = \frac{\hat{v}}{\text{SE}}$$
+$$t = \frac{\hat{v}}{\text{SE}}, \quad \text{SE}^2 = \hat\sigma_v^2 \cdot W^{(2)} \cdot \frac{1 + W^{(2)}}{2}, \quad \hat\sigma_v^2 = \frac{\delta^2}{1 + \alpha/2}$$
 
-**Latency is degrading** when $z > \sigma_D$ (one-sided test). At $\sigma_D = 2$: false positive rate $\leq 2.3\%$ per time constant evaluation (see below).
+This expression has four components, each rigorously derived. Under $H_0$ at steady state, $E[\text{SE}^2] = \text{Var}(\hat{v})$ exactly — the SE is an unbiased estimator of the trend EWMA's variance.
 
-**Two layers of shrinkage, one cancellation.** Bayesian shrinkage enters at two points:
+**(a) δ² noise estimator with autocorrelation bias.** $v_k$ is the first difference of an AR(1)-like EWMA, which carries known negative autocorrelation $\rho_1 = -\alpha/2$. Under $H_0$,
 
-1. **Level shrinkage** (on the EWMA alpha): dampens $\bar{m}_k$ updates at low throughput, producing smaller derivatives $v_k$. This cancels in the z-score because both $\hat{v}$ and $S^{(2)}$ see the same dampened $v_k$.
+$$E[\delta^2] = E\left[\frac{(v_k - v_{k-1})^2}{2}\right] = \sigma_v^2 (1 - \rho_1) = \sigma_v^2 \cdot \left(1 + \frac{\alpha}{2}\right)$$
 
-2. **Trend shrinkage** (on the derivative value): the trend EWMA input is $v_k \times s_k$, but $S^{(2)}$ uses the raw $v_k^2$. This does **not** cancel — it makes the z-test conservative at low throughput.
+So δ² overestimates $\sigma_v^2$ by factor $(1 + \alpha/2)$. Dividing yields the unbiased σ² estimator $\hat\sigma_v^2 = \delta^2/(1+\alpha/2)$.
 
-Under $H_0$ with approximately constant shrinkage $s$:
+**(b) Variance of an EWMA on autocorrelated $v$.** For an EWMA of $v_k$ with weights $w_j$, the standard formula $\text{Var}(\hat{v}) = \sigma_v^2 \sum_j w_j^2$ assumes independence. Under our actual lag-h autocorrelation $\rho_h = -\alpha(1-\alpha)^{h-1}/2$ (extending $\rho_1$ to higher lags), cross terms reduce the variance:
 
-$$\hat{v} = \text{EWMA}(s \cdot v_k), \quad S^{(2)} = \text{EWMA}(v_k^2)$$
+$$\text{Var}(\hat{v}) = \sigma_v^2 \left[\sum_j w_j^2 + 2\sum_{h \geq 1} \rho_h \sum_j w_j w_{j+h}\right]$$
 
-$$\text{Var}(\hat{v}) = s^2 \cdot \sigma^2 \cdot W^{(2)}, \quad \text{SE}^2 = \sigma^2 \cdot W^{(2)}$$
+Working through with $\sum_j w_j w_{j+h} = \alpha(1-\alpha)^h/(2-\alpha)$ at steady state and the closed-form $\rho_h$ above:
 
-$$\text{Var}(z) = \frac{\text{Var}(\hat{v})}{\text{SE}^2} = s^2$$
+$$\text{Var}(\hat{v}) = \sigma_v^2 \cdot W^{(2)} \cdot \frac{1 + W^{(2)}}{2}$$
 
-Therefore $z \sim N(0, s^2)$ under $H_0$, where $s = r_k/(r_k + Z^2) \leq 1$. The false positive rate is:
+The $(1+W^{(2)})/2$ factor is the **autocorrelation variance-reduction** — negative autocorrelation suppresses the EWMA's variance below the i.i.d. baseline. At steady state $\alpha \approx 0.105$ (so $W^{(2)} \approx 0.055$), the factor is $\approx 0.527$ — `Var(ĥ)` is about half what it would be under independence.
 
-$$P(z > \sigma_D \mid H_0) = \Phi(-\sigma_D / s)$$
+**(c) Tracking $W^{(2)}$ exactly.** $W_k^{(2)} = (1-\alpha_k)^2 W_{k-1}^{(2)} + \alpha_k^2$ generalizes the constant-$\alpha$ formula $\alpha/(2-\alpha)$ to time-varying $\alpha$. The same tracked $W^{(2)}$ appears twice in the SE formula: once as $W^{(2)}$ (sum-of-squared-weights) and once inside $(1+W^{(2)})/2$ (autocorrelation factor). Both are exact in tracked state under constant $\alpha$, and degenerate gracefully under varying $\alpha$ — when $W^{(2)} \to 1$ (one effective sample, post-idle), the autocorrelation factor approaches 1, so SE² → σ̂² (no autocorrelation correction when there's effectively one sample).
 
-| Completions/window | $s$ | FPR |
-|---|---|---|
-| 2 | 0.33 | $\Phi(-6.1) \approx 0$ |
-| 5 | 0.56 | $\Phi(-3.6) = 0.02\%$ |
-| 10 | 0.71 | $\Phi(-2.8) = 0.26\%$ |
-| 20 | 0.83 | $\Phi(-2.4) = 0.82\%$ |
-| 50 | 0.93 | $\Phi(-2.15) = 1.6\%$ |
-| $\infty$ | 1.0 | $\Phi(-2.0) = 2.3\%$ |
+**(d) Drift invariance.** A pure additive drift $v_k = \mu + \epsilon_k$ contributes zero to lag-1 differences ($\mu - \mu = 0$), so $\delta^2$ tracks the noise of $\epsilon_k$ only — independent of $\mu$. Under $H_1$ ($\mu > 0$), $\delta^2$ does **not** inflate, SE remains calibrated, and the test statistic $\hat{v}/\text{SE}$ grows linearly with $\mu$. There is no saturation ceiling on the z-score under severe degradation.
 
-The nominal FPR (2.3%) is an upper bound, achieved at infinite throughput.
+This property distinguishes von Neumann's δ² from any centered-variance estimator (Welford, $S^{(2)}$, etc.), all of which absorb drift into the noise estimate and produce saturating test statistics. Empirically validated in v1.2.0 against Welford-B and the raw second moment: those alternatives failed to fire on Full Overload and Error-Based Capacity Overload scenarios where δ² fired correctly. See `.changeset/statistical-rigor.md` for the comparative bench results.
 
-**Detection power under $H_1$.** Under a sustained trend $\mu$, the level EWMA lag produces $E[v] = \mu$ regardless of shrinkage (level shrinkage cancels in the derivative). The trend EWMA converges to $E[\hat{v}] = s \cdot \mu$. Detection requires $z > \sigma_D$, i.e.:
+**Asymmetric shrinkage between numerator and denominator.** The trend numerator $\hat{v}$ uses shrunk inputs $v_k \cdot s_k$ (§4.2.5); δ² uses raw $v_k$ (§4.2.6). Under $H_0$ this preserves FPR — $E[v \cdot s] = 0$ regardless of $s$. Under $H_1$ this dampens detection at low throughput by factor $E[s]$, providing per-window throughput-aware conservatism that complements the t-distribution's df-based gating.
 
-$$s \cdot z_0 > \sigma_D \quad \Longleftrightarrow \quad r_k > Z^2 \cdot \frac{\sigma_D}{z_0 - \sigma_D}$$
+**Putting it together.** Combining (a), (b), (c), (d):
 
-where $z_0$ is the z-score without trend shrinkage. A signal producing $z_0 = 3$ requires $\geq 8$ completions/window to detect. This is the intended tradeoff: more skepticism at low throughput, where $W$ estimates are noisier.
+$$\text{SE}^2 = \hat\sigma_v^2 \cdot W^{(2)} \cdot \frac{1+W^{(2)}}{2} = \frac{\delta^2 \cdot W^{(2)} \cdot (1 + W^{(2)})}{2 \cdot (1 + \alpha/2)}$$
 
-**Idle and sparse traffic handling.** Two mechanisms cooperate: (1) The time-weighted alpha $\alpha_k = 1 - e^{-\Delta t / (H \cdot W)}$ approaches 1 after long idle gaps, so the first observation after idle resets the EWMA to the current value. (2) The sum of squared weights $W^{(2)}$ correctly tracks the effective sample size under time-varying $\alpha$. After idle or irregular gaps, $W^{(2)}$ is large (few effective samples, wide SE), and gradually returns to $\alpha/(2-\alpha)$ as normal observations accumulate. (3) Trend shrinkage dampens the signal proportionally to throughput, preventing stale low-throughput observations from producing false positives during drain periods.
+Under constant $\alpha$ this is exact under both $H_0$ and $H_1$. Under smooth time-varying $\alpha$ it is a first-order approximation, accurate at steady state.
+
+##### Degrees of freedom and Student-t critical value
+
+Because $\sigma_v^2$ is estimated (not known), the studentized ratio $\hat{v}/\text{SE}$ follows a Student-t distribution rather than a standard normal:
+
+$$t = \frac{\hat{v}}{\text{SE}} \sim t_\nu, \quad \nu = \frac{1}{W^{(2)}} - 1$$
+
+The degrees-of-freedom expression $\nu = 1/W^{(2)} - 1$ comes from Welch–Satterthwaite applied to the EWMA:
+
+- $1/W^{(2)}$ is the **effective sample size** — the equivalent number of equally-weighted samples that would produce the same $\text{Var}(\hat{v})$.
+- Subtracting 1 reflects the loss of one degree of freedom from estimating the mean (here, the trend $\hat{v}$ is the estimator of $E[v]$). Standard practice for any sample-variance Student-t setup.
+
+At steady state under $\alpha \approx 0.105$: $W^{(2)} \approx 0.055$, so $\nu \approx 17$. After idle: $W^{(2)} \approx 1$, $\nu \approx 0$ — the test is gated off (see Theorem 9).
+
+**Critical value via Cornish-Fisher with conservative truncation bound.** Computing the exact Student-t quantile $t_{1-\Phi(-\sigma_D),\,\nu}$ requires the inverse incomplete beta function, which is expensive and has tricky edge cases at small $\nu$. concurrex uses a 4th-order Cornish-Fisher inverse-t series following Hill, G. W. "Algorithm 396: Student's t-quantiles." *Communications of the ACM* 13.10 (1970): 619–620, plus an asymptotic-series truncation bound:
+
+$$t_{1-p,\,\nu} \approx z_p + \frac{g_1}{\nu} + \frac{g_2}{\nu^2} + \frac{g_3}{\nu^3} + \frac{g_4}{\nu^4} \;+\; 2 \left|\frac{g_4}{\nu^4}\right|$$
+
+where $z_p = \Phi^{-1}(1-p) = \sigma_D$ for our test, and $g_1, g_2, g_3, g_4$ are polynomials in $z_p$:
+
+$$g_1 = \frac{z(z^2 + 1)}{4}, \quad g_2 = \frac{z(5z^4 + 16z^2 + 3)}{96}, \quad \ldots$$
+
+The truncation bound $2|g_4/\nu^4|$ is a one-sided upper bound on the geometric-tail residual: at $\nu \geq 5$, the Cornish-Fisher coefficients decay with ratio $\leq 1/2$ between successive terms, so the truncation error is bounded by twice the last included term. At $\nu < 5$ the geometric-decay assumption is heuristic, but the bound's $1/\nu^4$ growth is fast enough to remain empirically conservative.
+
+**Net effect.** The implementation's `tScore(z, df)` always returns an upper bound on the true $t$-quantile. As $\nu \to \infty$, the bound converges to $z = \sigma_D$ and FPR converges to $\Phi(-\sigma_D)$. As $\nu \to 0$, the bound diverges, naturally gating the test off — no separate df-clamp or warm-up guard is needed (Theorem 9).
+
+**Test rule.** Latency is degrading when
+
+$$\hat{v} > \text{tScore}(\sigma_D,\, \nu) \cdot \text{SE}$$
+
+At $\sigma_D = 2$, nominal FPR $\leq \Phi(-2) \approx 2.3\%$ at all $\nu$ (Theorem 7), with empirical FPR closer to $\sim 0\%$ in production benchmarks due to the conservative truncation bound at finite $\nu$.
+
+##### Idle and sparse traffic handling
+
+Three mechanisms cooperate to gate the test off when evidence is insufficient — all *implicit* through the math, no special-case code:
+
+1. **Time-weighted alpha** $\alpha_k = 1 - e^{-\Delta t / (H \cdot W)}$ approaches 1 after long idle gaps, so the first observation after idle dominates the EWMA — but $W^{(2)}$ resets to ≈ 1 simultaneously.
+2. **$W^{(2)}$ correctly tracks ESS** under time-varying $\alpha$. After idle, $W^{(2)} \approx 1$ (ESS = 1), so $\nu \approx 0$.
+3. **Student-t critical value diverges** at $\nu \to 0$ via the truncation bound's $1/\nu^4$ growth. The test cannot fire until $\nu$ has decayed back to a usable range.
+
+The handoff between these three mechanisms is continuous — there are no thresholds, no "warm-up window" counters, no df-clamps. The math gates the test naturally.
 
 ##### 4.3.1.1 Per-lane error rate: Bayesian shrinkage
 
@@ -409,7 +506,22 @@ Per-lane error rate uses Bayesian shrinkage (same as pool-wide signals), scaled 
 
 $$\alpha_\ell = \alpha_\ell^{\text{time}} \times \frac{c_\ell}{c_\ell + Z^2}$$
 
-where $c_\ell$ is the lane's cumulative completion count. At 1 completion: 20% weight. At 4 completions: 50% weight. At 10 completions: 71% weight. At 100 completions: 96% weight. This prevents noisy early estimates from causing aggressive per-lane shedding, using the same Bayesian framework as all other signals in the system.
+where $c_\ell$ is the lane's cumulative completion count. At 1 completion: 20% weight. At 4 completions: 50% weight. At 10 completions: 71% weight. At 100 completions: 96% weight. This prevents noisy early estimates from causing aggressive per-lane shedding, using the same Bayesian framework as all other estimation signals.
+
+##### 4.3.1.2 Shrinkage vs Student-t: audit of concurrex signals
+
+Each signal is classified by whether it's an *estimation* problem (shrinkage) or a *hypothesis test* (Student-t):
+
+| Signal | Role | Mechanism |
+|---|---|---|
+| $\bar{m}$ (logWBar) | Estimate mean of $\log(W)$ | Shrinkage on level EWMA alpha |
+| $\hat{v}$ (trend numerator) | Estimation input to the test | **Asymmetric** shrinkage on input ($v_k \cdot s_k$); δ² sees raw $v_k$ |
+| Completion / drop rate EWMAs | Estimate rate parameters | Shrinkage (Gamma-Poisson conjugate) |
+| Pool-wide and per-lane error rate | Estimate proportion | Shrinkage (Beta-Binomial / Wilson) |
+| Early-shed probability | Confidence-weighted shed rate | Shrinkage (credibility scaling) |
+| **Trend test (is $\mu_v > 0$?)** | **Hypothesis test** | **Student-t critical value with truncation bound** |
+
+Only one signal in the system is a hypothesis test, and Student-t applies there alone. Bayesian shrinkage applies wherever a *parameter* is estimated — including the trend numerator (asymmetrically: numerator dampened, denominator δ² unshrunk).
 
 #### 4.3.2 Probabilistic Error Decrease
 
@@ -421,28 +533,69 @@ Pool-wide error detection (error spread significance, dErrorRate z-test) has bee
 
 **Why this replaces pool-wide error detection.** The previous design used error spread (proportion of lanes with errors) and dErrorRate (trend in error ratio) to detect systemic errors. This required tracking `laneKeysCompletedThisWindow`, `laneKeysErroredThisWindow`, `errorSpreadEwma`, `activeLanesEwma`, `dErrorRateEwma`, and `dErrorRateVariance`. The new design achieves the same goal — decreasing concurrency for systemic errors while ignoring localized ones — with zero additional state. Per-lane shedding naturally filters localized errors, so the aggregate `errorRateEwma` is already a reliable systemic signal.
 
-**Theorem 7 (Conservative false positive rate).** *Under $H_0$ with per-window shrinkage $s_k = r_k/(r_k + Z^2)$, assuming approximately constant $s$ within the EWMA window:*
+**Theorem 7 (Upper-bounded false positive rate).** *Under the following assumptions:*
+- *constant $\alpha$ at steady state (or smooth time-varying $\alpha$ as a first-order approximation),*
+- *CLT normality of $v_k$ (excellent at moderate throughput; mild deviation at very low throughput is partially absorbed by the Student-t's heavier tails),*
+- *Satterthwaite df = $1/W^{(2)} - 1$ (standard EWMA approximation; exact for equal-weighted averages),*
+- *Cornish-Fisher 4th-order series with truncation bound $2|g_4/\nu^4|$ for the t-quantile (rigorous at $\nu \geq 5$, heuristically conservative at smaller $\nu$ via $1/\nu^4$ growth),*
 
-$$z \sim N(0, s^2), \quad P(\text{false positive}) = \Phi(-\sigma_D / s) \leq \Phi(-\sigma_D) \approx 0.0228$$
+*the Student-t test using $\text{SE}^2 = \hat\sigma_v^2 \cdot W^{(2)} \cdot (1+W^{(2)})/2$ with $\hat\sigma_v^2 = \delta^2/(1+\alpha/2)$ and critical value $\text{tScore}(\sigma_D, \nu)$ satisfies*
 
-*The FPR is bounded above by the nominal rate. At high throughput ($s \to 1$), the bound is tight. At low throughput, the test is conservative: with 2 completions/window ($s = 0.33$), $P(\text{FP}) = \Phi(-6.1) \approx 0$.*
+$$P(\text{false positive} \mid H_0) \leq \Phi(-\sigma_D)$$
 
-*Proof.* Level shrinkage dampens $v_k$ by factor $s$ (via $\alpha_{\text{eff}} = \alpha \cdot s$). Trend shrinkage applies an additional factor $s$ to the EWMA input. The second moment $S^{(2)} = \text{EWMA}(v_k^2)$ uses unshrunk $v_k$. Therefore: $\text{Var}(\hat{v}) = s^2 \cdot \text{Var}(v) \cdot W^{(2)}$, $\text{SE}^2 = \text{Var}(v) \cdot W^{(2)}$, and $\text{Var}(z) = s^2$. Since $s \leq 1$, $P(z > \sigma_D) \leq P(N(0,1) > \sigma_D)$. $\square$
+*at every $\nu$. At $\sigma_D = 2$: FPR $\leq 0.0228$. Equality is achieved in the limit $\nu \to \infty$.*
 
-**Theorem 8 (Detection under $H_1$: the test cannot miss severe degradation at sufficient throughput).** *Under $H_1$ ($E[v] = \mu > 0$), the trend EWMA converges to $E[\hat{v}] = s \cdot \mu$. Detection requires:*
+*Proof.* Under $H_0$, $E[v] = 0$ and $v_k$ is zero-mean noise. The first difference $v_k - v_{k-1}$ has variance $2\sigma_v^2(1 - \rho_1)$ where $\rho_1 = -\alpha/2$ (from first-differencing an AR(1)-like EWMA). Therefore
 
-$$s \cdot z_0 > \sigma_D \quad \Longleftrightarrow \quad r_k > Z^2 \cdot \frac{\sigma_D}{z_0 - \sigma_D}$$
+$$E[\delta^2] = E\left[\frac{(v_k - v_{k-1})^2}{2}\right] = \sigma_v^2(1 + \alpha/2)$$
 
-*where $z_0 = \mu / \sqrt{(\sigma^2 + \mu^2) \cdot W^{(2)}}$ is the z-score without trend shrinkage. Three regimes at high throughput ($s \approx 1$):*
-- *Small signal ($\mu < 0.53\sigma$): $z < \sigma_D$ — not detected. The signal is below the noise floor; no test could reliably detect it.*
-- *Moderate signal ($\mu \approx \sigma$): $z \approx 3$ — detected. The trend exceeds the noise level.*
-- *Severe degradation ($\mu \gg \sigma$): $z \to s \cdot \sqrt{(2-\alpha)/\alpha}$ — always detected at sufficient throughput. The z-score saturates because $S^{(2)}$ includes $\mu^2$, but the saturation value exceeds $\sigma_D$ when $s > \sigma_D / \sqrt{(2-\alpha)/\alpha} \approx 0.47$, i.e., $r_k \geq 4$ completions/window.*
+*so $\hat\sigma_v^2 = \delta^2/(1+\alpha/2)$ is unbiased for $\sigma_v^2$. For the EWMA $\hat{v}$ of an autocorrelated process with $\rho_h = -\alpha(1-\alpha)^{h-1}/2$, the variance is*
 
-*The saturation means the z-score indicates presence of degradation (binary), not severity. Severity is encoded through persistence: sustained degradation keeps the z-test firing across time constant evaluations, incrementing the regulation depth and producing progressively larger concurrency decreases.*
+$$\text{Var}(\hat{v}) = \sigma_v^2 \cdot W^{(2)} \cdot \frac{1 + W^{(2)}}{2}$$
 
-**Theorem 9 (Warm-up guard prevents early false positives).** *No concurrency adjustment occurs for the first $H$ windows after pool creation.*
+*(autocorrelation reduces the variance below the i.i.d. baseline by factor $(1+W^{(2)})/2$). Therefore*
 
-*Proof.* The time constant evaluation requires $n_w \geq H$. $n_w$ starts at 0 and increments once per window evaluation. Therefore at least $H$ windows ($\geq H \cdot W$ ms) must pass before the first evaluation. During this period, the trend EWMA and second moment accumulate data, providing a reliable baseline. $\square$
+$$\text{SE}^2 = \hat\sigma_v^2 \cdot W^{(2)} \cdot \frac{1+W^{(2)}}{2} = \frac{\delta^2 \cdot W^{(2)} \cdot (1+W^{(2)})}{2 \cdot (1 + \alpha/2)}$$
+
+*so $E[\text{SE}^2] = \text{Var}(\hat{v})$ exactly under constant $\alpha$. By CLT, $\hat{v}$ is approximately normal; since $\sigma_v^2$ is replaced by an estimate, the studentized ratio $\hat{v}/\text{SE}$ is approximately $t_\nu$ with $\nu = 1/W^{(2)} - 1$ (Satterthwaite ESS − 1). The implementation's `tScore` returns $t_{1-\Phi(-\sigma_D),\,\nu}$ plus an asymptotic-series truncation bound that is zero in the $\nu \to \infty$ limit and strictly positive otherwise. Thresholding at this upper bound yields $P(\text{FP} \mid H_0) \leq \Phi(-\sigma_D)$, with equality only in the $\nu \to \infty$ limit. $\square$
+
+*Caveats (approximations in the proof):*
+- *Constant $\alpha$: true only at steady state; smooth time-varying $\alpha$ gives a first-order approximation.*
+- *CLT for $v_k$: excellent at moderate throughput (≥ 5 completions/window); mild heavy-tail deviation at very low throughput is partially absorbed by the Student-t's heavier tails.*
+- *Satterthwaite df: standard approximation for EWMA variance estimators; exact for equal-weight averages.*
+- *$t_{1-p,\,\nu}$ approximation: implementation uses 4th-order Cornish-Fisher (Hill 1970) plus a one-sided asymptotic-series truncation bound $2\,|g_4/\nu^4|$. The bound is rigorous at $\nu \geq 5$, where Hill's series decays geometrically with ratio $\leq 1/2$ and the remainder is strictly less than twice the last term. At $\nu \in (1, 5)$ the ratio-½ assumption may not hold term-by-term (e.g., at $\nu = 2$ the first ratio $|g_2/g_1|/\nu \approx 0.6$); the bound is heuristically conservative in this regime — empirically the returned value upper-bounds the true t-quantile, and its fast growth at small $\nu$ swamps any term-by-term divergence. At $\nu \to 0$ the bound diverges, removing the need for any separate df-clamp. In all cases, realized FPR remains at or below nominal $\Phi(-\sigma_D)$ at steady state; the equality is achieved in the limit $\nu \to \infty$.*
+
+**Theorem 8 (Detection power under $H_1$: no saturation).** *Under $H_1$ ($E[v] = \mu > 0$), $\delta^2$ retains its $H_0$ expectation:*
+
+$$E[\delta^2 \mid H_1] = E[\delta^2 \mid H_0] = \sigma_v^2 (1 + \alpha/2)$$
+
+*and the test statistic grows unboundedly with $\mu$:*
+
+$$\lim_{\mu \to \infty} t = \frac{s \cdot \mu}{\sqrt{\sigma_v^2 \cdot W^{(2)} \cdot (1+W^{(2)})/2}} \to \infty$$
+
+*where $s = E[s_k]$ is the steady-state shrinkage. Severe degradation triggers the test at any positive throughput.*
+
+*Proof.* The drift component of $v_k = \mu + \epsilon_k$ cancels exactly in lag-1 differences:
+
+$$v_k - v_{k-1} = (\mu + \epsilon_k) - (\mu + \epsilon_{k-1}) = \epsilon_k - \epsilon_{k-1}$$
+
+*so $\delta^2 = \text{EWMA}((\epsilon_k - \epsilon_{k-1})^2/2)$ — independent of $\mu$. Therefore $E[\text{SE}^2 \mid H_1] = E[\text{SE}^2 \mid H_0] = \sigma_v^2 \cdot W^{(2)} \cdot (1+W^{(2)})/2$, and $E[\hat{v} \mid H_1] = s \mu$ (the asymmetric shrinkage on the trend numerator). The test statistic*
+
+$$t = \frac{\hat{v}}{\text{SE}} = \frac{s\mu + O(\sigma_v / \sqrt{\nu})}{\sigma_v \cdot \sqrt{W^{(2)} \cdot (1+W^{(2)})/2}}$$
+
+*grows linearly in $\mu$ with no saturation ceiling. This is the **drift invariance** property of von Neumann's δ²: drift cancels in pairwise differences, so the noise floor stays calibrated to the actual noise level under any $\mu$. $\square$
+
+*Transient behavior.* Before $\hat{v}$ has absorbed the new $\mu$, the test fires once $\hat{v}$ reaches roughly $\sigma_D \cdot \text{SE}$ — typically within $\sim 2/\alpha$ windows after onset (the EWMA time constant). Detection latency = O(time constant), not O(time constant × magnitude).
+
+**Theorem 9 (Implicit warm-up via the t-score error bound).** *The test cannot fire at low effective sample size: as $W^{(2)} \to 1$ (one effective observation, $\nu \to 0$), the asymptotic-series error bound $2\,|g_4/\nu^4|$ diverges, forcing the critical value $\to \infty$ and the test returns false. No separate $n_w \geq H$ elapsed-windows guard and no df-clamp are needed.*
+
+*Proof.* Three independent mechanisms cooperate:*
+
+1. *At pool creation, $\delta^2 = 0$ — `isLatencyDegrading` returns false on the explicit $\delta^2 = 0$ guard.*
+2. *Before two observations have been seen, the lag-1 difference cannot be computed and $\delta^2$ remains 0 — gated as in (1).*
+3. *After two observations, $W^{(2)} \approx 1$ initially, giving $\nu \approx 0$. In `tScore`, the truncation bound $2\,|g_4/\nu^4|$ diverges as $\nu \to 0^+$ — critical $\to \infty$, test returns false. As $W^{(2)}$ decays geometrically toward $\alpha/(2-\alpha) \approx 0.055$ (under typical $\alpha \approx 0.1$), the bound shrinks smoothly, and the test becomes active once enough independent data has accumulated.*
+
+*Unlike a hard df-clamp, the divergence at $\nu \to 0$ is a mathematical consequence of the series truncation expression: the last included term $g_4/\nu^4$ grows unboundedly as $\nu \to 0$, and the error bound $2\,|g_4/\nu^4|$ follows suit. The test returns conservative (large) critical values precisely when the approximation is least reliable — a single continuous function of $\nu$ with no special-case logic. The formal upper-bound guarantee on the t-quantile is rigorous at $\nu \geq 5$ (geometric decay with ratio $\leq 1/2$ verified empirically) and heuristic at smaller $\nu$; in the heuristic regime the bound grows fast enough to remain empirically conservative. $\square$
 
 ### 4.4 Regulation Phases and Step Formula
 
@@ -468,7 +621,7 @@ The factor $f(d)$ is the EWMA absorption fraction after $d$ steps with time cons
 
 #### 4.4.1 Per-Time-Constant Evaluation
 
-Every $H$ windows (when $n_w \geq H$ and $n_w \bmod H = 0$), the regulator evaluates six branches in priority order:
+Every $H$ windows (when $n_w > 0$ and $n_w \bmod H = 0$), the regulator evaluates six branches in priority order. Warm-up is handled implicitly by the Student-t critical value in branch 1 (Theorem 9) — no separate $n_w \geq H$ guard is needed.
 
 1. **Latency degrading** → `applyDecrease`. Retract previous increase or start fresh decrease ramp.
 2. **Cooling** ($\Phi \in \{\texttt{Retracting}, \texttt{Decreasing}\}$, not degrading) → Reset to $\texttt{Idle}$, $d = 0$, $s \leftarrow s/2$ (bisection damping). One time constant evaluation pause after a decrease sequence before allowing increases. Acts as natural momentum — prevents immediate flip-flop between latency-decrease and queue-increase. The halved $s$ ensures the next increase cycle uses finer steps.
@@ -587,7 +740,7 @@ Note: the table shows factors at $s = 1$ (first oscillation cycle). The retracti
 
 *Proof.* $1 - e^{-d/H} \leq 1$ for all $d \geq 0$, with equality only at $d = \infty$. Therefore $L \cdot (1 - e^{-d/H}) \leq L$, so $\lceil L \cdot (1 - e^{-d/H}) \rceil \leq L$. Since $L \geq L_{\min} \geq 1$, the $\max(1, \cdot)$ floor preserves $\Delta \leq L$. Equality ($\Delta = L$) is possible at very high $d$ when the product approaches $L$ from below and ceiling rounds up. $\square$
 
-**Theorem 10 (Exponential adjustment at convergence).** *Under sustained directional pressure, the limit grows (or shrinks) exponentially with doubling time $H^2 \cdot W$ ms.*
+**Theorem 11 (Exponential adjustment at convergence).** *Under sustained directional pressure, the limit grows (or shrinks) exponentially with doubling time $H^2 \cdot W$ ms.*
 
 *Proof.* At convergence ($d \gg H$), $1 - e^{-d/H} \to 1$. The behavior depends on the phase:
 
@@ -601,7 +754,7 @@ Time constant evaluations occur every $H \cdot W$ ms, and it takes $\sim H$ dept
 
 For $H = 9$ and $W = 100\text{ms}$: the ramp takes $\sim 8.1\text{s}$. After ramp, each doubling takes $\sim 900\text{ms}$. $\square$
 
-**Theorem 11 (Retraction mirrors growth in reverse order).** *If the system increased through depths $1, 2, \ldots, d_{\text{peak}}$ in Increasing phase, transitioning to Retracting on latency degradation produces decrease steps at depths $d_{\text{peak}}, d_{\text{peak}}-1, \ldots, 1$ — the mirror image of the increase sequence.*
+**Theorem 12 (Retraction mirrors growth in reverse order).** *If the system increased through depths $1, 2, \ldots, d_{\text{peak}}$ in Increasing phase, transitioning to Retracting on latency degradation produces decrease steps at depths $d_{\text{peak}}, d_{\text{peak}}-1, \ldots, 1$ — the mirror image of the increase sequence.*
 
 *Proof.* When $\widehat{\text{d}\bar{m}} > \theta$ and $\Phi = \texttt{Increasing}$ with $d = d_{\text{peak}} > 0$:
 
@@ -614,27 +767,27 @@ For $H = 9$ and $W = 100\text{ms}$: the ramp takes $\sim 8.1\text{s}$. After ram
 
 The decrease depths are exactly $d_{\text{peak}}, d_{\text{peak}}-1, \ldots, 1$, mirroring the increase sequence $1, 2, \ldots, d_{\text{peak}}$ in reverse. $\square$
 
-**Theorem 12 (Retraction exactly undoes growth).** *If the system increased through depths $1, 2, \ldots, d_{\text{peak}}$ in Increasing phase, a full retraction through depths $d_{\text{peak}}, d_{\text{peak}}-1, \ldots, 1$ returns $L$ to its original value (up to ceiling rounding effects of at most $\pm 1$ per step).*
+**Theorem 13 (Retraction exactly undoes growth).** *If the system increased through depths $1, 2, \ldots, d_{\text{peak}}$ in Increasing phase, a full retraction through depths $d_{\text{peak}}, d_{\text{peak}}-1, \ldots, 1$ returns $L$ to its original value, with cumulative error $O(d_{\text{peak}}/L)$ from ceiling rounding (bounded by $\pm 1$ per step).*
 
-*Proof.* At each increase step at depth $d$, the factor is $f(d) = 1 - e^{-d/H}$, and $L$ is multiplied by approximately $(1 + f(d))$. The retraction step at the same depth $d$ uses the multiplicative inverse $f(d)/(1+f(d))$, so $L$ is divided by approximately $(1 + f(d))$. Since each retraction step exactly inverts the corresponding increase step (up to ceiling rounding), the full retraction returns $L$ to a neighborhood of its original value. $\square$
+*Proof.* At each increase step at depth $d$, the actual update is $L_{\text{new}} = L + \max(1, \lceil L \cdot f(d) \cdot s \rceil)$ where $f(d) = 1 - e^{-d/H}$. In the continuous limit (no ceiling), this multiplies $L$ by $(1 + f \cdot s)$. The retraction step uses the multiplicative inverse $f \cdot s / (1 + f \cdot s)$, so the continuous-limit factor is $1/(1 + f \cdot s)$ — the exact inverse. Each step's ceiling rounding contributes at most $\pm 1$ to the actual change, so a full retraction through $d_{\text{peak}}$ steps differs from the original $L$ by at most $\pm d_{\text{peak}}$. For $L \gg d_{\text{peak}}$, the relative error is $O(d_{\text{peak}}/L)$; for small $L$ (e.g., $L = 2$, $d_{\text{peak}} = 5$), the bound is loose and convergence should be verified empirically. $\square$
 
-**Theorem 13 (Finite convergence to $L_{\min}$ under persistent degradation).** *Starting from any $L_0$, there exists a finite $N$ such that after $N$ consecutive decrease evaluations, $L \leq L_{\min}$.*
+**Theorem 14 (Finite convergence to $L_{\min}$ under persistent degradation).** *Starting from any $L_0$, there exists a finite $N$ such that after $N$ consecutive decrease evaluations, $L \leq L_{\min}$.*
 
 *Proof.* Since $\Delta \geq 1$ always (the $\max(1, \cdot)$ floor), $L$ decreases by at least 1 per evaluation. Starting from $L_0$, at most $L_0 - L_{\min}$ evaluations reach $L_{\min}$. In practice, convergence is much faster due to accelerating step sizes. $\square$
 
-**Theorem 14 (Invariant: $L \in [L_{\min}, L_{\max}]$).** *The concurrency limit is always within bounds.*
+**Theorem 15 (Invariant: $L \in [L_{\min}, L_{\max}]$).** *The concurrency limit is always within bounds.*
 
 *Proof.* By exhaustive case analysis: decrease uses $\max(L_{\min}, L - \Delta)$; increase uses $\min(L_{\max}, L + \Delta)$; restoring clamps toward $B$ using $\min(B, L + \Delta)$ or $\max(B, L - \Delta)$ where $B \in [L_{\min}, L_{\max}]$ by registration validation. $\square$
 
-**Theorem 15 (System converges to sustainable concurrency).** *If the backend has a sustainable capacity $C$ at concurrency $L_C$ (and degrades above $L_C$), the system converges to a neighborhood of $L_C$.*
+**Theorem 16 (System converges to sustainable concurrency).** *If the backend has a sustainable capacity $C$ at concurrency $L_C$ (and degrades above $L_C$), the system converges to a neighborhood of $L_C$.*
 
-*Proof sketch.* Each overshoot-correction cycle narrows the oscillation band via bisection damping: (1) retraction exactly undoes recent growth (Theorem 12), (2) cooling halves $s$, (3) the next increase cycle uses finer steps. After $k$ cycles, the maximum step is $\Delta_1 / 2^k$ where $\Delta_1 = \max(1, \lceil L_C \cdot f(1) \rceil)$. The oscillation amplitude converges geometrically to within $\max(1, \cdot)$ of $L_C$. This is strictly tighter than the previous bound of $\Delta(1)$ per cycle — bisection provides $O(\log L)$ convergence instead of perpetual oscillation at the minimum step size. $\square$
+*Proof sketch.* Each overshoot-correction cycle narrows the oscillation band via bisection damping: (1) retraction exactly undoes recent growth (Theorem 13), (2) cooling halves $s$, (3) the next increase cycle uses finer steps. After $k$ cycles, the maximum step is $\Delta_1 / 2^k$ where $\Delta_1 = \max(1, \lceil L_C \cdot f(1) \rceil)$. The oscillation amplitude converges geometrically to within $\max(1, \cdot)$ of $L_C$. This is strictly tighter than the previous bound of $\Delta(1)$ per cycle — bisection provides $O(\log L)$ convergence instead of perpetual oscillation at the minimum step size. $\square$
 
 ---
 
 ## 5. Independence of Mechanisms
 
-**Theorem 16 (Orthogonality).** *ProDel, early shedding, and the throughput regulator operate on disjoint state and trigger on different signals.*
+**Theorem 17 (Orthogonality).** *ProDel, early shedding, and the throughput regulator operate on disjoint state and trigger on different signals.*
 
 | Property | ProDel | Early Shed | Per-Lane Shedding | Throughput Regulator | Probabilistic Error Decrease |
 |----------|-------|------------|-------------------|----------------------|------------------------------|
@@ -654,24 +807,117 @@ ProDel never writes to regulator state; the regulator never writes to ProDel sta
 | **No premature drops** | ProDel waits $\geq W$ ms before first drop (Theorem 2) |
 | **No fresh drops** | Entries with sojourn $< \tau$ are never dropped (Theorem 1) |
 | **No wasted drops** | P = 1 - τ/s ensures staleness is verified for every drop (Theorem 1) |
-| **Bounded limit** | $L \in [L_{\min}, L_{\max}]$ always (Theorem 14) |
-| **No false positives during warm-up** | Evaluation gated on $n_w \geq H$ (Theorem 9) |
-| **Conservative at low concurrency** | Shrinkage-dampened EWMA reduces update weight at low throughput (§4.1.1, §4.2) |
+| **Bounded limit** | $L \in [L_{\min}, L_{\max}]$ always (Theorem 15) |
+| **FPR upper bound** | $P(\text{FP} \mid H_0) \leq \Phi(-\sigma_D)$ at all $\nu$ (Theorem 7) |
+| **No saturation under H₁** | Drift-invariant δ² → test statistic grows linearly with $\mu$ (Theorem 8) |
+| **No false positives during warm-up** | Student-t critical value diverges as $\nu \to 0$ (Theorem 9) |
+| **Conservative at low throughput** | Asymmetric shrinkage on trend numerator + Student-t at small df (§4.2.5, §4.3.1) |
+| **Arbitrary $W/W_{\text{cw}}$ ratio** | Operational LL is exact for any finite interval (§4.2.1) |
 | **Step bounded** | Each step $\leq L$ (Theorem 10) |
-| **Retraction mirrors growth** | Decrease walks back growth in reverse order (Theorem 11) |
-| **Retraction is exact inverse** | Full retraction returns L to original value (Theorem 12) |
-| **Finite convergence to floor** | Decrease reaches $L_{\min}$ in $O(L_0)$ steps (Theorem 13) |
+| **Retraction mirrors growth** | Decrease walks back growth in reverse order (Theorem 12) |
+| **Retraction is exact inverse** | Full retraction returns L to original value (Theorem 13) |
+| **Finite convergence to floor** | Decrease reaches $L_{\min}$ in $O(L_0)$ steps (Theorem 14) |
 | **Self-recovery** | ProDel exits dropping when no lane has stale entries (pool-wide check after all lanes processed) (Theorem 4) |
-| **System convergence** | Regulator converges to sustainable $L_C$ via bisection in $O(\log L)$ cycles (Theorem 15) |
+| **System convergence** | Regulator converges to sustainable $L_C$ via bisection in $O(\log L)$ cycles (Theorem 16) |
 | **Early shed is self-regulating** | Shedding dampens its own intensity (Theorem 5b) |
 | **No starvation from early shed** | Only fires at capacity; completing tasks re-enable admission (Theorem 5c) |
 | **Adaptive LIFO/FIFO** | FIFO when healthy (fair ordering); LIFO when dropping (protect fresh work) — both among lanes and within lanes (§2.1) |
 | **Single convergent formula** | Same step $\Delta(d)$ for Increasing, Retracting, Decreasing, and Restoring |
 | **Cautious recovery** | Retracting/Decreasing→Increasing starts fresh from depth 0 |
 | **Asymmetric phase transitions** | Only Increasing→decrease triggers retraction; decrease→Increasing does not |
-| **Per-lane shedding is independent** | Lane error rate doesn't affect pool-wide regulation (Theorem 16) |
+| **Per-lane shedding is independent** | Lane error rate doesn't affect pool-wide regulation (Theorem 17) |
 | **Probabilistic error decrease** | Systemic errors cause probabilistic decrease (P = errorRate); per-lane shedding filters localized errors (§4.3.2) |
 | **Gradual restoring** | Convergent steps toward baseline from either direction; no discontinuous snaps (§4.4.4) |
 | **Bisection convergence** | Each increase→retract→cooling cycle halves stepScale; $O(\log L)$ cycles to equilibrium (§4.5) |
 | **One-eval cooling** | After a decrease sequence, one time constant evaluation pause before allowing increases; stepScale halved (§4.4.1) |
 | **Log-space robustness** | Log-transform compresses error-spike contamination of latency signal (§4.2) |
+
+---
+
+## Appendix A. Derivation of the Autocorrelation Structure of $v_k$
+
+This appendix derives the autocorrelation $\rho_h$ used in §4.3.1 and the variance reduction factor $(1+W^{(2)})/2$ in the SE formula.
+
+**Setup.** Let $x_k$ be i.i.d. zero-mean noise with variance $\sigma_x^2$ (the per-window log-W observations under $H_0$). The level EWMA is
+
+$$\bar{m}_k = (1-\alpha)\bar{m}_{k-1} + \alpha x_k$$
+
+The trend signal is the first difference
+
+$$v_k = \bar{m}_k - \bar{m}_{k-1} = \alpha(x_k - \bar{m}_{k-1})$$
+
+(The dt-normalization in §4.2.4 is suppressed here; it doesn't affect autocorrelation structure.)
+
+**A.1 Variance of $v_k$ at steady state.**
+
+$$\text{Var}(v_k) = \alpha^2\,\text{Var}(x_k - \bar{m}_{k-1}) = \alpha^2[\sigma_x^2 + \sigma_x^2 W^{(2)}] = \alpha^2 \sigma_x^2 (1 + W^{(2)})$$
+
+(using $\text{Var}(\bar{m}) = \sigma_x^2 W^{(2)}$ and independence of $x_k$ from past $\bar{m}$). With $W^{(2)} = \alpha/(2-\alpha)$ at steady state, this simplifies to $2\alpha^2\sigma_x^2/(2-\alpha)$.
+
+**A.2 Lag-1 autocorrelation $\rho_1 = -\alpha/2$.**
+
+$$\text{Cov}(v_k, v_{k-1}) = \alpha^2\,\text{Cov}(x_k - \bar{m}_{k-1}, x_{k-1} - \bar{m}_{k-2})$$
+
+Expanding the covariance using independence of $x$ from past $\bar{m}$:
+
+$$= \alpha^2[0 - 0 - \alpha\sigma_x^2 + (1-\alpha)\sigma_x^2 W^{(2)}]$$
+
+(The $-\alpha\sigma_x^2$ term comes from $\text{Cov}(\bar{m}_{k-1}, x_{k-1}) = \alpha\sigma_x^2$ since $\bar{m}_{k-1} = \alpha x_{k-1} + (1-\alpha)\bar{m}_{k-2}$. The $(1-\alpha)\sigma_x^2 W^{(2)}$ comes from $\text{Cov}(\bar{m}_{k-1}, \bar{m}_{k-2}) = (1-\alpha)\text{Var}(\bar{m})$.)
+
+Substituting $W^{(2)} = \alpha/(2-\alpha)$ and simplifying:
+
+$$\text{Cov}(v_k, v_{k-1}) = \alpha^2 \sigma_x^2 \cdot \frac{(1-\alpha)\alpha - \alpha(2-\alpha)}{2-\alpha} = -\frac{\alpha^3 \sigma_x^2}{2-\alpha}$$
+
+Therefore
+
+$$\rho_1 = \frac{\text{Cov}(v_k, v_{k-1})}{\text{Var}(v_k)} = \frac{-\alpha^3/(2-\alpha)}{2\alpha^2/(2-\alpha)} = -\frac{\alpha}{2}$$
+
+**A.3 Lag-h generalization $\rho_h = -\alpha(1-\alpha)^{h-1}/2$.**
+
+By the same expansion at lag $h$, the EWMA's geometric decay propagates: $\bar{m}_{k-1}$'s correlation with $\bar{m}_{k-h-1}$ is $(1-\alpha)^{h-1}$ times its lag-1 correlation. The result $\rho_h = -\alpha(1-\alpha)^{h-1}/2$ follows.
+
+**A.4 Variance reduction factor $(1+W^{(2)})/2$.**
+
+The variance of an EWMA over an autocorrelated sequence is
+
+$$\text{Var}(\hat{v}) = \sigma_v^2\left[\sum_j w_j^2 + 2\sum_{h\geq 1}\rho_h \sum_j w_j w_{j+h}\right]$$
+
+For EWMA weights $w_j = \alpha(1-\alpha)^j$ at steady state:
+
+$$\sum_j w_j^2 = W^{(2)} = \frac{\alpha}{2-\alpha}, \qquad \sum_j w_j w_{j+h} = \frac{\alpha(1-\alpha)^h}{2-\alpha}$$
+
+Substituting $\rho_h$ from A.3:
+
+$$2\sum_{h\geq 1} \rho_h \cdot \frac{\alpha(1-\alpha)^h}{2-\alpha} = -\frac{\alpha^2}{2-\alpha} \sum_{h\geq 1}(1-\alpha)^{2h-1} = -\frac{\alpha(1-\alpha)}{(2-\alpha)^2}$$
+
+Combining:
+
+$$\text{Var}(\hat{v}) = \sigma_v^2\left[\frac{\alpha}{2-\alpha} - \frac{\alpha(1-\alpha)}{(2-\alpha)^2}\right] = \frac{\sigma_v^2 \cdot \alpha}{(2-\alpha)^2}$$
+
+Converting via $W^{(2)} = \alpha/(2-\alpha)$, so $\alpha = 2W^{(2)}/(1+W^{(2)})$ and $2-\alpha = 2/(1+W^{(2)})$:
+
+$$\frac{\alpha}{(2-\alpha)^2} = \frac{2W^{(2)}/(1+W^{(2)})}{4/(1+W^{(2)})^2} = \frac{W^{(2)}(1+W^{(2)})}{2}$$
+
+Therefore
+
+$$\text{Var}(\hat{v}) = \sigma_v^2 \cdot W^{(2)} \cdot \frac{1+W^{(2)}}{2}$$
+
+This is the autocorrelation-corrected variance used in §4.3.1's SE formula.
+
+**A.5 δ²'s bias under autocorrelation.**
+
+$$E[\delta^2] = E\left[\frac{(v_k - v_{k-1})^2}{2}\right] = \frac{2\sigma_v^2 - 2\text{Cov}(v_k, v_{k-1})}{2} = \sigma_v^2(1 - \rho_1) = \sigma_v^2(1 + \alpha/2)$$
+
+So $\hat\sigma_v^2 = \delta^2/(1+\alpha/2)$ is unbiased for $\sigma_v^2$ under both $H_0$ and $H_1$ (drift cancels in pairwise differences — see Theorem 8).
+
+## Appendix B. Reproducibility of the v1.2.0 Empirical Bench
+
+The bench numbers cited in `.changeset/statistical-rigor.md` and §4.2.6 were produced by:
+
+```
+npx tsx simulations/simulation-live.ts
+```
+
+This runs an HTTP backend on `localhost:9877` and exercises 10 workload scenarios against the executor (steady state, burst absorption, latency step change, demand spike, full overload, gradual ramp, backend backpressure, error scenarios). Output is `simulations/simulation-live.json` and `.html` (gitignored — re-generated each run).
+
+Run-to-run variance is significant (~5pp on healthy-state FPR per scenario) due to OS scheduling, GC, and HTTP queueing on localhost. The cited numbers are representative single runs; for definitive comparisons, average 5–10 runs.

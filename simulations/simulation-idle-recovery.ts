@@ -89,10 +89,11 @@ async function advance(ms: number): Promise<void> {
         timers.splice(earliestIdx, 1);
         currentTime = earliest.fireAt;
         earliest.callback();
-        await new Promise<void>((r) => r());
+        // Pump setImmediate too — Executor defers admission via setImmediate.
+        await new Promise<void>((r) => setImmediate(r));
     }
     currentTime = target;
-    await new Promise<void>((r) => r());
+    await new Promise<void>((r) => setImmediate(r));
 }
 
 function simulationWait(ms: number): Promise<void> {
@@ -111,13 +112,13 @@ type Snapshot = {
     logW: number | null;
     logWBar: number | null;
     dLogWBarEwma: number | null;
-    dLogWBarSM: number;
+    dLogWBarVarianceEstimate: number;
     ewmaSumW2: number;
     se: number;
     zScore: number;
     completionRateEwma: number | null;
     regulationPhase: string;
-    threshold: number; // zScoreThreshold × SE — the actual detection boundary
+    threshold: number; // tCritical × SE — actual firing boundary (use this not Z × SE for plots)
 };
 
 type Scenario = {
@@ -137,7 +138,7 @@ const logger = {
     child: () => logger
 } as any;
 
-function captureSnapshot(executor: Executor, pool: string, zScoreThreshold: number): Snapshot {
+function captureSnapshot(executor: Executor, pool: string, _zScoreThreshold: number): Snapshot {
     const rs = executor.getRegulatorState(pool);
     return {
         time: Math.round(currentTime),
@@ -149,13 +150,13 @@ function captureSnapshot(executor: Executor, pool: string, zScoreThreshold: numb
         logW: rs.logW,
         logWBar: rs.logWBar,
         dLogWBarEwma: rs.dLogWBarEwma,
-        dLogWBarSM: rs.dLogWBarSM,
+        dLogWBarVarianceEstimate: rs.dLogWBarVarianceEstimate,
         ewmaSumW2: rs.ewmaSumW2,
         se: rs.se,
         zScore: rs.zScore,
         completionRateEwma: rs.completionRateEwma,
         regulationPhase: rs.regulationPhase,
-        threshold: zScoreThreshold * rs.se
+        threshold: rs.threshold
     };
 }
 
@@ -410,8 +411,8 @@ async function scenarioFeedbackLoop(): Promise<Scenario> {
             "Baseline: 15, min: 2, controlWindow: 100ms. " +
             "Phase 1: 300 tasks at 10ms, high throughput \u2014 variance converges to a low value. " +
             "Phase 2: latency increases to 30ms (3\u00d7). The regulator should reduce concurrency " +
-            "proportionally, NOT spiral to minimum. With the fix, second-moment variance estimation " +
-            "keeps SE properly calibrated, preventing the runaway loop. " +
+            "proportionally, NOT spiral to minimum. Drift-invariant von Neumann \u03b4\u00b2 noise estimator with " +
+            "autocorrelation-corrected SE keeps the z-test properly calibrated, preventing the runaway loop. " +
             "Phase 3: latency recovers to 10ms \u2014 concurrency should restore toward baseline.",
         data,
         phases
@@ -421,7 +422,7 @@ async function scenarioFeedbackLoop(): Promise<Scenario> {
 // ── Main ────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-    console.log("Running idle recovery & second-moment variance simulations...\n");
+    console.log("Running idle recovery & noise-estimator simulations...\n");
 
     const scenarios: Scenario[] = [
         await scenarioIdleGap(),
@@ -445,8 +446,8 @@ async function main(): Promise<void> {
     }
 
     const jsonPath = generateJsonOutput(import.meta.url, "simulation-idle-recovery", scenarios, {
-        title: "Idle Recovery & Variance Fix Simulation",
-        subtitle: "Demonstrates idle recovery, second-moment variance estimation, and feedback loop prevention"
+        title: "Idle Recovery & Variance Simulation",
+        subtitle: "Demonstrates idle recovery, drift-invariant δ² noise estimation, and feedback loop prevention"
     });
     generateHtmlFromJson(jsonPath);
 }

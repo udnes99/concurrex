@@ -2,6 +2,7 @@ node_modules/
 dist/
 .context/
 *.tgz
+.DS_Store
 simulations/*.html
 simulations/*.json
 benchmarks/results.html

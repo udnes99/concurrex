@@ -42,7 +42,7 @@ type ScenarioOutput = {
         peakInFlight: number;
         concurrencyLimitMin: number;
         concurrencyLimitMax: number;
-        codelDropsOccurred: boolean;
+        prodelDropsOccurred: boolean;
         throughputDegradationOccurred: boolean;
     };
     phases?: { timeMs: number; label: string }[];
@@ -91,7 +91,7 @@ function buildScenarioOutput(scenario: Scenario): ScenarioOutput {
             peakInFlight: Math.max(0, ...data.map((d) => d.inFlight)),
             concurrencyLimitMin: Math.min(...limits),
             concurrencyLimitMax: Math.max(...limits),
-            codelDropsOccurred: data.some((d) => d.dropping),
+            prodelDropsOccurred: data.some((d) => d.dropping),
             throughputDegradationOccurred: data.some((d) => d.throughputDegraded)
         },
         timeSeries: buildTimeSeries(data)
