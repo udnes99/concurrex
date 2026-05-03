@@ -103,16 +103,11 @@ async function advance(ms: number): Promise<void> {
         timers.splice(earliestIdx, 1);
         currentTime = earliest.fireAt;
         earliest.callback();
-        // Yield to microtask queue (resolve pending promises)
-        await new Promise<void>((r) => {
-            r();
-        });
+        // Pump setImmediate too — Executor defers admission via setImmediate.
+        await new Promise<void>((r) => setImmediate(r));
     }
     currentTime = target;
-    // Yield once more at target time
-    await new Promise<void>((r) => {
-        r();
-    });
+    await new Promise<void>((r) => setImmediate(r));
 }
 
 // ── Simulation wait (replaces Time.wait) ────────────────────────────
@@ -205,7 +200,7 @@ async function scenarioSteadyState(): Promise<Scenario> {
             "Baseline: 10, delayThreshold: 100ms, controlWindow: 100ms. " +
             "0\u20132000ms: 400 tasks arrive (mean inter-arrival 5ms) each taking ~20ms. " +
             "Load stays within baseline capacity \u2014 in-flight hovers around 4\u20138, queue stays at 0. " +
-            "No CoDel activation, no throughput degradation. This is what normal operation looks like.",
+            "No ProDel activation, no throughput degradation. This is what normal operation looks like.",
         data
     };
 }
@@ -269,7 +264,7 @@ async function scenarioBurstAbsorption(): Promise<Scenario> {
             "~1000ms: sudden burst \u2014 200 tasks dumped at once. Queue spikes to ~190. " +
             "AI grows the concurrency limit (+1 per completion while queue has work) to absorb the burst. " +
             "1000\u20136000ms: burst drains, no new arrivals. Baseline gravity snaps the limit back down as in-flight tasks complete. " +
-            "Key point: a long queue with fast processing is healthy \u2014 no CoDel drops, no MD.",
+            "Key point: a long queue with fast processing is healthy \u2014 no ProDel drops, no MD.",
         data
     };
 }
@@ -329,7 +324,7 @@ async function scenarioThroughputDegradation(): Promise<Scenario> {
             "~1500\u20133500ms: backend degrades \u2014 tasks slow to ~200ms (arrival slows to ~40ms). " +
             "Z-test detects the latency step change and the regulator decreases concurrency. " +
             "~3500\u20136000ms: backend recovers \u2014 tasks return to ~15ms. Queue drains, baseline gravity restores the limit. " +
-            "CoDel may activate briefly if capacity drops below arrival rate.",
+            "ProDel may activate briefly if capacity drops below arrival rate.",
         data
     };
 }
@@ -385,7 +380,7 @@ async function scenarioDemandSpikeHealthy(): Promise<Scenario> {
             "Baseline: 10, min: 2, delayThreshold: 50ms, controlWindow: 100ms. " +
             "0\u2013500ms: baseline established with 50 tasks arriving every ~10ms, each taking ~10ms. " +
             "~500ms: 500 tasks dumped at once. Queue spikes to ~490. Processing speed unchanged (~10ms). " +
-            "500\u201310000ms: AI grows the limit as tasks complete with queue work. CoDel drops stale entries whose sojourn exceeds 50ms. " +
+            "500\u201310000ms: AI grows the limit as tasks complete with queue work. ProDel drops stale entries whose sojourn exceeds 50ms. " +
             "Key point: z-test does NOT fire \u2014 throughput (completions/window) stays healthy. " +
             "A long queue is a demand problem, not a processing problem. The cashier doesn't slow down because the line is long.",
         data
@@ -424,7 +419,7 @@ async function scenarioActualDegradationUnderLoad(): Promise<Scenario> {
     await advance(0);
     data.push(captureSnapshot(executor, pool, currentTime));
 
-    // Phase 3: observe the system react — CoDel drops stale entries
+    // Phase 3: observe the system react — ProDel drops stale entries
     for (let i = 0; i < 100; i++) {
         await advance(50);
         data.push(captureSnapshot(executor, pool, currentTime));
@@ -446,14 +441,14 @@ async function scenarioActualDegradationUnderLoad(): Promise<Scenario> {
     restoreFakeTime();
 
     return {
-        name: "Degraded Burst (CoDel Only)",
+        name: "Degraded Burst (ProDel Only)",
         description:
             "Baseline: 10, min: 2, delayThreshold: 50ms, controlWindow: 100ms. " +
             "0\u2013500ms: baseline established with 50 tasks, same as the healthy demand spike. " +
             "~500ms: 200 slow tasks (~150ms each) dumped at once. Queue spikes to ~190. " +
-            "500\u20135500ms: AI grows the limit (tasks complete with queue work), CoDel drops stale entries. " +
+            "500\u20135500ms: AI grows the limit (tasks complete with queue work), ProDel drops stale entries. " +
             "z-test does NOT fire \u2014 the short baseline phase (~5 windows) doesn't accumulate enough variance samples for detection (requires ESS \u2248 9). " +
-            "This is a one-shot burst, not sustained degradation. Compare with the healthy demand spike: same shape, but slower processing means CoDel drops more aggressively. " +
+            "This is a one-shot burst, not sustained degradation. Compare with the healthy demand spike: same shape, but slower processing means ProDel drops more aggressively. " +
             "5500\u201311000ms: 100 fast recovery tasks (~10ms) drain remaining queue.",
         data
     };
@@ -487,10 +482,10 @@ async function scenarioFullOverload(): Promise<Scenario> {
 
     // Phase 2: sustained backend degradation — same arrival rate, tasks now take ~300ms
     // Capacity: 10 slots / 300ms ≈ 33/sec. Arrival 100/sec >> capacity.
-    // Queue grows rapidly → entries age past 100ms threshold → CoDel activates.
+    // Queue grows rapidly → entries age past 100ms threshold → ProDel activates.
     // Completion rate drops from ~10/window to ~3/window → z-test fires.
     // Both mechanisms cooperate: regulator reduces concurrency to protect the backend,
-    // CoDel sheds excess demand from the queue.
+    // ProDel sheds excess demand from the queue.
     for (let i = 0; i < 200; i++) {
         const duration = rng.erlang(300);
         catchAll.push(executor.run(pool, () => simulationWait(duration)).catch(() => {}));
@@ -514,7 +509,7 @@ async function scenarioFullOverload(): Promise<Scenario> {
     restoreFakeTime();
 
     return {
-        name: "Full Overload (CoDel + Regulator Decrease)",
+        name: "Full Overload (ProDel + Regulator Decrease)",
         description:
             "Baseline: 10, min: 2, max: 15, delayThreshold: 100ms, controlWindow: 100ms. " +
             "0\u20131500ms: healthy phase \u2014 150 tasks arriving every ~10ms, each taking ~15ms. EWMA warms up (~15 windows). " +
@@ -522,8 +517,8 @@ async function scenarioFullOverload(): Promise<Scenario> {
             "Capacity drops well below arrival (100/sec). AI grows the limit but hits the cap (15) \u2014 not enough to compensate. " +
             "Queue grows, entries age past 100ms. " +
             "Both mechanisms activate: z-test detects the latency change and cuts concurrency to reduce backend pressure. " +
-            "CoDel detects stale queue entries and sheds excess demand. " +
-            "~3500\u20135500ms: backend recovers \u2014 tasks return to ~15ms. CoDel exits dropping, " +
+            "ProDel detects stale queue entries and sheds excess demand. " +
+            "~3500\u20135500ms: backend recovers \u2014 tasks return to ~15ms. ProDel exits dropping, " +
             "baseline gravity and AI restore the concurrency limit.",
         data
     };
@@ -557,13 +552,13 @@ async function main(): Promise<void> {
             `    Peak queue: ${maxQueue}, Peak in-flight: ${maxInFlight}, Peak limit: ${maxLimit}`
         );
         console.log(
-            `    CoDel drops: ${hadDrops ? "yes" : "no"}, Degradation detected: ${hadDegradation ? "yes" : "no"}\n`
+            `    ProDel drops: ${hadDrops ? "yes" : "no"}, Degradation detected: ${hadDegradation ? "yes" : "no"}\n`
         );
     }
 
     const jsonPath = generateJsonOutput(import.meta.url, "simulation", scenarios, {
         title: "Executor \u2013 Adaptive Concurrency Simulation",
-        subtitle: "CoDel queue management + throughput-driven AIMD concurrency regulation"
+        subtitle: "ProDel queue management + throughput-driven AIMD concurrency regulation"
     });
     generateHtmlFromJson(jsonPath);
 }

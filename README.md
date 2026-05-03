@@ -45,7 +45,7 @@ Five mechanisms cooperate:
 
 1. **ProDel** (Probabilistic Delay Load-shedding) — sojourn-based AQM. Drop probability `P = 1 - threshold/sojourn`. Adaptive LIFO/FIFO admission (FIFO when healthy, LIFO when dropping to protect fresh work).
 2. **Probabilistic early shedding** — rejects new arrivals at enqueue time with `P = dropRate/(dropRate+completionRate) * shrinkage` when ProDel is dropping and pool is at capacity. Instant rejections.
-3. **EWMA throughput regulator** — latency detection via operational Little's Law (`W = integral N(t)dt / completions`), log-transformed, smoothed by a shrinkage-dampened EWMA, with a null-hypothesis z-test on the trend. Trend input is shrinkage-dampened (conservative at low throughput) while the variance estimator sees raw values — the z-test false positive rate scales from ~0% at 2 completions/window to the nominal 2.3% at high throughput. Concurrency adjusted via a convergent step formula with bisection damping for O(log L) equilibrium convergence.
+3. **EWMA throughput regulator** — latency detection via operational Little's Law (`W = integral N(t)dt / completions`), log-transformed, smoothed by a shrinkage-dampened level EWMA. A Student-t hypothesis test on the trend detects sustained upward drift, with SE formula `√(δ² × W² × (1+W²) / (2 × (1+α/2)))` derived from von Neumann's lag-1 squared-difference noise estimator (drift-invariant) plus an autocorrelation variance-reduction factor for the EWMA. False-positive rate is upper-bounded by Φ(−Z) at steady state (≤2.3% at Z=2); small-sample conservatism comes from the Student-t critical value widening as effective sample size shrinks. Concurrency adjusted via a convergent step formula with bisection damping for O(log L) equilibrium convergence.
 4. **Per-lane error shedding** — each lane tracks its own error rate EWMA. High-error lanes probabilistically reject new requests without affecting pool-wide concurrency.
 5. **Fair lane scheduling** — round-robin across lanes (per-tenant, per-user, or shared). Prevents noisy neighbors from monopolizing capacity.
 
@@ -132,7 +132,9 @@ executor.getRegulatorState("commands");    // full filter state snapshot
 
 `isOverloaded` returns `true` only during confirmed sustained overload (dropping state). Use this to pause upstream work fetching.
 
-`getRegulatorState` returns a `RegulatorState` with the filter internals: `logW`, `logWBar`, `dLogWBarEwma`, `dLogWBarSM`, `ewmaSumW2`, `se`, `zScore`, `degrading`, `inFlightEwma`, `completionRateEwma`, `dropRateEwma`, `errorRateEwma`, `regulationPhase`, `regulationDepth`, `elapsedWindows`, `alpha`.
+`getRegulatorState` returns a `RegulatorState` with the filter internals: `logW`, `logWBar`, `dLogWBarEwma`, `dLogWBarVarianceEstimate`, `ewmaSumW2`, `se`, `zScore`, `tCritical`, `threshold`, `degrading`, `inFlightEwma`, `completionRateEwma`, `admissionRateEwma`, `dropRateEwma`, `errorRateEwma`, `regulationPhase`, `regulationDepth`, `elapsedWindows`, `alpha`. Use `threshold` (= `tCritical × se`) to plot the actual firing boundary — NOT `zScoreThreshold × se`, which is only correct at steady-state df.
+
+`dLogWBarVarianceEstimate` is von Neumann's δ² — an EWMA of `(v_k − v_{k-1})²/2`, where `v` is the trend signal `dLogWBar`. It's a drift-invariant noise estimator: pairwise differences cancel any sustained drift, so δ² stays calibrated to the actual noise level even under sustained latency degradation. See `docs/THEORY.md` §4.2.6 for the derivation.
 
 ## Error Handling
 
@@ -204,7 +206,7 @@ class Executor {
 
 ## Theory
 
-See [THEORY.md](https://github.com/udnes99/concurrex/blob/main/docs/THEORY.md) for formal analysis with 16 theorems and proofs covering convergence guarantees, stability bounds, and fairness properties.
+See [THEORY.md](https://github.com/udnes99/concurrex/blob/main/docs/THEORY.md) for formal analysis with 17 theorems and proofs covering convergence guarantees, stability bounds, and fairness properties.
 
 ## License
 

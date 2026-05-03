@@ -28,8 +28,12 @@ type Snapshot = {
     logW: number | null;
     logWBar: number | null;
     dLogWBarEwma: number | null;
+    dLogWBarVarianceEstimate: number;
+    ewmaSumW2: number;
     se: number;
     zScore: number;
+    tCritical: number;
+    threshold: number;
     regulationPhase: string;
     regulationDepth: number;
 };
@@ -123,8 +127,12 @@ function captureSnapshot(
         logW: rs.logW,
         logWBar: rs.logWBar,
         dLogWBarEwma: rs.dLogWBarEwma,
+        dLogWBarVarianceEstimate: rs.dLogWBarVarianceEstimate,
+        ewmaSumW2: rs.ewmaSumW2,
         se: rs.se,
         zScore: rs.zScore,
+        tCritical: rs.tCritical,
+        threshold: rs.threshold,
         regulationPhase: rs.regulationPhase,
         regulationDepth: rs.regulationDepth
     };
@@ -183,7 +191,7 @@ async function runDegradationScenario(zScore: number): Promise<Scenario> {
     });
 
     // Warm-up: run 2×TIME_CONSTANT windows of steady traffic so all EWMAs
-    // and the second moment reach statistical steady state before
+    // and the variance estimator reach statistical steady state before
     // the actual test phases begin. Not recorded in charts.
     globalDelay = 10;
     backpressureEnabled = false;

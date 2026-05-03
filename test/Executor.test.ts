@@ -102,6 +102,43 @@ describe("Executor tests", () => {
                     })
                 ).rejects.toThrow("task failed");
             });
+
+            test("supports reentrant task submission (task body calls run())", async () => {
+                executor.registerPool("outer", { maximumConcurrency: 5 });
+                executor.registerPool("inner", { maximumConcurrency: 5 });
+
+                const log: string[] = [];
+                const outerPromise = executor.run("outer", async () => {
+                    log.push("outer-start");
+                    // Reentrant call: same pool, different lane
+                    const a = executor.run("outer", () => {
+                        log.push("outer-nested");
+                        return "a";
+                    }, { lane: "nested" });
+                    // Reentrant call: different pool
+                    const b = executor.run("inner", () => {
+                        log.push("inner-nested");
+                        return "b";
+                    });
+                    const [ra, rb] = await Promise.all([a, b]);
+                    log.push("outer-end");
+                    return ra + rb;
+                });
+
+                await vi.advanceTimersByTimeAsync(100);
+                const result = await outerPromise;
+                expect(result).toBe("ab");
+                expect(log).toEqual(["outer-start", "outer-nested", "inner-nested", "outer-end"]);
+                expect(executor.getInFlight("outer")).toBe(0);
+                expect(executor.getInFlight("inner")).toBe(0);
+            });
+
+            test("rejects user lane names with reserved _t_ prefix", async () => {
+                executor.registerPool("test");
+                await expect(
+                    executor.run("test", () => 1, { lane: "_t_custom" })
+                ).rejects.toThrow(/reserved for transient lanes/);
+            });
         });
 
         describe("ProDel admission control", () => {
@@ -2322,6 +2359,116 @@ describe("Executor tests", () => {
             expect(executor.getConcurrencyLimit("test")).toBe(5);
         });
 
+        test("isThroughputDegraded returns true under sustained latency increase", async () => {
+            vi.useRealTimers();
+
+            const realExecutor = new Executor({ logger });
+            realExecutor.start();
+            realExecutor.registerPool("test", {
+                baselineConcurrency: 10,
+                minimumConcurrency: 2,
+                maximumConcurrency: 50,
+                controlWindow: 50,
+                delayThreshold: 5000
+            });
+
+            const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+            // Phase 1: fast tasks build a low-W baseline.
+            for (let w = 0; w < 20; w++) {
+                const batch = Array.from({ length: 10 }, () =>
+                    realExecutor.run("test", () => sleep(2))
+                );
+                await Promise.allSettled(batch);
+                await sleep(50);
+            }
+
+            // Phase 2: slow tasks → W rises → trend test should fire.
+            for (let w = 0; w < 15; w++) {
+                const batch = Array.from({ length: 10 }, () =>
+                    realExecutor.run("test", () => sleep(40))
+                );
+                await Promise.allSettled(batch);
+                await sleep(10);
+            }
+
+            expect(realExecutor.isThroughputDegraded("test")).toBe(true);
+            const state = realExecutor.getRegulatorState("test");
+            expect(state.degrading).toBe(true);
+            expect(state.zScore).toBeGreaterThan(state.tCritical);
+
+            realExecutor.stop();
+
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
+            vi.setSystemTime(0);
+            currentTime = 0;
+            vi.spyOn(performance, "now").mockImplementation(() => currentTime);
+        }, 15_000);
+
+        test("isThroughputDegraded stays false on first sample after a long idle gap", async () => {
+            // Use real timers — fake timers + setImmediate scheduling makes
+            // multi-second idle gaps tricky.
+            vi.useRealTimers();
+            const realExecutor = new Executor({ logger });
+            realExecutor.start();
+            realExecutor.registerPool("test", {
+                baselineConcurrency: 5,
+                minimumConcurrency: 2,
+                maximumConcurrency: 50,
+                controlWindow: 30,
+                delayThreshold: 60_000
+            });
+            const realWait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+            // Baseline.
+            for (let w = 0; w < 20; w++) {
+                const batch = Array.from({ length: 5 }, () =>
+                    realExecutor.run("test", () => realWait(2))
+                );
+                await Promise.allSettled(batch);
+                await realWait(30);
+            }
+            expect(realExecutor.isThroughputDegraded("test")).toBe(false);
+
+            // Idle for many windows. ewmaSumW2 should reset toward 1 on the
+            // next observation (Theorem 9: implicit warm-up).
+            await realWait(2000);
+
+            // First post-idle completion. Even if its W̃ is unusual due to the
+            // multi-window inFlightMs integral, the ESS-gated tCritical must
+            // dominate — test must NOT fire.
+            await realExecutor.run("test", () => realWait(2));
+            await realWait(50);
+            expect(realExecutor.isThroughputDegraded("test")).toBe(false);
+
+            realExecutor.stop();
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
+            vi.setSystemTime(0);
+            currentTime = 0;
+            vi.spyOn(performance, "now").mockImplementation(() => currentTime);
+        }, 15_000);
+
+        test("isThroughputDegraded stays false during stable steady-state load", async () => {
+            executor.registerPool("test", {
+                baselineConcurrency: 5,
+                minimumConcurrency: 2,
+                maximumConcurrency: 50,
+                controlWindow: 100,
+                delayThreshold: 60_000
+            });
+
+            // Build EWMA baseline with 100 stable tasks at constant 50ms duration.
+            for (let i = 0; i < 100; i++) {
+                const p = executor.run("test", () => wait(50));
+                p.catch(() => {});
+            }
+            for (let w = 0; w < 30; w++) {
+                await advance(110);
+            }
+
+            expect(executor.isThroughputDegraded("test")).toBe(false);
+        });
+
         test("flips from decrease to increase when latency trend reverses", async () => {
             vi.useRealTimers();
 
@@ -2849,6 +2996,37 @@ describe("Executor tests", () => {
             expect(fastState.elapsedWindows).toBeGreaterThan(0);
             expect(slowState.elapsedWindows).toBeGreaterThan(0);
         });
+
+        test("lower z-score yields lower critical value at the same df", async () => {
+            // Both pools see the same load; tCritical depends only on z and df.
+            // For matched df, the lower-z pool must have a strictly lower tCritical.
+            // Use real timers + a real-duration workload so state actually populates.
+            vi.useRealTimers();
+            const realExecutor = new Executor({ logger });
+            realExecutor.start();
+            realExecutor.registerPool("sensitive", { zScoreThreshold: 1, baselineConcurrency: 5, controlWindow: 30 });
+            realExecutor.registerPool("relaxed", { zScoreThreshold: 3, baselineConcurrency: 5, controlWindow: 30 });
+
+            const realWait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+            for (let w = 0; w < 25; w++) {
+                const a = Array.from({ length: 5 }, () => realExecutor.run("sensitive", () => realWait(5)));
+                const b = Array.from({ length: 5 }, () => realExecutor.run("relaxed", () => realWait(5)));
+                await Promise.allSettled([...a, ...b]);
+                await realWait(35);
+            }
+
+            const sensitive = realExecutor.getRegulatorState("sensitive");
+            const relaxed = realExecutor.getRegulatorState("relaxed");
+
+            // Critical value at z=1 should be strictly less than at z=3
+            // (Cornish-Fisher inverse-t is monotone increasing in z).
+            expect(sensitive.tCritical).toBeGreaterThan(0);
+            expect(relaxed.tCritical).toBeGreaterThan(sensitive.tCritical);
+
+            realExecutor.stop();
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
+            vi.setSystemTime(0);
+        }, 10_000);
     });
 
     describe("getRegulatorState", () => {
@@ -2879,7 +3057,7 @@ describe("Executor tests", () => {
             expect(state.logW).toBeNull();
             expect(state.logWBar).toBeNull();
             expect(state.dLogWBarEwma).toBeNull();
-            expect(state.dLogWBarSM).toBe(0);
+            expect(state.dLogWBarVarianceEstimate).toBe(0);
             expect(state.ewmaSumW2).toBe(0);
             expect(state.se).toBe(0);
             expect(state.zScore).toBe(0);
@@ -2891,7 +3069,7 @@ describe("Executor tests", () => {
             expect(state.regulationPhase).toBe("Idle");
             expect(state.regulationDepth).toBe(0);
             expect(state.elapsedWindows).toBe(0);
-            expect(state.alpha).toBeGreaterThan(0);
+            expect(state.alpha).toBeNull();
         });
 
         test("throws for nonexistent pool", () => {
@@ -2911,6 +3089,36 @@ describe("Executor tests", () => {
             expect(state.completionRateEwma).not.toBeNull();
             expect(state.inFlightEwma).not.toBeNull();
         });
+
+        test("dLogWBarVarianceEstimate and SE populate after sustained load", async () => {
+            // Use real timers + a real-duration workload so inFlightMs accumulates
+            // and Little's Law produces real W̃ samples.
+            vi.useRealTimers();
+            const realExecutor = new Executor({ logger });
+            realExecutor.start();
+            realExecutor.registerPool("test", { controlWindow: 30, baselineConcurrency: 5 });
+
+            const realWait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+            for (let w = 0; w < 30; w++) {
+                const batch = Array.from({ length: 5 }, () =>
+                    realExecutor.run("test", () => realWait(5))
+                );
+                await Promise.allSettled(batch);
+                await realWait(35);
+            }
+
+            const state = realExecutor.getRegulatorState("test");
+            expect(state.dLogWBarVarianceEstimate).toBeGreaterThan(0);
+            expect(Number.isFinite(state.dLogWBarVarianceEstimate)).toBe(true);
+            // SE = √(σ̂² · W² · (1+W²)/2) where σ̂² = δ²/(1+α/2).
+            const sigmaSq = state.dLogWBarVarianceEstimate / (1 + state.alpha! / 2);
+            const expectedSe = Math.sqrt(sigmaSq * state.ewmaSumW2 * (1 + state.ewmaSumW2) / 2);
+            expect(state.se).toBeCloseTo(expectedSe, 8);
+
+            realExecutor.stop();
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
+            vi.setSystemTime(0);
+        }, 10_000);
     });
 
     describe("Error class hierarchy", () => {

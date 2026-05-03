@@ -46,6 +46,7 @@ type Lane = {
 type DebouncedEntry<T = unknown> = {
     callback: Callback<T>;
     mode: DebounceMode;
+    lane: string;
 };
 
 type Parameters = {
@@ -84,6 +85,12 @@ type Pool = {
     // Throughput monitor state (capacity regulation)
     windowStart: number;
     completionsThisWindow: number;
+    /** Admissions this window — tasks that entered in-flight. Used with
+     *  completions to compute the flow ratio r = admRate/compRate.
+     *  Used as a gate in isLatencyDegrading: when the queue is draining
+     *  (r < 1), we don't trust the latency test regardless of z-score. */
+    admissionsThisWindow: number;
+    admissionRateEwma: number | null;
     completionRateEwma: number | null;
     dropsThisWindow: number;
     dropRateEwma: number | null;
@@ -96,8 +103,9 @@ type Pool = {
     errorRateEwma: number | null;
 
     // Last computed EWMA alpha — stored so query methods can use the
-    // same time-weighted alpha as the control loop.
-    alpha: number;
+    // same time-weighted alpha as the control loop. null until first
+    // window evaluation has run.
+    alpha: number | null;
 
     // Latency detection: EWMA on log(W) + trend z-test.
     // W = ∫N(t)dt / C (operational Little's Law). Shrinkage-dampened
@@ -105,8 +113,9 @@ type Pool = {
     inFlightEwma: number | null;
     lastLogW: number | null; // Raw log(W) from the last completed window
     logWBar: number | null; // EWMA-filtered log(W) level
-    dLogWBarEwma: number | null; // EWMA of dLogWBar rate (trend per window)
-    dLogWBarSM: number; // Second moment of dLogWBar rate (EWMA of x²)
+    dLogWBarEwma: number | null; // EWMA of dLogWBar rate (trend per window), shrunk input
+    dLogWBarVarianceEstimate: number; // EWMA of (v_n − v_{n−1})²/2 — von Neumann's δ² (= MSSD/2), drift-invariant σ² estimator
+    lastDLogWBarRate: number | null; // Previous window's dLogWBarRate (for the δ² pairwise diff)
     ewmaSumW2: number; // Sum of squared EWMA weights (effective sample size)
 
     // Convergent throughput regulator state
@@ -140,22 +149,36 @@ export type RegulatorState = {
     logW: number | null;
     /** EWMA-filtered log(W) level (shrinkage-dampened). */
     logWBar: number | null;
-    /** EWMA of dLogWBar rate (trend signal per window). */
+    /** EWMA of dLogWBar rate (trend signal per window), shrunk input. */
     dLogWBarEwma: number | null;
-    /** Second moment of dLogWBar rate (EWMA of x²) — variance estimate under H0. */
-    dLogWBarSM: number;
+    /** EWMA of (v_n − v_{n−1})²/2 — von Neumann lag-1 variance estimator.
+     *  Unbiased for σ² under both H₀ (no drift) and H₁ (sustained drift):
+     *  drift cancels in pairwise differences, so the noise floor stays
+     *  calibrated regardless of drift state and step transitions. */
+    dLogWBarVarianceEstimate: number;
     /** Sum of squared EWMA weights — effective sample size for time-varying alpha. */
     ewmaSumW2: number;
-    /** Standard error: sqrt(dLogWBarSM × ewmaSumW2). */
+    /** Standard error: sqrt(MSSD/2 × sumW2 / (1 + α/2)). MSSD/2 is von Neumann's
+     *  δ², a drift-invariant σ² estimator; (1 + α/2) corrects for the lag-1
+     *  negative autocorrelation that dLogW inherits as a derivative-of-EWMA. */
     se: number;
-    /** Current z-score: dLogWBarEwma / SE. Degrading when > zScoreThreshold. */
+    /** Current z-statistic: dLogWBarEwma / SE. Degrading when > tCritical. */
     zScore: number;
+    /** Student-t critical value at df = 1/sumW2 − 1 (Cornish-Fisher upper
+     *  bound). At moderate df ≈ Z; at low df diverges, gating the test off
+     *  during warm-up and post-idle. */
+    tCritical: number;
+    /** Firing threshold: tCritical × se. */
+    threshold: number;
     /** Whether the z-test currently detects latency degradation. */
     degrading: boolean;
     /** EWMA of in-flight count. */
     inFlightEwma: number | null;
     /** EWMA of completion rate (completions per window). */
     completionRateEwma: number | null;
+    /** EWMA of admission rate (admissions per window). Used with
+     *  completionRateEwma to form the flow ratio gate in the latency test. */
+    admissionRateEwma: number | null;
     /** EWMA of drop rate (drops per window). */
     dropRateEwma: number | null;
     /** EWMA of error ratio (errors / completions). */
@@ -166,8 +189,8 @@ export type RegulatorState = {
     regulationDepth: number;
     /** Number of elapsed control windows. */
     elapsedWindows: number;
-    /** Last computed EWMA alpha. */
-    alpha: number;
+    /** Last computed EWMA alpha. null until the first window has been evaluated. */
+    alpha: number | null;
 };
 
 export type TaskRunOptions = {
@@ -305,6 +328,11 @@ export class Executor {
     public async run<T>(pool: string, task: () => T, options?: TaskRunOptions): Promise<T> {
         if (!this.running) throw new ExecutorNotRunningError();
         const p = this.getPool(pool);
+        if (options?.lane != null && options.lane.startsWith("_t_")) {
+            throw new ArgumentError(
+                `Lane names starting with "_t_" are reserved for transient lanes. Got: "${options.lane}"`
+            );
+        }
         const laneKey = options?.lane ?? `_t_${this.transientLaneCounter++}`;
 
         await this.enqueueAndWait(p, laneKey);
@@ -335,12 +363,17 @@ export class Executor {
         if (!Number.isFinite(minimumConcurrency) || minimumConcurrency < 1) {
             throw new ArgumentError("minimumConcurrency must be a finite number >= 1.");
         }
-        if (maximumConcurrency < minimumConcurrency) {
-            throw new ArgumentError("maximumConcurrency must be >= minimumConcurrency.");
+        // maximumConcurrency may be Infinity (default), but must not be NaN.
+        if (Number.isNaN(maximumConcurrency) || maximumConcurrency < minimumConcurrency) {
+            throw new ArgumentError("maximumConcurrency must be a number >= minimumConcurrency.");
         }
-        if (baselineConcurrency < minimumConcurrency || baselineConcurrency > maximumConcurrency) {
+        if (
+            !Number.isFinite(baselineConcurrency) ||
+            baselineConcurrency < minimumConcurrency ||
+            baselineConcurrency > maximumConcurrency
+        ) {
             throw new ArgumentError(
-                "baselineConcurrency must be between minimumConcurrency and maximumConcurrency."
+                "baselineConcurrency must be a finite number between minimumConcurrency and maximumConcurrency."
             );
         }
         if (!Number.isFinite(controlWindow) || controlWindow <= 0) {
@@ -378,18 +411,21 @@ export class Executor {
             lastInFlightChangeTime: performance.now(),
             windowStart: performance.now(),
             completionsThisWindow: 0,
+            admissionsThisWindow: 0,
+            admissionRateEwma: null,
             completionRateEwma: null,
             dropsThisWindow: 0,
             dropRateEwma: null,
             elapsedWindows: 0,
             errorsThisWindow: 0,
             errorRateEwma: null,
-            alpha: 1 - Math.exp(-1 / zc.timeConstant),
+            alpha: null,
             inFlightEwma: null,
             lastLogW: null,
             logWBar: null,
             dLogWBarEwma: null,
-            dLogWBarSM: 0,
+            dLogWBarVarianceEstimate: 0,
+            lastDLogWBarRate: null,
             ewmaSumW2: 0,
             regulationDepth: 0,
             regulationPhase: RegulationPhase.Idle,
@@ -411,11 +447,11 @@ export class Executor {
     }
 
     /** Returns whether throughput is degraded (latency worsening).
-     *  Only meaningful after TIME_CONSTANT windows. */
+     *  Warm-up is handled internally by the Student-t critical value:
+     *  small effective sample size → large critical value → cannot fire. */
     public isThroughputDegraded(pool: string): boolean {
         const p = this.pools.get(pool);
         if (!p) throw new ArgumentError(`Pool "${pool}" does not exist.`);
-        if (p.elapsedWindows < this.params(p).timeConstant) return false;
         return this.isLatencyDegrading(p);
     }
 
@@ -449,22 +485,44 @@ export class Executor {
 
         let se = 0;
         let zScore = 0;
-        if (p.dLogWBarEwma !== null && p.dLogWBarSM > 0) {
-            se = Math.sqrt(p.dLogWBarSM * p.ewmaSumW2);
+        let tCritical = 0;
+        let threshold = 0;
+        if (
+            p.dLogWBarEwma !== null &&
+            p.dLogWBarVarianceEstimate > 0 &&
+            p.ewmaSumW2 > 0 &&
+            p.alpha !== null
+        ) {
+            // SE² = σ̂² × W² × (1+W²)/2 — the variance of an EWMA on the
+            // autocorrelated v sequence (ρ_h = −α(1−α)^(h−1)/2 from
+            // first-differencing an AR(1)-like EWMA). The (1+W²)/2 factor
+            // is the autocorrelation variance-reduction. σ̂² = δ²/(1+α/2)
+            // is the unbiased noise estimator (δ² is biased by (1+α/2)
+            // because pairwise diffs have variance 2σ²(1−ρ₁) = 2σ²(1+α/2)).
+            const sigmaSqEstimate = p.dLogWBarVarianceEstimate / (1 + p.alpha / 2);
+            se = Math.sqrt(sigmaSqEstimate * p.ewmaSumW2 * (1 + p.ewmaSumW2) / 2);
             zScore = se > 0 ? p.dLogWBarEwma / se : 0;
+            // df = 1/sumW2 − 1. Student-t widens at low df, gating warm-up.
+            const df = 1 / p.ewmaSumW2 - 1;
+            const { zScoreThreshold } = this.params(p);
+            tCritical = this.tScore(zScoreThreshold, df);
+            threshold = tCritical * se;
         }
 
         return {
             logW: p.lastLogW,
             logWBar: p.logWBar,
             dLogWBarEwma: p.dLogWBarEwma,
-            dLogWBarSM: p.dLogWBarSM,
+            dLogWBarVarianceEstimate: p.dLogWBarVarianceEstimate,
             ewmaSumW2: p.ewmaSumW2,
             se,
             zScore,
+            tCritical,
+            threshold,
             degrading: this.isLatencyDegrading(p),
             inFlightEwma: p.inFlightEwma,
             completionRateEwma: p.completionRateEwma,
+            admissionRateEwma: p.admissionRateEwma,
             dropRateEwma: p.dropRateEwma,
             errorRateEwma: p.errorRateEwma,
             regulationPhase: RegulationPhase[p.regulationPhase],
@@ -479,6 +537,13 @@ export class Executor {
      *
      * - `BeforeExecution`: deduplicate until the task is admitted to run.
      * - `BeforeResult`: deduplicate until the task finishes (success or error).
+     *
+     * **First caller wins.** When multiple callers share a key, only the first
+     * caller's `task` function is ever executed — duplicates receive a promise
+     * wired to the first call's result. To catch accidental misuse, a duplicate
+     * call that passes a different `mode` or `lane` than the original throws
+     * `ArgumentError`. If `mode` and `lane` match, duplicates are silently
+     * merged (the expected debounce behavior).
      */
     public async runDebounced<T>(
         pool: string,
@@ -488,17 +553,36 @@ export class Executor {
     ): Promise<T> {
         if (!this.running) throw new ExecutorNotRunningError();
         const p = this.getPool(pool);
-        const laneKey = options?.lane ?? `_t_${this.transientLaneCounter++}`;
+        if (options?.lane != null && options.lane.startsWith("_t_")) {
+            throw new ArgumentError(
+                `Lane names starting with "_t_" are reserved for transient lanes. Got: "${options.lane}"`
+            );
+        }
         const mode = options?.mode ?? DebounceMode.BeforeExecution;
 
         const existing = p.debounceMap.get(key) as DebouncedEntry<T> | undefined;
         if (existing) {
+            // Detect conflicting mode/lane on duplicate call — silent divergence
+            // would be a footgun (user thinks they set BeforeResult but gets
+            // BeforeExecution because someone else got in first).
+            if (existing.mode !== mode) {
+                throw new ArgumentError(
+                    `runDebounced: conflicting mode for key "${key}" — existing entry uses ${existing.mode}, new call requested ${mode}. Wait for the existing call to settle or use a different key.`
+                );
+            }
+            if (options?.lane != null && options.lane !== existing.lane) {
+                throw new ArgumentError(
+                    `runDebounced: conflicting lane for key "${key}" — existing entry uses lane "${existing.lane}", new call requested "${options.lane}". Wait for the existing call to settle or use a different key.`
+                );
+            }
             return existing.callback.promise;
         }
 
+        const laneKey = options?.lane ?? `_t_${this.transientLaneCounter++}`;
         const entry: DebouncedEntry<T> = {
             callback: createCallback<T>(),
-            mode
+            mode,
+            lane: laneKey
         };
         p.debounceMap.set(key, entry as DebouncedEntry);
 
@@ -692,6 +776,12 @@ export class Executor {
         const target = pool.delayThreshold;
         const now = performance.now();
 
+        // Note: at capacity + non-empty queue, this walk visits every lane
+        // computing sojourn even when we can't admit. This is intentional —
+        // the walk detects the grace → dropping transition, and skipping it
+        // delays drop evaluation. High-tenancy pools (thousands of lanes)
+        // with sustained at-capacity load will pay O(lanes) per call here.
+
         // Adaptive traversal: LIFO among lanes when dropping (newest first —
         // protect fresh traffic), FIFO when healthy (oldest first — fair).
         let current = pool.dropping ? pool.laneTail : pool.laneHead;
@@ -759,6 +849,11 @@ export class Executor {
                 pool.dropCount = 0;
                 pool.dropNext = now;
                 dropRound = true; // First round fires immediately.
+                // Note: traversal direction stays FIFO for the rest of this
+                // invocation (captured at loop entry). Next processQueue call
+                // will use LIFO direction. One iteration's worth of direction
+                // mismatch is harmless — admission still respects capacity,
+                // and ProDel drops apply regardless of lane visit order.
                 this.logger.warn("Queue shedding stale entries — tasks waited too long", {
                     pool: pool.name,
                     sojournMs: Math.round(headSojourn),
@@ -878,7 +973,14 @@ export class Executor {
         pool.lastInFlightChangeTime = now;
         pool.inFlight++;
         lane.inFlight++;
-        this.schedule(() => this.running && entry.callback.resolve());
+        pool.admissionsThisWindow++;
+        // If stop() is called between here and the scheduled callback firing,
+        // reject with ExecutorNotRunningError rather than silently dropping the
+        // promise — otherwise the caller's run() hangs forever.
+        this.schedule(() => {
+            if (this.running) entry.callback.resolve();
+            else entry.callback.reject(new ExecutorNotRunningError());
+        });
     }
 
     /**
@@ -919,6 +1021,19 @@ export class Executor {
      *   4. probabilistic error decrease (P = errorRateEwma)
      *   5. restoring → gradual convergent steps toward baseline
      *   6. idle → at baseline, depth = 0
+     *
+     * **Completion-driven.** This function is only invoked from `executeTask`'s
+     * `finally` block. A pool whose tasks are all stuck (no completions) will
+     * not advance its window state, which means:
+     *   - `elapsedWindows` does not increment.
+     *   - EWMAs (completion rate, error rate, W, dW, V, sumW2) do not decay.
+     *   - `isLatencyDegrading` returns whatever its last-computed state was.
+     *   - The regulator cannot decrease concurrency on a stuck pool.
+     * This is the intended behavior — without data, there's no signal to
+     * regulate on — but callers relying on `isThroughputDegraded` for
+     * backpressure should be aware it won't flip while the pool is fully
+     * stuck. ProDel continues to drop stale queued entries via a separate
+     * timer (`scheduleProcessQueue`).
      */
     private evaluateControlWindow(pool: Pool): void {
         const now = performance.now();
@@ -947,6 +1062,17 @@ export class Executor {
             pool.completionRateEwma = (1 - countAlpha) * pool.completionRateEwma + countAlpha * rate;
         }
 
+        // Update admission rate EWMA — tracked alongside completionRateEwma
+        // so their ratio can be used as a flow-balance gate in the latency
+        // test (see isLatencyDegrading). Uses raw alpha (no shrinkage) since
+        // this is a count-based rate tracked per window, like drops.
+        const admissions = pool.admissionsThisWindow;
+        if (pool.admissionRateEwma === null) {
+            pool.admissionRateEwma = admissions;
+        } else {
+            pool.admissionRateEwma = (1 - alpha) * pool.admissionRateEwma + alpha * admissions;
+        }
+
         // Update drop rate EWMA (for probabilistic early shedding).
         const drops = pool.dropsThisWindow;
         if (pool.dropRateEwma === null) {
@@ -956,18 +1082,15 @@ export class Executor {
         }
         pool.dropsThisWindow = 0;
 
-        // Update error rate EWMA (errors/completions) and its rate of change.
-        // Error rate EWMA — tracked for observability / per-lane context only.
-        // Pool-wide concurrency regulation is driven solely by latency;
-        // per-lane shedding handles error response independently.
+        // Update error rate EWMA (errors/completions). Tracked for observability
+        // and as input to the probabilistic error decrease branch in the
+        // regulation loop. Uses the same countAlpha as completion/drop rates.
         if (pool.completionsThisWindow > 0) {
             const instantErrorRate = pool.errorsThisWindow / pool.completionsThisWindow;
-            const errorAlpha = alpha * windowShrinkage;
-
             if (pool.errorRateEwma === null) {
                 pool.errorRateEwma = instantErrorRate;
             } else {
-                pool.errorRateEwma = (1 - errorAlpha) * pool.errorRateEwma + errorAlpha * instantErrorRate;
+                pool.errorRateEwma = (1 - countAlpha) * pool.errorRateEwma + countAlpha * instantErrorRate;
             }
         }
 
@@ -991,39 +1114,54 @@ export class Executor {
             const logInstantW = Math.log(instantW);
             pool.lastLogW = logInstantW;
 
-            // ── Shrinkage-dampened EWMA on log(W) ──
-            // Smooths log-latency with throughput-aware dampening.
-            // At low throughput, shrinkage reduces the update weight
-            // (fewer completions → noisier W → trust prior more).
+            // ── Shrinkage-dampened EWMA on log(W) (level estimation) ──
+            // Bayesian shrinkage is the conjugate-prior treatment for parameter
+            // estimation: at low throughput, fewer completions → noisier W →
+            // trust prior (current logWBar) more. This is estimation, not
+            // hypothesis testing.
             const shrinkageFactor = this.shrinkage(pool.completionsThisWindow, z2);
 
             if (pool.logWBar === null) {
                 pool.logWBar = logInstantW;
             } else {
                 const previousState = pool.logWBar;
+                // Level EWMA update: shrinkage-dampened only.
                 const levelAlpha = alpha * shrinkageFactor;
                 pool.logWBar = (1 - levelAlpha) * pool.logWBar + levelAlpha * logInstantW;
 
                 // dLogWBar = change in filtered state, normalized by dt.
-                // The EWMA decorrelates consecutive derivatives (vs raw
-                // differencing which has ρ = -0.5 autocorrelation).
                 const dt = elapsed / pool.controlWindow;
                 const dLogWBarRate = (pool.logWBar - previousState) / dt;
                 if (pool.dLogWBarEwma === null) {
+                    // First observation: seed the trend EWMA with the shrunk
+                    // derivative. δ² stays 0; the Student-t critical value
+                    // diverges at small df and gates the test off until enough
+                    // effective samples have accumulated.
                     pool.dLogWBarEwma = dLogWBarRate * shrinkageFactor;
                     pool.ewmaSumW2 = 1; // first observation has weight 1
                 } else {
-                    // Shrink the derivative before feeding it into the trend
-                    // EWMA, but let the second moment see the raw value.
-                    // This intentionally breaks the shrinkage cancellation:
-                    // at low throughput, the signal is dampened while the SE
-                    // stays honest → z is conservative → fewer false positives.
-                    pool.dLogWBarEwma = (1 - alpha) * pool.dLogWBarEwma + alpha * (dLogWBarRate * shrinkageFactor);
-                    pool.dLogWBarSM =
-                        (1 - alpha) * pool.dLogWBarSM + alpha * dLogWBarRate * dLogWBarRate;
+                    // Asymmetric shrinkage on the trend numerator: at low
+                    // throughput (small s) the trend is damped while δ²
+                    // stays honest → z is conservative.
+                    pool.dLogWBarEwma =
+                        (1 - alpha) * pool.dLogWBarEwma + alpha * (dLogWBarRate * shrinkageFactor);
+                    // MSSD/2 = EWMA((v_n − v_{n−1})²/2) — von Neumann's δ²
+                    // estimator. Drift cancels in pairwise differences, so
+                    // it stays calibrated as a σ² estimate regardless of
+                    // drift state. Post-idle (α→1) briefly clobbers the
+                    // estimate with a spurious cross-discontinuity diff, but
+                    // sumW2 → 1 → df → 0 → tCritical → ∞ gates the test
+                    // off that window. Subsequent windows recalibrate via
+                    // normal EWMA dynamics — no special handling needed.
+                    if (pool.lastDLogWBarRate !== null) {
+                        const diff = dLogWBarRate - pool.lastDLogWBarRate;
+                        pool.dLogWBarVarianceEstimate =
+                            (1 - alpha) * pool.dLogWBarVarianceEstimate + alpha * (diff * diff) / 2;
+                    }
                     pool.ewmaSumW2 =
                         (1 - alpha) * (1 - alpha) * pool.ewmaSumW2 + alpha * alpha;
                 }
+                pool.lastDLogWBarRate = dLogWBarRate;
             }
         }
 
@@ -1037,9 +1175,14 @@ export class Executor {
         // Severity encoded through persistence: sustained signal →
         // depth keeps incrementing → steps grow naturally.
         //
+        // Warm-up is handled inside isLatencyDegrading via the Student-t
+        // critical value: at low effective sample size (small df), the
+        // critical value grows large and the test cannot fire spuriously.
+        // No separate elapsedWindows-based guard is needed here.
+        //
         // Phase transitions: Increasing→Retracting (walk back growth),
         // Retracting→Decreasing (fresh ramp), any→Idle (cooling).
-        if (pool.elapsedWindows >= timeConstant && pool.elapsedWindows % timeConstant === 0) {
+        if (pool.elapsedWindows > 0 && pool.elapsedWindows % timeConstant === 0) {
             if (this.isLatencyDegrading(pool)) {
                 this.applyDecrease(pool);
             } else if (
@@ -1055,7 +1198,9 @@ export class Executor {
                 // ±1 of the true equilibrium over O(log L) cycles.
                 pool.regulationPhase = RegulationPhase.Idle;
                 pool.regulationDepth = 0;
-                pool.stepScale *= 0.5;
+                // Floor at 1/L: once stepScale × L = 1, all steps are 1 (the
+                // minimum). Halving below this is wasted state drift.
+                pool.stepScale = Math.max(pool.stepScale * 0.5, 1 / pool.concurrencyLimit);
             } else if (pool.queueLength > 0) {
                 // Queue pressure: increase to meet demand. Only fires when
                 // not in a decrease sequence (Idle, Increasing, or Restoring).
@@ -1109,6 +1254,7 @@ export class Executor {
 
         // Reset window.
         pool.completionsThisWindow = 0;
+        pool.admissionsThisWindow = 0;
         pool.windowStart = now;
     }
 
@@ -1163,26 +1309,77 @@ export class Executor {
 
     /** Bayesian shrinkage factor: n/(n+z²). Weights an observation of n samples
      *  against a prior of z² pseudo-observations. At z=2, n=1: 0.20, n=10: 0.71,
-     *  n=100: 0.96. Connected to Wilson (same denominator). */
+     *  n=100: 0.96. Connected to Wilson (same denominator). Used for parameter
+     *  estimation (level, rates, proportions) — not for the hypothesis test. */
     private shrinkage(n: number, z2: number): number {
         return n / (n + z2);
     }
 
-    /**
-     * Trend z-test: is latency trending upward?
+    /** One-sided Student-t critical value (safe upper bound) at upper-tail
+     *  probability Φ(-z), df ν.
      *
-     * Uses EWMA of dLogWBar (trend) and its second moment for the SE
-     * denominator. Degrading when trend / SE > zScoreThreshold.
+     *  4th-order Cornish-Fisher inverse-t series (Hill 1970):
+     *    t_ν ≈ z + g₁/ν + g₂/ν² + g₃/ν³ + g₄/ν⁴
+     *  Plus an asymptotic-series truncation bound 2·|g₄/ν⁴|. As ν → 0 the
+     *  bound diverges, naturally gating the test off — no clamp needed. */
+    private tScore(z: number, df: number): number {
+        const z2 = z * z;
+        const z4 = z2 * z2;
+        const z6 = z4 * z2;
+        const z8 = z4 * z4;
+        const g1 = (z * (z2 + 1)) / 4;
+        const g2 = (z * (5 * z4 + 16 * z2 + 3)) / 96;
+        const g3 = (z * (3 * z6 + 19 * z4 + 17 * z2 - 15)) / 384;
+        const g4 = (z * (79 * z8 + 776 * z6 + 1482 * z4 - 1920 * z2 - 945)) / 92160;
+        const df2 = df * df;
+        const df3 = df2 * df;
+        const df4 = df3 * df;
+        const tApprox = z + g1 / df + g2 / df2 + g3 / df3 + g4 / df4;
+        const errorBound = 2 * Math.abs(g4 / df4);
+        return tApprox + errorBound;
+    }
+
+    /**
+     * Trend hypothesis test: is latency trending upward?
+     *
+     * H₀: μ_v = 0 (latency stable). H₁: μ_v > 0 (degrading).
+     *
+     * Asymmetric shrinkage construction:
+     *   numerator: v̂ = EWMA(v · s)                 where s = n/(n+Z²) is the per-window shrinkage
+     *   denominator: δ² = EWMA((v_n − v_{n−1})²/2) von Neumann's δ² (= MSSD/2)
+     *   SE = sqrt(δ² × sumW2 / (1 + α/2))
+     *
+     * δ² is unbiased for σ² under both H₀ and H₁: drift cancels in pairwise
+     * differences, so the noise floor stays calibrated regardless of drift
+     * state and step transitions. Decouples noise estimation from trend
+     * estimation.
+     *
+     * Test statistic t = v̂ / SE compared to Student-t critical value at
+     * df = 1/sumW2 − 1. At moderate df ≈ Z; at low df (warm-up, post-idle)
+     * tCritical widens, gating the test continuously. As df → 0 the truncation
+     * bound diverges, gating off entirely.
      */
     private isLatencyDegrading(pool: Pool): boolean {
-        if (pool.dLogWBarEwma === null || pool.dLogWBarSM === 0) return false;
+        if (
+            pool.dLogWBarEwma === null ||
+            pool.dLogWBarVarianceEstimate === 0 ||
+            pool.ewmaSumW2 === 0 ||
+            pool.alpha === null
+        ) {
+            return false;
+        }
+        // SE² = σ̂² × W² × (1+W²)/2 — variance of an EWMA on autocorrelated v
+        // (ρ_h = −α(1−α)^(h−1)/2 from first-differencing an AR(1)-like EWMA).
+        // (1+W²)/2 is the autocorrelation variance-reduction factor.
+        // σ̂² = δ²/(1+α/2) is the unbiased noise estimator: δ² is biased high
+        // by (1+α/2) because pairwise diffs have variance 2σ²(1−ρ₁).
+        const sigmaSqEstimate = pool.dLogWBarVarianceEstimate / (1 + pool.alpha / 2);
+        const se = Math.sqrt(sigmaSqEstimate * pool.ewmaSumW2 * (1 + pool.ewmaSumW2) / 2);
+        if (se === 0) return false;
         const { zScoreThreshold } = this.params(pool);
-        // SE = sqrt(SM × sumW2). SM estimates σ² under H0. sumW2 is the
-        // exact sum of squared EWMA weights — generalizes α/(2-α) to
-        // time-varying α, giving correct effective sample size after
-        // idle gaps and irregular window timing.
-        const se = Math.sqrt(pool.dLogWBarSM * pool.ewmaSumW2);
-        return pool.dLogWBarEwma > zScoreThreshold * se;
+        const df = 1 / pool.ewmaSumW2 - 1;
+        const critical = this.tScore(zScoreThreshold, df);
+        return pool.dLogWBarEwma > critical * se;
     }
 
     /**
