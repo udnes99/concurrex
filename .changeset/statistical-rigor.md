@@ -41,11 +41,11 @@ Live HTTP simulation across 10 scenarios (steady, burst, demand spike, full over
 
 | Variant | FPR (healthy) | TPR (overload) |
 |---|---|---|
-| **NDV+t (this design)** | 0.0–1.5% (steady), 5.9% (localized-errors outlier) | catches Full Overload (14.7%), Backend Backpressure (13.8%), Error-Based Cap Overload (2.2%) |
+| **δ²+t (this design)** | 0.0–1.5% (steady), 5.9% (localized-errors outlier) | catches Full Overload (14.7%), Backend Backpressure (13.8%), Error-Based Cap Overload (2.2%) |
 | Welford-B centered variance | 0.0–0.2% | **misses Full Overload (0%)** and Error-Based Cap Overload (0%) |
 | $S^{(2)}$ raw second moment | 0.0–1.3% | **misses Full Overload (0%)** and Error-Based Cap Overload (0%) |
 
-NDV+t is uniquely sensitive to drift because δ² doesn't absorb the drift level into the noise floor. Centered/uncentered moment estimators inflate under $H_1$, attenuating detection. NDV+t's healthy-state FPR is at or below the nominal $\Phi(-\sigma_D) \approx 2.3\%$ target in 9/10 scenarios; the Localized-Errors outlier reflects genuine pool-wide latency correlation with the failing lane's retries.
+δ²+t is uniquely sensitive to drift because δ² doesn't absorb the drift level into the noise floor. Centered/uncentered moment estimators inflate under $H_1$, attenuating detection. δ²+t's healthy-state FPR is at or below the nominal $\Phi(-\sigma_D) \approx 2.3\%$ target in 9/10 scenarios; the Localized-Errors outlier reflects genuine pool-wide latency correlation with the failing lane's retries.
 
 ## Breaking changes
 
