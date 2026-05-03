@@ -234,7 +234,7 @@ where $n$ is the observation count backing the current window's measurement, and
 
 **Interpretation.** The shrinkage factor $n/(n+Z^2)$ is the optimal Bayesian weight for combining a prior of $Z^2$ pseudo-observations with $n$ new observations. When $n$ is small, the prior dominates and the EWMA update is dampened. When $n$ is large, the observation dominates and the EWMA tracks the signal closely.
 
-**Connection to Wilson score interval.** The Wilson interval's denominator is $n + z^2$ — the same expression. The shrinkage factor is the fraction of the Wilson denominator attributable to data (vs. prior).
+**Connection to Wilson score interval (proportions only).** When the signal is a binomial proportion (pool-wide or per-lane error rate), the shrunk center estimator $(n\hat{p} + 0.5 Z^2)/(n+Z^2)$ is *exactly* the Wilson (1927) interval's center under prior $p_0 = 0.5$. For our other shrunk signals (rates, level $\bar{m}$), the denominator $n + Z^2$ has the same algebraic shape but the underlying conjugate-prior is different (Gamma-Poisson for rates, Normal for the log-W level). So Wilson is the precise frequentist counterpart for the proportion case; for other signals, the connection is "same shrinkage shape, different prior."
 
 **Representative values:**
 

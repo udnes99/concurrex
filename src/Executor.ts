@@ -1309,7 +1309,7 @@ export class Executor {
 
     /** Bayesian shrinkage factor: n/(n+z²). Weights an observation of n samples
      *  against a prior of z² pseudo-observations. At z=2, n=1: 0.20, n=10: 0.71,
-     *  n=100: 0.96. Connected to Wilson (same denominator). Used for parameter
+     *  n=100: 0.96. Used for parameter
      *  estimation (level, rates, proportions) — not for the hypothesis test. */
     private shrinkage(n: number, z2: number): number {
         return n / (n + z2);

@@ -2750,14 +2750,11 @@ describe("Executor tests", () => {
             }
 
             // Mixed traffic: 1 bad lane + 49 good lanes per window.
-            // The bad lane errors every window. With Wilson score interval,
-            // even 1/50 = 2% spread is detected as statistically significant
-            // (Wilson correctly identifies a consistently erroring lane as a
-            // real signal, not noise). The spread-significant branch fires,
-            // causing a modest decrease. However, the decrease is small
-            // because the error rate (dErrorRate) is not increasing — the
-            // spread-significant branch does gentle decreases, not aggressive
-            // ones. Per-lane shedding handles the actual bad lane.
+            // Per-lane shedding fences off the bad lane (its error EWMA rises
+            // above ~50% within a few windows, triggering enqueue-time
+            // rejection). Pool-wide error rate stays low (~2%), so the
+            // probabilistic error decrease branch barely fires. The
+            // throughput regulator should NOT drive concurrency to minimum.
             for (let w = 0; w < ESS * 2; w++) {
                 await advance(110);
                 for (let i = 0; i < 49; i++) {
