@@ -2430,6 +2430,12 @@ describe("Executor tests", () => {
             }
             expect(realExecutor.isThroughputDegraded("test")).toBe(false);
 
+            const preIdleState = realExecutor.getRegulatorState("test");
+            // At steady state, ewmaSumW2 should be small (many effective samples),
+            // and tCritical should be near σ_D = 2.
+            expect(preIdleState.ewmaSumW2).toBeLessThan(0.5);
+            expect(preIdleState.tCritical).toBeLessThan(3);
+
             // Idle for many windows. ewmaSumW2 should reset toward 1 on the
             // next observation (Theorem 9: implicit warm-up).
             await realWait(2000);
@@ -2440,6 +2446,13 @@ describe("Executor tests", () => {
             await realExecutor.run("test", () => realWait(2));
             await realWait(50);
             expect(realExecutor.isThroughputDegraded("test")).toBe(false);
+
+            // Theorem 9 mechanism check: after idle, ewmaSumW2 should have
+            // reset toward 1 (one effective sample), driving tCritical large
+            // via the Cornish-Fisher truncation bound at small df.
+            const postIdleState = realExecutor.getRegulatorState("test");
+            expect(postIdleState.ewmaSumW2).toBeGreaterThan(preIdleState.ewmaSumW2);
+            expect(postIdleState.tCritical).toBeGreaterThan(preIdleState.tCritical);
 
             realExecutor.stop();
             vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
@@ -3070,6 +3083,17 @@ describe("Executor tests", () => {
             expect(state.regulationDepth).toBe(0);
             expect(state.elapsedWindows).toBe(0);
             expect(state.alpha).toBeNull();
+        });
+
+        test("RegulatorState exposes dLogWBarVarianceEstimate (not the v1.1.0 dLogWBarSM)", () => {
+            // Breaking-change protection: the v1.2.0 field rename and semantic
+            // change must not silently regress. Asserts the new field exists
+            // and the old name is absent on the public state shape.
+            executor.registerPool("test");
+            const state = executor.getRegulatorState("test");
+            expect("dLogWBarVarianceEstimate" in state).toBe(true);
+            expect("dLogWBarSM" in state).toBe(false);
+            expect("dLogWBarVariance" in state).toBe(false);
         });
 
         test("throws for nonexistent pool", () => {

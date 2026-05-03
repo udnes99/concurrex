@@ -831,3 +831,93 @@ ProDel never writes to regulator state; the regulator never writes to ProDel sta
 | **Bisection convergence** | Each increase→retract→cooling cycle halves stepScale; $O(\log L)$ cycles to equilibrium (§4.5) |
 | **One-eval cooling** | After a decrease sequence, one time constant evaluation pause before allowing increases; stepScale halved (§4.4.1) |
 | **Log-space robustness** | Log-transform compresses error-spike contamination of latency signal (§4.2) |
+
+---
+
+## Appendix A. Derivation of the Autocorrelation Structure of $v_k$
+
+This appendix derives the autocorrelation $\rho_h$ used in §4.3.1 and the variance reduction factor $(1+W^{(2)})/2$ in the SE formula.
+
+**Setup.** Let $x_k$ be i.i.d. zero-mean noise with variance $\sigma_x^2$ (the per-window log-W observations under $H_0$). The level EWMA is
+
+$$\bar{m}_k = (1-\alpha)\bar{m}_{k-1} + \alpha x_k$$
+
+The trend signal is the first difference
+
+$$v_k = \bar{m}_k - \bar{m}_{k-1} = \alpha(x_k - \bar{m}_{k-1})$$
+
+(The dt-normalization in §4.2.4 is suppressed here; it doesn't affect autocorrelation structure.)
+
+**A.1 Variance of $v_k$ at steady state.**
+
+$$\text{Var}(v_k) = \alpha^2\,\text{Var}(x_k - \bar{m}_{k-1}) = \alpha^2[\sigma_x^2 + \sigma_x^2 W^{(2)}] = \alpha^2 \sigma_x^2 (1 + W^{(2)})$$
+
+(using $\text{Var}(\bar{m}) = \sigma_x^2 W^{(2)}$ and independence of $x_k$ from past $\bar{m}$). With $W^{(2)} = \alpha/(2-\alpha)$ at steady state, this simplifies to $2\alpha^2\sigma_x^2/(2-\alpha)$.
+
+**A.2 Lag-1 autocorrelation $\rho_1 = -\alpha/2$.**
+
+$$\text{Cov}(v_k, v_{k-1}) = \alpha^2\,\text{Cov}(x_k - \bar{m}_{k-1}, x_{k-1} - \bar{m}_{k-2})$$
+
+Expanding the covariance using independence of $x$ from past $\bar{m}$:
+
+$$= \alpha^2[0 - 0 - \alpha\sigma_x^2 + (1-\alpha)\sigma_x^2 W^{(2)}]$$
+
+(The $-\alpha\sigma_x^2$ term comes from $\text{Cov}(\bar{m}_{k-1}, x_{k-1}) = \alpha\sigma_x^2$ since $\bar{m}_{k-1} = \alpha x_{k-1} + (1-\alpha)\bar{m}_{k-2}$. The $(1-\alpha)\sigma_x^2 W^{(2)}$ comes from $\text{Cov}(\bar{m}_{k-1}, \bar{m}_{k-2}) = (1-\alpha)\text{Var}(\bar{m})$.)
+
+Substituting $W^{(2)} = \alpha/(2-\alpha)$ and simplifying:
+
+$$\text{Cov}(v_k, v_{k-1}) = \alpha^2 \sigma_x^2 \cdot \frac{(1-\alpha)\alpha - \alpha(2-\alpha)}{2-\alpha} = -\frac{\alpha^3 \sigma_x^2}{2-\alpha}$$
+
+Therefore
+
+$$\rho_1 = \frac{\text{Cov}(v_k, v_{k-1})}{\text{Var}(v_k)} = \frac{-\alpha^3/(2-\alpha)}{2\alpha^2/(2-\alpha)} = -\frac{\alpha}{2}$$
+
+**A.3 Lag-h generalization $\rho_h = -\alpha(1-\alpha)^{h-1}/2$.**
+
+By the same expansion at lag $h$, the EWMA's geometric decay propagates: $\bar{m}_{k-1}$'s correlation with $\bar{m}_{k-h-1}$ is $(1-\alpha)^{h-1}$ times its lag-1 correlation. The result $\rho_h = -\alpha(1-\alpha)^{h-1}/2$ follows.
+
+**A.4 Variance reduction factor $(1+W^{(2)})/2$.**
+
+The variance of an EWMA over an autocorrelated sequence is
+
+$$\text{Var}(\hat{v}) = \sigma_v^2\left[\sum_j w_j^2 + 2\sum_{h\geq 1}\rho_h \sum_j w_j w_{j+h}\right]$$
+
+For EWMA weights $w_j = \alpha(1-\alpha)^j$ at steady state:
+
+$$\sum_j w_j^2 = W^{(2)} = \frac{\alpha}{2-\alpha}, \qquad \sum_j w_j w_{j+h} = \frac{\alpha(1-\alpha)^h}{2-\alpha}$$
+
+Substituting $\rho_h$ from A.3:
+
+$$2\sum_{h\geq 1} \rho_h \cdot \frac{\alpha(1-\alpha)^h}{2-\alpha} = -\frac{\alpha^2}{2-\alpha} \sum_{h\geq 1}(1-\alpha)^{2h-1} = -\frac{\alpha(1-\alpha)}{(2-\alpha)^2}$$
+
+Combining:
+
+$$\text{Var}(\hat{v}) = \sigma_v^2\left[\frac{\alpha}{2-\alpha} - \frac{\alpha(1-\alpha)}{(2-\alpha)^2}\right] = \frac{\sigma_v^2 \cdot \alpha}{(2-\alpha)^2}$$
+
+Converting via $W^{(2)} = \alpha/(2-\alpha)$, so $\alpha = 2W^{(2)}/(1+W^{(2)})$ and $2-\alpha = 2/(1+W^{(2)})$:
+
+$$\frac{\alpha}{(2-\alpha)^2} = \frac{2W^{(2)}/(1+W^{(2)})}{4/(1+W^{(2)})^2} = \frac{W^{(2)}(1+W^{(2)})}{2}$$
+
+Therefore
+
+$$\text{Var}(\hat{v}) = \sigma_v^2 \cdot W^{(2)} \cdot \frac{1+W^{(2)}}{2}$$
+
+This is the autocorrelation-corrected variance used in §4.3.1's SE formula.
+
+**A.5 δ²'s bias under autocorrelation.**
+
+$$E[\delta^2] = E\left[\frac{(v_k - v_{k-1})^2}{2}\right] = \frac{2\sigma_v^2 - 2\text{Cov}(v_k, v_{k-1})}{2} = \sigma_v^2(1 - \rho_1) = \sigma_v^2(1 + \alpha/2)$$
+
+So $\hat\sigma_v^2 = \delta^2/(1+\alpha/2)$ is unbiased for $\sigma_v^2$ under both $H_0$ and $H_1$ (drift cancels in pairwise differences — see Theorem 8).
+
+## Appendix B. Reproducibility of the v1.2.0 Empirical Bench
+
+The bench numbers cited in `.changeset/statistical-rigor.md` and §4.2.6 were produced by:
+
+```
+npx tsx simulations/simulation-live.ts
+```
+
+This runs an HTTP backend on `localhost:9877` and exercises 10 workload scenarios against the executor (steady state, burst absorption, latency step change, demand spike, full overload, gradual ramp, backend backpressure, error scenarios). Output is `simulations/simulation-live.json` and `.html` (gitignored — re-generated each run).
+
+Run-to-run variance is significant (~5pp on healthy-state FPR per scenario) due to OS scheduling, GC, and HTTP queueing on localhost. The cited numbers are representative single runs; for definitive comparisons, average 5–10 runs.
