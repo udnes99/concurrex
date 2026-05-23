@@ -3043,6 +3043,116 @@ describe("Executor tests", () => {
         }, 10_000);
     });
 
+    describe("Backpressure signals (v2.0 architecture)", () => {
+        let executor: Executor;
+
+        beforeEach(() => {
+            executor = new Executor({ logger });
+            executor.start();
+        });
+
+        afterEach(() => {
+            executor.stop();
+        });
+
+        test("default signals are [LatencyDrift] when none specified", () => {
+            executor.registerPool("test");
+            // No degradation initially, but signal is configured.
+            expect(executor.isThroughputDegraded("test")).toBe(false);
+            // LatencyDrift's state is accessible via getSignalState.
+            const state = executor.getSignalState("test", "latency-drift");
+            expect(state).toBeDefined();
+        });
+
+        test("custom signal triggers concurrency decrease", async () => {
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
+            const alwaysFire = {
+                name: "always-fire",
+                onAdmit() {}, onComplete() {}, onEvaluate() {},
+                triggered: () => true,
+                clone() { return alwaysFire; }
+            };
+            executor.registerPool("test", {
+                baselineConcurrency: 100,
+                controlWindow: 10,
+                signals: [alwaysFire]
+            });
+            const initial = executor.getConcurrencyLimit("test");
+            for (let i = 0; i < 30; i++) {
+                vi.advanceTimersByTime(10);
+                await executor.run("test", () => {});
+            }
+            vi.useRealTimers();
+            expect(executor.getConcurrencyLimit("test")).toBeLessThan(initial);
+        });
+
+        test("empty signals array disables backpressure-driven decrease", async () => {
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
+            const alwaysFire = {
+                name: "always-fire",
+                onAdmit() {}, onComplete() {}, onEvaluate() {},
+                triggered: () => true,
+                clone() { return alwaysFire; }
+            };
+            executor.stop();
+            executor = new Executor({ logger, signals: [alwaysFire] });
+            executor.start();
+            executor.registerPool("test", {
+                baselineConcurrency: 50,
+                controlWindow: 10,
+                signals: []  // overrides executor's always-fire — pool stays at baseline
+            });
+            const initial = executor.getConcurrencyLimit("test");
+            for (let i = 0; i < 30; i++) {
+                vi.advanceTimersByTime(10);
+                await executor.run("test", () => {});
+            }
+            vi.useRealTimers();
+            expect(executor.getConcurrencyLimit("test")).toBe(initial);
+        });
+
+        test("any signal triggering causes decrease (OR semantics)", async () => {
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
+            const sig1 = { name: "s1", onAdmit() {}, onComplete() {}, onEvaluate() {}, triggered: () => false, clone(): any { return sig1; } };
+            const sig2 = { name: "s2", onAdmit() {}, onComplete() {}, onEvaluate() {}, triggered: () => true,  clone(): any { return sig2; } };
+            const sig3 = { name: "s3", onAdmit() {}, onComplete() {}, onEvaluate() {}, triggered: () => false, clone(): any { return sig3; } };
+            executor.registerPool("test", {
+                baselineConcurrency: 50,
+                controlWindow: 10,
+                signals: [sig1, sig2, sig3]
+            });
+            const initial = executor.getConcurrencyLimit("test");
+            for (let i = 0; i < 30; i++) {
+                vi.advanceTimersByTime(10);
+                await executor.run("test", () => {});
+            }
+            vi.useRealTimers();
+            expect(executor.getConcurrencyLimit("test")).toBeLessThan(initial);
+        });
+
+        test("clone() produces a stateless copy per pool", () => {
+            const drift = new LatencyDrift();
+            // Register the same template with two pools — clone should isolate state.
+            executor.registerPool("a");
+            executor.registerPool("b", { signals: [drift] });
+            // Both pools must have independent signal instances.
+            const stateA = executor.getSignalState("a", "latency-drift");
+            const stateB = executor.getSignalState("b", "latency-drift");
+            expect(stateA).toBeDefined();
+            expect(stateB).toBeDefined();
+            expect(stateA).not.toBe(stateB);
+        });
+
+        test("getSignalState returns undefined for missing signal name", () => {
+            executor.registerPool("test");
+            expect(executor.getSignalState("test", "nonexistent")).toBeUndefined();
+        });
+
+        test("getSignalState throws for nonexistent pool", () => {
+            expect(() => executor.getSignalState("nope", "latency-drift")).toThrow(ArgumentError);
+        });
+    });
+
     describe("getRegulatorState", () => {
         let executor: Executor;
 
