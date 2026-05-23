@@ -200,6 +200,15 @@ Early shed handles the **flow rate** (preventing queue growth); ProDel handles t
 
 ## 4. Throughput Regulator
 
+The throughput regulator does not implement detection logic itself. It computes a single statistical *heartbeat* — `currentAlpha`, `ewmaSumW2`, `df`, `bayesianShrinkage` — derived from the pool's `zScoreThreshold`, and exposes it via `RegulatorContext`. Pluggable *signals* observe raw task events through lifecycle hooks (`onAdmit`, `onComplete`, `onEvaluate`) and decide when to fire (`triggered`). When any signal fires, the regulator applies a concurrency decrease.
+
+The architecture is two layers:
+
+- **Pool / Executor**: computes the heartbeat (§4.1) and provides shared `Statistics.*` primitives (§4.1.1). One heartbeat per pool — every signal sees the same α, ESS, df, derived from the same single `zScoreThreshold`.
+- **Signal**: owns its observation stream (per-pool state, cloned via `signal.clone()` at registration). Implements `triggered(ctx)` by composing the heartbeat + `Statistics.*` primitives.
+
+The built-in `LatencyDrift` signal is the v1.x trend test now expressed as a first-class signal. It composes the heartbeat with its own operational-Little's-Law integral and inline EWMAs (§4.2). Multiple signals on the same pool combine with OR semantics; joint FPR is bounded by Bonferroni (§4.3.2).
+
 ### 4.1 EWMA with Time-Weighted Smoothing
 
 **Definition.** The smoothing factor for window $k$ with actual elapsed time $\Delta t_k$ is:
@@ -523,15 +532,28 @@ Each signal is classified by whether it's an *estimation* problem (shrinkage) or
 
 Only one signal in the system is a hypothesis test, and Student-t applies there alone. Bayesian shrinkage applies wherever a *parameter* is estimated — including the trend numerator (asymmetrically: numerator dampened, denominator δ² unshrunk).
 
-#### 4.3.2 Probabilistic Error Decrease
+#### 4.3.2 Composing Multiple Signals — Joint FPR Bound (Bonferroni)
 
-Pool-wide error detection (error spread significance, dErrorRate z-test) has been removed. Error response is now handled by two independent mechanisms:
+When a pool has $N$ signals participating in the statistical framework (each individually satisfying FPR $\leq \Phi(-\sigma_D)$ under $H_0$), and the regulator fires whenever *any* signal triggers (OR composition), the joint FPR is upper-bounded by Bonferroni:
 
-1. **Per-lane shedding** (§4.3.1.1): filters localized errors at the lane level. One bad downstream dependency causes its lane's error rate EWMA to rise, shedding requests to that lane without affecting pool-wide concurrency.
+$$P(\text{any signal fires} \mid H_0) \leq \sum_{i=1}^{N} \Phi(-\sigma_{D,i}) \leq N \cdot \Phi(-\sigma_D)$$
 
-2. **Probabilistic error decrease** (§4.4.1, branch 4): when the pool-wide `errorRateEwma` $\hat{E} > 0$ and $\text{rand}() < \hat{E}$, the regulator applies a decrease step. Per-lane shedding keeps the aggregate error rate low for localized failures, so `errorRateEwma` only rises significantly for systemic issues (errors across many lanes). At 2% aggregate errors, the decrease fires on ~2% of time constant evaluations — barely noticeable. At 80% errors, it fires on most evaluations — aggressive correction. The probability self-scales to match error severity.
+For independent signals, the exact joint FPR is given by Šidák:
 
-**Why this replaces pool-wide error detection.** The previous design used error spread (proportion of lanes with errors) and dErrorRate (trend in error ratio) to detect systemic errors. This required tracking `laneKeysCompletedThisWindow`, `laneKeysErroredThisWindow`, `errorSpreadEwma`, `activeLanesEwma`, `dErrorRateEwma`, and `dErrorRateVariance`. The new design achieves the same goal — decreasing concurrency for systemic errors while ignoring localized ones — with zero additional state. Per-lane shedding naturally filters localized errors, so the aggregate `errorRateEwma` is already a reliable systemic signal.
+$$P(\text{any signal fires} \mid H_0) = 1 - \prod_{i=1}^{N}\bigl(1 - \Phi(-\sigma_{D,i})\bigr) \leq N \cdot \Phi(-\sigma_D)$$
+
+(Bonferroni is the union bound; Šidák is tighter for independent tests. Both reduce to $\Phi(-\sigma_D)$ at $N=1$.)
+
+**At the framework's default $\sigma_D = 2$**:
+- $N=1$ signal: joint FPR $\leq 0.023$
+- $N=2$: joint FPR $\leq 0.046$
+- $N=3$: joint FPR $\leq 0.069$
+
+If users want joint FPR $\leq \alpha$ across $N$ statistical signals, they Bonferroni-correct by setting per-signal $\sigma_{D,i} = \Phi^{-1}(1 - \alpha/N)$. For target $\alpha = 0.023$ with $N=3$: $\sigma_D = 2.42$.
+
+**Caveat — "statistical" vs heuristic signals.** The joint FPR bound applies only to signals that participate in the framework (i.e., compose their hypothesis test using the pool's heartbeat). Heuristic signals (predicate-only, e.g., `MemoryPressure`) fire whenever their condition is met — they have no inherent FPR guarantee and are not included in the Bonferroni count.
+
+**Probabilistic error response (opt-in).** v1.x had a hardcoded branch firing with $P = \texttt{errorRateEwma}$. In v2.0 this is the opt-in `ProbabilisticErrorRate` signal — predicate-only, not a hypothesis test, so it's not subject to the Bonferroni bound. Users opting into it should be aware their pool's "auto-decrease" responses include this non-statistical mechanism.
 
 **Theorem 7 (Upper-bounded false positive rate).** *Under the following assumptions:*
 - *constant $\alpha$ at steady state (or smooth time-varying $\alpha$ as a first-order approximation),*
