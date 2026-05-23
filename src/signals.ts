@@ -2,49 +2,58 @@
  * Pluggable backpressure signals.
  *
  * The throughput regulator does not implement detection logic itself —
- * it only orchestrates raw task events (admissions, completions, window
- * boundaries) and asks each pool's signals whether they want a decrease.
+ * it computes the statistical heartbeat (α, ESS, df, shrinkage from the
+ * pool's `zScoreThreshold`) and exposes it via `RegulatorContext`.
+ * Each signal observes raw task events through lifecycle hooks and
+ * decides whether to fire via `triggered()`.
  *
- * Every detection statistic lives inside a `Signal` implementation. The
- * built-in `LatencyDrift` carries the full operational-Little's-Law +
- * EWMA + δ² + Student-t pipeline; users can write any custom signal that
- * fits their workload (deadline pressure, memory limits, downstream
- * health, etc.).
+ * Signals own their per-pool state (cloned at `registerPool`) and use
+ * `Statistics.*` utilities for shared mathematical building blocks
+ * (tScore, time-weighted α, Bayesian shrinkage, autocorrelation-
+ * corrected SE).
  *
- * # Signal lifecycle
+ * # Built-in signals
  *
- *   1. Constructed by the user with options.
- *   2. Cloned by the executor at `registerPool` — the user's instance is
- *      a template; the cloned instance owns the per-pool state.
- *   3. Receives lifecycle hooks: `onAdmit`, `onComplete`, `onEvaluate`.
- *   4. Asked `triggered(ctx)` once per regulator evaluation cycle.
+ * - `LatencyDrift` — the v1.x latency-trend Student-t test, now a
+ *   first-class signal that composes the framework's primitives.
+ * - `ErrorRateThreshold` — fires when `errorRateEwma > threshold`.
+ * - `ProbabilisticErrorRate` — fires with `P = errorRateEwma`. Preserves
+ *   the v1.2 default behavior; opt-in for v2.0+.
  *
- * # Why clone?
+ * # Custom signals
  *
- * Stateful signals must not share state across pools — two pools sharing
- * a `LatencyDrift` instance would interleave their EWMAs into garbage.
- * The `clone()` contract resets all accumulated state while preserving
- * options, so the same template can be safely registered with multiple
- * pools.
+ * Implement `Signal` directly. The simplest signal is a predicate; the
+ * richest is a statistical hypothesis test using the framework's
+ * heartbeat — see `LatencyDrift` for the canonical pattern.
  */
 
 import { ArgumentError } from "./errors.js";
+import { Statistics } from "./statistics.js";
 
 // ── Types ────────────────────────────────────────────────────────────
 
-/** Snapshot of pool state passed to every signal hook. Frozen — must not be mutated. */
+/** Frozen snapshot of pool state passed to every signal hook. */
 export interface SignalContext {
     readonly pool: string;
     readonly concurrencyLimit: number;
     readonly inFlight: number;
     readonly queueLength: number;
-    /** General-purpose regulator metrics (rate EWMAs, regulation phase, etc.).
-     *  Signal-specific state lives inside the signal itself, not here. */
+    /** General-purpose metrics + the statistical framework's heartbeat. */
     readonly regulator: RegulatorContext;
 }
 
-/** General-purpose regulator metrics shared across all signals. */
+/**
+ * General-purpose regulator metrics + the heartbeat of the statistical
+ * framework. The heartbeat is computed once per evaluation by the
+ * executor and is the same for every signal on the pool — there is one
+ * α, one ESS, one df, one shrinkage per pool, derived from the pool's
+ * single `zScoreThreshold`.
+ *
+ * Signals use these to compose their own hypothesis test (typically
+ * a Student-t trend test on a signal-specific observation stream).
+ */
 export interface RegulatorContext {
+    // ── General-purpose metrics ──
     readonly completionRateEwma: number | null;
     readonly admissionRateEwma: number | null;
     readonly dropRateEwma: number | null;
@@ -53,9 +62,26 @@ export interface RegulatorContext {
     readonly regulationPhase: string;
     readonly regulationDepth: number;
     readonly elapsedWindows: number;
+
+    // ── Statistical heartbeat ──
+    /** Single z-score threshold for the whole control loop. */
     readonly zScoreThreshold: number;
+    /** z² — the Bayesian prior strength in pseudo-observations. */
+    readonly z2: number;
+    /** EWMA time constant in control windows. Also the regulator's
+     *  decision cadence (decisions are made every `timeConstant` windows). */
     readonly timeConstant: number;
+    /** Control window length in milliseconds. */
     readonly controlWindow: number;
+    /** Time-weighted α for the current evaluation: α = 1 − exp(−Δt/(τ·CW)). */
+    readonly currentAlpha: number;
+    /** Bayesian shrinkage for the current window: r / (r + z²). */
+    readonly bayesianShrinkage: number;
+    /** Effective sample size tracker: Σw² updated via the EWMA-weights
+     *  recursion (1−α)²·prev + α². */
+    readonly ewmaSumW2: number;
+    /** Satterthwaite degrees of freedom: 1/W^(2) − 1. */
+    readonly df: number;
 }
 
 export interface AdmitInfo {
@@ -74,8 +100,7 @@ export interface CompletionInfo {
 export interface EvaluateInfo {
     readonly windowStart: number;
     readonly windowEnd: number;
-    /** Elapsed wall-clock time since `windowStart`. May exceed `controlWindow`
-     *  on idle pools where evaluation is delayed until the next event. */
+    /** Elapsed wall-clock time since `windowStart`. */
     readonly elapsed: number;
     readonly completions: number;
     readonly admissions: number;
@@ -84,307 +109,186 @@ export interface EvaluateInfo {
 /**
  * A pluggable backpressure signal.
  *
- * The regulator iterates each pool's signals once per evaluation cycle.
- * If any returns `triggered() === true`, the regulator applies a
- * concurrency decrease. Composition is implicit OR — wrap inside a
- * custom `Signal` to express AND or weighted combinations.
+ * The regulator iterates each pool's signals once per evaluation cycle
+ * (every `timeConstant` windows). If any signal returns `triggered() ===
+ * true`, the regulator applies a concurrency decrease. Multiple signals
+ * compose with OR semantics.
+ *
+ * Stateful signals must not share state across pools — implement
+ * `clone()` to return a fresh, stateless copy. The user's original
+ * instance is a template; the executor clones it per pool.
  */
 export interface Signal {
-    /** Stable identifier — used in diagnostics and `getSignalState(pool, name)`. */
+    /** Stable identifier — used in diagnostics, logs, `getSignalState`. */
     readonly name: string;
 
-    /** Create a fresh, stateless copy.
-     *
-     *  The clone must:
-     *    - retain configuration (constructor options) of the original
-     *    - reset all accumulated state (EWMAs, counters, internal buffers)
-     *
-     *  Called by the executor when binding the signal to a pool. The user's
-     *  original instance is a template; the cloned instance receives all
-     *  lifecycle hooks. */
-    clone(): Signal;
-
     /** Called once per task admission, just after `inFlight++`. */
-    onAdmit?(ctx: SignalContext, info: AdmitInfo): void;
+    onAdmit(ctx: SignalContext, info: AdmitInfo): void;
 
-    /** Called once per task completion, just after `inFlight--` (success or error). */
-    onComplete?(ctx: SignalContext, info: CompletionInfo): void;
+    /** Called once per task completion, just after `inFlight--`. */
+    onComplete(ctx: SignalContext, info: CompletionInfo): void;
 
-    /** Called at every control-window boundary. The signal's window-aggregated
-     *  computations (EWMA updates, derivative computation) typically live here. */
-    onEvaluate?(ctx: SignalContext, info: EvaluateInfo): void;
+    /** Called at every control-window boundary. The signal's window-
+     *  aggregated computations (EWMA updates, derivative computation,
+     *  noise floor updates) typically live here. */
+    onEvaluate(ctx: SignalContext, info: EvaluateInfo): void;
 
     /** Decide whether the signal is currently triggered. Called every
      *  `timeConstant` regulation cycles. */
     triggered(ctx: SignalContext): boolean;
+
+    /** Create a fresh, stateless copy. The clone must retain
+     *  configuration but reset accumulated state. Called by the executor
+     *  when binding the signal to a pool. */
+    clone(): Signal;
 
     /** Optional: expose internal state for diagnostics. Returned by
      *  `executor.getSignalState(pool, name)`. */
     state?(): Record<string, unknown>;
 }
 
-// ── Base class for ergonomic custom signals ──────────────────────────
+// ── LatencyDrift — the canonical statistical signal ──────────────────
 
 /**
- * Convenience base for `Signal` implementations. Captures `options` and
- * implements `clone()` automatically by re-instantiating with the same options.
+ * Latency-trend Student-t hypothesis test (the v1.x detection mechanism,
+ * now a first-class signal).
  *
- * @example
- * class MySignal extends BaseSignal<{ threshold: number }> {
- *     name = "my-signal";
- *     private count = 0;
- *
- *     onComplete(ctx, info) {
- *         if (info.serviceTime > this.options.threshold) this.count++;
- *     }
- *
- *     triggered() { return this.count > 5; }
- * }
- *
- * // clone() is inherited; uses `new MySignal(this.options)`.
- */
-export abstract class BaseSignal<O = unknown> implements Signal {
-    public abstract readonly name: string;
-
-    constructor(protected readonly options: O) {}
-
-    public clone(): Signal {
-        // The constructor of the concrete subclass is invoked with the
-        // same options. Subclasses with non-trivial state should reset
-        // it in their own constructor.
-        const Ctor = this.constructor as new (o: O) => Signal;
-        return new Ctor(this.options);
-    }
-
-    public abstract triggered(ctx: SignalContext): boolean;
-}
-
-// ── LatencyDrift: the v1.x trend test, now self-contained ────────────
-
-/**
- * Options for {@link LatencyDrift}. Defaults are derived from the pool's
- * `zScoreThreshold` (`ctx.regulator.zScoreThreshold`) when not specified.
- */
-export interface LatencyDriftOptions {
-    /** Override the pool's zScoreThreshold for this signal's noise floor.
-     *  When omitted, the signal reads it from `ctx.regulator.zScoreThreshold`
-     *  on first use (so most users set it once at the pool level). */
-    zScoreThreshold?: number;
-}
-
-/**
- * Latency-trend hypothesis test (the v1.x mechanism).
- *
- * **Pipeline (per `docs/THEORY.md` §4.2)**:
+ * **Pipeline** (per `docs/THEORY.md` §4.2):
  *   1. Operational Little's Law: W̃ = ∫N(t)dt / r per window
  *   2. Log transform: m_k = log W̃_k
  *   3. Level EWMA on logW with Bayesian shrinkage
  *   4. dt-normalized derivative dLogW
  *   5. Trend EWMA with asymmetric shrinkage on input
  *   6. von Neumann's δ² noise estimator (drift-invariant)
- *   7. Effective sample size via exact W² recursion
+ *
+ * Uses the pool's heartbeat (α, ESS, df, shrinkage from `ctx.regulator`)
+ * — no signal-local statistical parameters.
  *
  * **Test**: `t = v̂ / SE` against the Cornish-Fisher Student-t critical
- * value at df = 1/W² − 1. SE² = δ² · W² · (1+W²) / (2·(1+α/2)).
+ * value at df = 1/W^(2) − 1.
  *
  * **State** (all reset on `clone()`):
- *   - `inFlightMs`, `lastInFlightChangeTime`, `inFlight` — operational LL integral
- *   - `windowStart` — current window's start time
- *   - `logWBar`, `dLogWBarEwma`, `dLogWBarVarianceEstimate`, `lastDLogWBarRate`
- *   - `ewmaSumW2`, `alpha`
+ *   - `inFlight`, `inFlightMs`, `lastInFlightChange` — operational LL integral
+ *   - `logWBar`, `dLogWBarEwma`, `dLogWBarVarEst`, `lastDLogWBarRate`
  */
 export class LatencyDrift implements Signal {
     public readonly name = "latency-drift";
-    private readonly options: LatencyDriftOptions;
 
-    // Operational Little's Law integral state
+    // ── Operational Little's Law integral ──
     private inFlight = 0;
     private inFlightMs = 0;
-    private lastInFlightChangeTime: number | null = null;
+    private lastInFlightChange: number | null = null;
 
-    // Window tracking
-    private windowStart: number | null = null;
-
-    // Latency-trend pipeline state
-    private lastLogW: number | null = null;
+    // ── Latency-trend pipeline state ──
     private logWBar: number | null = null;
     private dLogWBarEwma: number | null = null;
-    private dLogWBarVarianceEstimate = 0;
+    private dLogWBarVarEst = 0;
     private lastDLogWBarRate: number | null = null;
-    private ewmaSumW2 = 0;
-    private alpha: number | null = null;
-
-    // Cached test outputs (computed in onEvaluate; read by triggered())
-    private currentSe = 0;
-    private currentZScore = 0;
-    private currentTCritical = 0;
-    private currentThreshold = 0;
-    private currentlyDegrading = false;
-
-    // Derived parameters (resolved on first hook from ctx.regulator)
-    private resolvedZ: number | null = null;
-    private resolvedZ2 = 0;
-    private resolvedTimeConstant = 0;
-
-    constructor(options: LatencyDriftOptions = {}) {
-        if (options.zScoreThreshold !== undefined) {
-            if (!Number.isFinite(options.zScoreThreshold) || options.zScoreThreshold <= 0) {
-                throw new ArgumentError("LatencyDrift.zScoreThreshold must be a finite number > 0.");
-            }
-            this.resolvedZ = options.zScoreThreshold;
-            this.resolvedZ2 = options.zScoreThreshold * options.zScoreThreshold;
-            this.resolvedTimeConstant = computeTimeConstant(options.zScoreThreshold);
-        }
-        this.options = { ...options };
-    }
-
-    public clone(): LatencyDrift {
-        return new LatencyDrift(this.options);
-    }
-
-    public state(): Record<string, unknown> {
-        return {
-            logW: this.lastLogW,
-            logWBar: this.logWBar,
-            dLogWBarEwma: this.dLogWBarEwma,
-            dLogWBarVarianceEstimate: this.dLogWBarVarianceEstimate,
-            ewmaSumW2: this.ewmaSumW2,
-            alpha: this.alpha,
-            se: this.currentSe,
-            zScore: this.currentZScore,
-            tCritical: this.currentTCritical,
-            threshold: this.currentThreshold,
-            degrading: this.currentlyDegrading
-        };
-    }
 
     public onAdmit(_ctx: SignalContext, info: AdmitInfo): void {
-        this.advanceIntegral(info.admitTime);
+        if (this.lastInFlightChange !== null) {
+            this.inFlightMs += this.inFlight * (info.admitTime - this.lastInFlightChange);
+        }
+        this.lastInFlightChange = info.admitTime;
         this.inFlight++;
     }
 
     public onComplete(_ctx: SignalContext, info: CompletionInfo): void {
-        this.advanceIntegral(info.completionTime);
+        if (this.lastInFlightChange !== null) {
+            this.inFlightMs += this.inFlight * (info.completionTime - this.lastInFlightChange);
+        }
+        this.lastInFlightChange = info.completionTime;
         this.inFlight--;
     }
 
     public onEvaluate(ctx: SignalContext, info: EvaluateInfo): void {
-        // Resolve parameters from the context on first call.
-        if (this.resolvedZ === null) {
-            this.resolvedZ = ctx.regulator.zScoreThreshold;
-            this.resolvedZ2 = this.resolvedZ * this.resolvedZ;
-            this.resolvedTimeConstant = ctx.regulator.timeConstant;
-        }
-
-        // Initialize windowStart on first call.
-        if (this.windowStart === null) {
-            this.windowStart = info.windowStart;
-        }
-
-        // Time-weighted EWMA alpha.
-        const cw = ctx.regulator.controlWindow;
-        const alpha = 1 - Math.exp(-info.elapsed / (this.resolvedTimeConstant * cw));
-        this.alpha = alpha;
+        const { currentAlpha, bayesianShrinkage, controlWindow } = ctx.regulator;
 
         // Close out the in-flight integral at the window boundary.
-        this.advanceIntegral(info.windowEnd);
+        if (this.lastInFlightChange !== null) {
+            this.inFlightMs += this.inFlight * (info.windowEnd - this.lastInFlightChange);
+            this.lastInFlightChange = info.windowEnd;
+        }
 
-        // Compute instantW per Little's Law and update the trend pipeline.
-        if (info.completions > 0 && this.inFlightMs > 0) {
-            const instantW = this.inFlightMs / info.completions;
-            const logInstantW = Math.log(instantW);
-            this.lastLogW = logInstantW;
+        // Operational Little's Law: W̃ = ∫N(t)dt / r — skipped on
+        // empty windows. inFlightMs resets either way.
+        if (info.completions === 0 || this.inFlightMs === 0) {
+            this.inFlightMs = 0;
+            return;
+        }
 
-            // Bayesian shrinkage on the level update.
-            const shrinkage = info.completions / (info.completions + this.resolvedZ2);
+        const W = this.inFlightMs / info.completions;
+        const logInstantW = Math.log(W);
 
-            if (this.logWBar === null) {
-                this.logWBar = logInstantW;
+        // Level EWMA on logW with Bayesian shrinkage on input.
+        const levelAlpha = currentAlpha * bayesianShrinkage;
+        const previousLogWBar = this.logWBar;
+        if (this.logWBar === null) {
+            this.logWBar = logInstantW;
+        } else {
+            this.logWBar = (1 - levelAlpha) * this.logWBar + levelAlpha * logInstantW;
+        }
+
+        // dt-normalized derivative + trend EWMA + δ² update.
+        if (previousLogWBar !== null) {
+            const dt = info.elapsed / controlWindow;
+            const dLogWBarRate = (this.logWBar - previousLogWBar) / dt;
+
+            if (this.dLogWBarEwma === null) {
+                // Seed the trend EWMA with the shrunk derivative.
+                this.dLogWBarEwma = dLogWBarRate * bayesianShrinkage;
             } else {
-                const previousLogWBar = this.logWBar;
-                const levelAlpha = alpha * shrinkage;
-                this.logWBar = (1 - levelAlpha) * this.logWBar + levelAlpha * logInstantW;
-
-                // dt-normalized derivative.
-                const dt = info.elapsed / cw;
-                const dLogWBarRate = (this.logWBar - previousLogWBar) / dt;
-
-                if (this.dLogWBarEwma === null) {
-                    // First sample: seed the trend EWMA with shrunk derivative.
-                    this.dLogWBarEwma = dLogWBarRate * shrinkage;
-                    this.ewmaSumW2 = 1;
-                } else {
-                    // Asymmetric shrinkage on the trend numerator.
-                    this.dLogWBarEwma =
-                        (1 - alpha) * this.dLogWBarEwma + alpha * (dLogWBarRate * shrinkage);
-
-                    // δ² = MSSD/2: drift-invariant via pairwise differences.
-                    if (this.lastDLogWBarRate !== null) {
-                        const diff = dLogWBarRate - this.lastDLogWBarRate;
-                        this.dLogWBarVarianceEstimate =
-                            (1 - alpha) * this.dLogWBarVarianceEstimate +
-                            (alpha * diff * diff) / 2;
-                    }
-
-                    // Effective sample size: Σw² recursion.
-                    this.ewmaSumW2 = (1 - alpha) * (1 - alpha) * this.ewmaSumW2 + alpha * alpha;
-                }
-                this.lastDLogWBarRate = dLogWBarRate;
+                // Asymmetric shrinkage on the trend numerator.
+                this.dLogWBarEwma =
+                    (1 - currentAlpha) * this.dLogWBarEwma +
+                    currentAlpha * (dLogWBarRate * bayesianShrinkage);
             }
+
+            // δ² = EWMA((v_n − v_{n−1})²/2) — von Neumann's lag-1 variance estimator.
+            // Drift-invariant: pairwise differences cancel sustained drift.
+            if (this.lastDLogWBarRate !== null) {
+                const diff = dLogWBarRate - this.lastDLogWBarRate;
+                this.dLogWBarVarEst =
+                    (1 - currentAlpha) * this.dLogWBarVarEst +
+                    (currentAlpha * diff * diff) / 2;
+            }
+            this.lastDLogWBarRate = dLogWBarRate;
         }
 
-        // Reset for next window.
         this.inFlightMs = 0;
-        this.windowStart = info.windowEnd;
-
-        // Refresh cached test outputs.
-        this.recomputeTestOutputs();
     }
 
-    public triggered(_ctx: SignalContext): boolean {
-        return this.currentlyDegrading;
+    public triggered(ctx: SignalContext): boolean {
+        if (this.dLogWBarEwma === null || this.dLogWBarVarEst === 0) return false;
+        const { currentAlpha, ewmaSumW2, df, zScoreThreshold } = ctx.regulator;
+        if (ewmaSumW2 === 0) return false;
+
+        // σ̂² = δ² / (1 + α/2) — corrects δ²'s overestimation under
+        // lag-1 negative autocorrelation ρ₁ = −α/2.
+        const sigmaSqEstimate = this.dLogWBarVarEst / (1 + currentAlpha / 2);
+        const se = Statistics.studentTTrendSE({ sigmaSqEstimate, ewmaSumW2 });
+        if (se === 0) return false;
+
+        const threshold = Statistics.tScore(zScoreThreshold, df) * se;
+        return this.dLogWBarEwma > threshold;
     }
 
-    /** Update inFlightMs integral up to `now` using the current `inFlight`. */
-    private advanceIntegral(now: number): void {
-        if (this.lastInFlightChangeTime === null) {
-            this.lastInFlightChangeTime = now;
-            return;
-        }
-        this.inFlightMs += this.inFlight * (now - this.lastInFlightChangeTime);
-        this.lastInFlightChangeTime = now;
+    public state(): Record<string, unknown> {
+        return {
+            logWBar: this.logWBar,
+            dLogWBarEwma: this.dLogWBarEwma,
+            dLogWBarVarEst: this.dLogWBarVarEst,
+            inFlight: this.inFlight,
+            inFlightMs: this.inFlightMs
+        };
     }
 
-    /** Recompute SE, zScore, tCritical, threshold, degrading. */
-    private recomputeTestOutputs(): void {
-        if (
-            this.dLogWBarEwma === null ||
-            this.dLogWBarVarianceEstimate === 0 ||
-            this.ewmaSumW2 === 0 ||
-            this.alpha === null ||
-            this.resolvedZ === null
-        ) {
-            this.currentSe = 0;
-            this.currentZScore = 0;
-            this.currentTCritical = 0;
-            this.currentThreshold = 0;
-            this.currentlyDegrading = false;
-            return;
-        }
-        const sigmaSqEstimate = this.dLogWBarVarianceEstimate / (1 + this.alpha / 2);
-        const se = Math.sqrt(
-            (sigmaSqEstimate * this.ewmaSumW2 * (1 + this.ewmaSumW2)) / 2
-        );
-        this.currentSe = se;
-        this.currentZScore = se > 0 ? this.dLogWBarEwma / se : 0;
-        const df = 1 / this.ewmaSumW2 - 1;
-        this.currentTCritical = tScore(this.resolvedZ, df);
-        this.currentThreshold = this.currentTCritical * se;
-        this.currentlyDegrading = this.dLogWBarEwma > this.currentThreshold;
+    public clone(): LatencyDrift {
+        return new LatencyDrift();
     }
 }
 
-// ── ErrorRateThreshold ───────────────────────────────────────────────
+// ── ErrorRateThreshold — deterministic threshold predicate ───────────
 
 export interface ErrorRateThresholdOptions {
     /** Threshold ∈ [0, 1]. Triggers when `regulator.errorRateEwma > threshold`. */
@@ -394,11 +298,11 @@ export interface ErrorRateThresholdOptions {
 /**
  * Triggers deterministically when the pool's error rate EWMA exceeds a
  * fixed threshold. Useful for "if 50% of work is failing, back off".
- *
- * Stateless — the executor tracks `errorRateEwma`; this signal just reads it.
+ * Stateless — reads `regulator.errorRateEwma`.
  */
-export class ErrorRateThreshold extends BaseSignal<ErrorRateThresholdOptions> {
+export class ErrorRateThreshold implements Signal {
     public readonly name = "error-rate-threshold";
+    private readonly threshold: number;
 
     constructor(options: ErrorRateThresholdOptions) {
         if (
@@ -408,66 +312,46 @@ export class ErrorRateThreshold extends BaseSignal<ErrorRateThresholdOptions> {
         ) {
             throw new ArgumentError("ErrorRateThreshold.threshold must be in [0, 1].");
         }
-        super(options);
+        this.threshold = options.threshold;
     }
+
+    public onAdmit(): void {}
+    public onComplete(): void {}
+    public onEvaluate(): void {}
 
     public triggered(ctx: SignalContext): boolean {
         const rate = ctx.regulator.errorRateEwma;
-        return rate !== null && rate > this.options.threshold;
+        return rate !== null && rate > this.threshold;
+    }
+
+    public clone(): ErrorRateThreshold {
+        return new ErrorRateThreshold({ threshold: this.threshold });
     }
 }
 
-// ── ProbabilisticErrorRate ───────────────────────────────────────────
+// ── ProbabilisticErrorRate — v1.2 default behavior, opt-in for v2.0 ──
 
 /**
- * Triggers probabilistically with `P = errorRateEwma`. Self-scaling response
- * to systemic errors: at 2% aggregate errors, fires on ~2% of evaluations;
- * at 80%, fires on most.
+ * Triggers probabilistically with `P = errorRateEwma`. Self-scaling
+ * response to systemic errors: at 2% aggregate errors, fires on ~2% of
+ * evaluations; at 80%, fires on most.
  *
  * Stateless. Preserves the v1.2 default behavior; opt-in for v2.0+.
  */
 export class ProbabilisticErrorRate implements Signal {
     public readonly name = "probabilistic-error-rate";
 
-    public clone(): ProbabilisticErrorRate {
-        return new ProbabilisticErrorRate();
-    }
+    public onAdmit(): void {}
+    public onComplete(): void {}
+    public onEvaluate(): void {}
 
     public triggered(ctx: SignalContext): boolean {
         const rate = ctx.regulator.errorRateEwma;
         if (rate === null || rate <= 0) return false;
         return Math.random() < rate;
     }
-}
 
-// ── Helpers ──────────────────────────────────────────────────────────
-
-/** Compute the EWMA time constant from a z-score threshold. */
-function computeTimeConstant(zScoreThreshold: number): number {
-    const z2 = zScoreThreshold * zScoreThreshold;
-    return Math.round(2 / (1 - Math.exp(-1 / z2)));
-}
-
-/** One-sided Student-t critical value (safe upper bound) at upper-tail
- *  probability Φ(-z), df ν.
- *
- *  4th-order Cornish-Fisher inverse-t series (Hill, G. W. "Algorithm 396:
- *  Student's t-quantiles." Communications of the ACM 13.10 (1970): 619–620)
- *  plus an asymptotic-series truncation bound 2·|g₄/ν⁴|. As ν → 0 the bound
- *  diverges, naturally gating the test off — no clamp needed. */
-function tScore(z: number, df: number): number {
-    const z2 = z * z;
-    const z4 = z2 * z2;
-    const z6 = z4 * z2;
-    const z8 = z4 * z4;
-    const g1 = (z * (z2 + 1)) / 4;
-    const g2 = (z * (5 * z4 + 16 * z2 + 3)) / 96;
-    const g3 = (z * (3 * z6 + 19 * z4 + 17 * z2 - 15)) / 384;
-    const g4 = (z * (79 * z8 + 776 * z6 + 1482 * z4 - 1920 * z2 - 945)) / 92160;
-    const df2 = df * df;
-    const df3 = df2 * df;
-    const df4 = df3 * df;
-    const tApprox = z + g1 / df + g2 / df2 + g3 / df3 + g4 / df4;
-    const errorBound = 2 * Math.abs(g4 / df4);
-    return tApprox + errorBound;
+    public clone(): ProbabilisticErrorRate {
+        return new ProbabilisticErrorRate();
+    }
 }

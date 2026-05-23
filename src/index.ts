@@ -23,10 +23,10 @@ export {
     type AdmitInfo,
     type CompletionInfo,
     type EvaluateInfo,
-    type LatencyDriftOptions,
     type ErrorRateThresholdOptions,
-    BaseSignal,
     LatencyDrift,
     ErrorRateThreshold,
     ProbabilisticErrorRate,
 } from "./signals.js";
+
+export { Statistics } from "./statistics.js";

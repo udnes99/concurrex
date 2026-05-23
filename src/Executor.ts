@@ -10,6 +10,7 @@ import {
     type SignalContext,
     LatencyDrift
 } from "./signals.js";
+import { Statistics } from "./statistics.js";
 
 /** Throughput regulator phase — tracks the current regulation direction. */
 enum RegulationPhase {
@@ -104,6 +105,14 @@ type Pool = {
 
     // EWMA of in-flight count (for observability).
     inFlightEwma: number | null;
+
+    // ── Statistical heartbeat ──
+    // Computed once per window evaluation. Exposed to signals via
+    // RegulatorContext. Single source of truth for the control loop's
+    // statistical parameters — derived from the pool's zScoreThreshold.
+    currentAlpha: number;          // 1 − exp(−Δt/(τ·CW))
+    bayesianShrinkage: number;     // r / (r + z²) for current window
+    ewmaSumW2: number;             // Σw² (effective sample size tracker)
 
     // Convergent throughput regulator state
     regulationDepth: number;
@@ -425,6 +434,9 @@ export class Executor {
             errorsThisWindow: 0,
             errorRateEwma: null,
             inFlightEwma: null,
+            currentAlpha: 0,
+            bayesianShrinkage: 0,
+            ewmaSumW2: 0,
             regulationDepth: 0,
             regulationPhase: RegulationPhase.Idle,
             stepScale: 1,
@@ -479,6 +491,7 @@ export class Executor {
     /** Build a frozen SignalContext snapshot for a pool. */
     private buildSignalContext(pool: Pool): SignalContext {
         const params = pool.parameters ?? this.defaults;
+        const df = pool.ewmaSumW2 > 0 ? 1 / pool.ewmaSumW2 - 1 : 0;
         const regulator: RegulatorContext = Object.freeze({
             completionRateEwma: pool.completionRateEwma,
             admissionRateEwma: pool.admissionRateEwma,
@@ -488,9 +501,15 @@ export class Executor {
             regulationPhase: RegulationPhase[pool.regulationPhase],
             regulationDepth: pool.regulationDepth,
             elapsedWindows: pool.elapsedWindows,
+            // Statistical heartbeat — single source of truth
             zScoreThreshold: params.zScoreThreshold,
+            z2: params.z2,
             timeConstant: params.timeConstant,
-            controlWindow: pool.controlWindow
+            controlWindow: pool.controlWindow,
+            currentAlpha: pool.currentAlpha,
+            bayesianShrinkage: pool.bayesianShrinkage,
+            ewmaSumW2: pool.ewmaSumW2,
+            df
         });
         return Object.freeze({
             pool: pool.name,
@@ -1060,13 +1079,17 @@ export class Executor {
         const rate = pool.completionsThisWindow;
         const { timeConstant, z2 } = this.params(pool);
 
-        // Time-weighted EWMA alpha — used for general per-window EWMAs.
-        const alpha = 1 - Math.exp(-elapsed / (timeConstant * pool.controlWindow));
+        // ── Heartbeat: compute the statistical framework's pulse ──
+        // Single source of truth for the control loop's parameters. Signals
+        // read these via ctx.regulator — no signal-local α or shrinkage.
+        const alpha = Statistics.timeWeightedAlpha(elapsed, timeConstant, pool.controlWindow);
+        const windowShrinkage = Statistics.bayesianShrinkage(pool.completionsThisWindow, z2);
 
-        // Bayesian shrinkage: n/(n+z²) weights the observation against a prior
-        // of strength z² = 4 pseudo-observations. At n=1: 20% weight (sparse
-        // window, mostly trust the prior). At n=10: 71%. At n=100: 96%.
-        const windowShrinkage = this.shrinkage(pool.completionsThisWindow, z2);
+        // Effective sample size: exact Σw² recursion under time-varying α.
+        pool.ewmaSumW2 = (1 - alpha) * (1 - alpha) * pool.ewmaSumW2 + alpha * alpha;
+        pool.currentAlpha = alpha;
+        pool.bayesianShrinkage = windowShrinkage;
+
         const countAlpha = alpha * windowShrinkage;
 
         // Update completion rate EWMA.
