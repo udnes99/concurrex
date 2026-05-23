@@ -109,16 +109,11 @@ type Snapshot = {
     queueLength: number;
     dropping: boolean;
     throughputDegraded: boolean;
-    logW: number | null;
     logWBar: number | null;
     dLogWBarEwma: number | null;
-    dLogWBarVarianceEstimate: number;
-    ewmaSumW2: number;
-    se: number;
-    zScore: number;
+    dLogWBarVarEst: number;
     completionRateEwma: number | null;
     regulationPhase: string;
-    threshold: number; // tCritical × SE — actual firing boundary (use this not Z × SE for plots)
 };
 
 type Scenario = {
@@ -140,6 +135,7 @@ const logger = {
 
 function captureSnapshot(executor: Executor, pool: string, _zScoreThreshold: number): Snapshot {
     const rs = executor.getRegulatorState(pool);
+    const latency = executor.getSignalState(pool, "latency-drift");
     return {
         time: Math.round(currentTime),
         concurrencyLimit: executor.getConcurrencyLimit(pool),
@@ -147,16 +143,11 @@ function captureSnapshot(executor: Executor, pool: string, _zScoreThreshold: num
         queueLength: executor.getQueueLength(pool),
         dropping: executor.isOverloaded(pool),
         throughputDegraded: executor.isThroughputDegraded(pool),
-        logW: rs.logW,
-        logWBar: rs.logWBar,
-        dLogWBarEwma: rs.dLogWBarEwma,
-        dLogWBarVarianceEstimate: rs.dLogWBarVarianceEstimate,
-        ewmaSumW2: rs.ewmaSumW2,
-        se: rs.se,
-        zScore: rs.zScore,
+        logWBar: (latency?.logWBar as number | null) ?? null,
+        dLogWBarEwma: (latency?.dLogWBarEwma as number | null) ?? null,
+        dLogWBarVarEst: (latency?.dLogWBarVarEst as number | undefined) ?? 0,
         completionRateEwma: rs.completionRateEwma,
-        regulationPhase: rs.regulationPhase,
-        threshold: rs.threshold
+        regulationPhase: rs.regulationPhase
     };
 }
 

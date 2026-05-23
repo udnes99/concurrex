@@ -256,21 +256,14 @@ export class LatencyDrift implements Signal {
         }
 
         this.inFlightMs = 0;
+
+        // Refresh cached test outputs so state() reflects the latest window.
+        this.testOutputs(ctx);
     }
 
     public triggered(ctx: SignalContext): boolean {
-        if (this.dLogWBarEwma === null || this.dLogWBarVarEst === 0) return false;
-        const { currentAlpha, ewmaSumW2, df, zScoreThreshold } = ctx.regulator;
-        if (ewmaSumW2 === 0) return false;
-
-        // σ̂² = δ² / (1 + α/2) — corrects δ²'s overestimation under
-        // lag-1 negative autocorrelation ρ₁ = −α/2.
-        const sigmaSqEstimate = this.dLogWBarVarEst / (1 + currentAlpha / 2);
-        const se = Statistics.studentTTrendSE({ sigmaSqEstimate, ewmaSumW2 });
-        if (se === 0) return false;
-
-        const threshold = Statistics.tScore(zScoreThreshold, df) * se;
-        return this.dLogWBarEwma > threshold;
+        const r = this.testOutputs(ctx);
+        return r !== null && r.zScore > r.tCritical;
     }
 
     public state(): Record<string, unknown> {
@@ -279,8 +272,52 @@ export class LatencyDrift implements Signal {
             dLogWBarEwma: this.dLogWBarEwma,
             dLogWBarVarEst: this.dLogWBarVarEst,
             inFlight: this.inFlight,
-            inFlightMs: this.inFlightMs
+            inFlightMs: this.inFlightMs,
+            // Cached test outputs from the last triggered()/state() call.
+            // null when there's insufficient data to run the test.
+            se: this.cachedSe,
+            zScore: this.cachedZScore,
+            tCritical: this.cachedTCritical,
+            threshold: this.cachedThreshold,
+            degrading: this.cachedDegrading
         };
+    }
+
+    private cachedSe = 0;
+    private cachedZScore = 0;
+    private cachedTCritical = 0;
+    private cachedThreshold = 0;
+    private cachedDegrading = false;
+
+    /** Computes SE, zScore, tCritical, threshold using the current pool heartbeat.
+     *  Caches the values for later inspection via state(). Returns null when
+     *  the test cannot be evaluated (insufficient data). */
+    private testOutputs(ctx: SignalContext): { zScore: number; tCritical: number } | null {
+        if (this.dLogWBarEwma === null || this.dLogWBarVarEst === 0) {
+            this.cachedSe = 0;
+            this.cachedZScore = 0;
+            this.cachedTCritical = 0;
+            this.cachedThreshold = 0;
+            this.cachedDegrading = false;
+            return null;
+        }
+        const { currentAlpha, ewmaSumW2, df, zScoreThreshold } = ctx.regulator;
+        if (ewmaSumW2 === 0) return null;
+
+        const sigmaSqEstimate = this.dLogWBarVarEst / (1 + currentAlpha / 2);
+        const se = Statistics.studentTTrendSE({ sigmaSqEstimate, ewmaSumW2 });
+        if (se === 0) return null;
+
+        const tCritical = Statistics.tScore(zScoreThreshold, df);
+        const threshold = tCritical * se;
+        const zScore = this.dLogWBarEwma / se;
+
+        this.cachedSe = se;
+        this.cachedZScore = zScore;
+        this.cachedTCritical = tCritical;
+        this.cachedThreshold = threshold;
+        this.cachedDegrading = this.dLogWBarEwma > threshold;
+        return { zScore, tCritical };
     }
 
     public clone(): LatencyDrift {

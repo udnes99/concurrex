@@ -45,9 +45,11 @@ Five mechanisms cooperate:
 
 1. **ProDel** (Probabilistic Delay Load-shedding) — sojourn-based AQM. Drop probability `P = 1 - threshold/sojourn`. Adaptive LIFO/FIFO admission (FIFO when healthy, LIFO when dropping to protect fresh work).
 2. **Probabilistic early shedding** — rejects new arrivals at enqueue time with `P = dropRate/(dropRate+completionRate) * shrinkage` when ProDel is dropping and pool is at capacity. Instant rejections.
-3. **EWMA throughput regulator** — latency detection via operational Little's Law (`W = integral N(t)dt / completions`), log-transformed, smoothed by a shrinkage-dampened level EWMA. A Student-t hypothesis test on the trend detects sustained upward drift, with SE formula `√(δ² × W² × (1+W²) / (2 × (1+α/2)))` derived from von Neumann's lag-1 squared-difference noise estimator (drift-invariant) plus an autocorrelation variance-reduction factor for the EWMA. False-positive rate is upper-bounded by Φ(−Z) at steady state (≤2.3% at Z=2); small-sample conservatism comes from the Student-t critical value widening as effective sample size shrinks. Concurrency adjusted via a convergent step formula with bisection damping for O(log L) equilibrium convergence.
+3. **Pluggable backpressure signals** — each pool runs a list of `Signal` instances that observe task events and decide when to decrease concurrency. The default is `LatencyDrift` — the v1.x latency-trend Student-t test (operational Little's Law, log-transform, EWMA on logW, von Neumann's δ² for drift-invariant noise estimation, autocorrelation-corrected SE, Cornish-Fisher critical value). Pools can add `ErrorRateThreshold`, `ProbabilisticErrorRate`, or custom user-defined signals. FPR is upper-bounded by Φ(−Z) per signal; joint FPR across N signals is bounded by Bonferroni `N · Φ(−Z)`. Concurrency adjusted via a convergent step formula with bisection damping for O(log L) equilibrium convergence.
 4. **Per-lane error shedding** — each lane tracks its own error rate EWMA. High-error lanes probabilistically reject new requests without affecting pool-wide concurrency.
 5. **Fair lane scheduling** — round-robin across lanes (per-tenant, per-user, or shared). Prevents noisy neighbors from monopolizing capacity.
+
+All statistical parameters in the framework — α, ESS, df, Bayesian shrinkage, time constant — derive from a single `zScoreThreshold` per pool. The pool computes this "heartbeat" once per evaluation and exposes it to signals via `SignalContext.regulator`. Every signal observes the same heartbeat; the framework's rigor is preserved when composing multiple signals.
 
 ## Single-Constant Design
 
@@ -84,6 +86,69 @@ executor.registerPool("commands", {
 | `minimumConcurrency` | 1 | Absolute floor for the concurrency limit |
 | `maximumConcurrency` | Infinity | Absolute ceiling for the concurrency limit |
 | `zScoreThreshold` | (inherit) | Detection sensitivity; overrides the executor-level default |
+| `signals` | (inherit) | Backpressure signals (replaces executor's defaults entirely) |
+
+## Backpressure Signals
+
+Pools auto-decrease concurrency when any of their configured `Signal`s is triggered. The default is `[new LatencyDrift()]` — the v1.x latency-trend Student-t test.
+
+```typescript
+import { Executor, LatencyDrift, ErrorRateThreshold, ProbabilisticErrorRate } from "concurrex";
+
+// Executor-level default applies to every pool that doesn't override
+const executor = new Executor({
+    signals: [
+        new LatencyDrift(),                       // default
+        new ErrorRateThreshold({ threshold: 0.5 }) // opt-in: also fire above 50% errors
+    ]
+});
+
+// Per-pool override — replaces executor defaults entirely (no merge)
+executor.registerPool("api", {
+    signals: [new LatencyDrift(), new ProbabilisticErrorRate()]
+});
+
+// Empty array = "never auto-decrease on backpressure"
+executor.registerPool("debug", { signals: [] });
+```
+
+### Built-in signals
+
+- **`LatencyDrift`** — fires when the trend test detects sustained upward latency drift. Default. Uses the pool's heartbeat (α, ESS, df from `zScoreThreshold`) and composes its own EWMAs + δ² inline.
+- **`ErrorRateThreshold({ threshold })`** — fires when `errorRateEwma > threshold` (∈ [0, 1]).
+- **`ProbabilisticErrorRate`** — fires with `P = errorRateEwma`. Preserves v1.2 default behavior; opt-in for v2.0+.
+
+### Custom signals
+
+Implement the `Signal` interface. The pool's heartbeat (α, ESS, df, shrinkage) is exposed via `ctx.regulator` — use it (with `Statistics.*` utilities) to build statistically rigorous custom detectors, or just write a predicate for heuristic backpressure.
+
+```typescript
+import type { Signal, SignalContext } from "concurrex";
+
+// Predicate-only signal — no statistics
+const memorySignal: Signal = {
+    name: "memory-pressure",
+    onAdmit() {}, onComplete() {}, onEvaluate() {},
+    triggered: () => process.memoryUsage().heapUsed > 1_000_000_000,
+    clone() { return memorySignal }
+};
+
+executor.registerPool("ingest", {
+    signals: [new LatencyDrift(), memorySignal]
+});
+```
+
+For a statistically rigorous custom signal (e.g., a p99 latency drift detector), follow `LatencyDrift`'s pattern: compose `Statistics.tScore`, `Statistics.studentTTrendSE`, etc. with inline EWMA state. See `src/signals.ts` for the canonical pattern.
+
+### Inspecting signal state
+
+```typescript
+// General regulator state (rate EWMAs, regulation phase, etc.)
+executor.getRegulatorState("api");
+
+// Per-signal internal state (LatencyDrift's logWBar, zScore, tCritical, etc.)
+executor.getSignalState("api", "latency-drift");
+```
 
 ## Lanes
 
@@ -132,9 +197,9 @@ executor.getRegulatorState("commands");    // full filter state snapshot
 
 `isOverloaded` returns `true` only during confirmed sustained overload (dropping state). Use this to pause upstream work fetching.
 
-`getRegulatorState` returns a `RegulatorState` with the filter internals: `logW`, `logWBar`, `dLogWBarEwma`, `dLogWBarVarianceEstimate`, `ewmaSumW2`, `se`, `zScore`, `tCritical`, `threshold`, `degrading`, `inFlightEwma`, `completionRateEwma`, `admissionRateEwma`, `dropRateEwma`, `errorRateEwma`, `regulationPhase`, `regulationDepth`, `elapsedWindows`, `alpha`. Use `threshold` (= `tCritical × se`) to plot the actual firing boundary — NOT `zScoreThreshold × se`, which is only correct at steady-state df.
+`getRegulatorState` returns a `RegulatorState` with general regulator metrics: `inFlightEwma`, `completionRateEwma`, `admissionRateEwma`, `dropRateEwma`, `errorRateEwma`, `regulationPhase`, `regulationDepth`, `elapsedWindows`, `degrading` (= "any signal is currently triggered").
 
-`dLogWBarVarianceEstimate` is von Neumann's δ² — an EWMA of `(v_k − v_{k-1})²/2`, where `v` is the trend signal `dLogWBar`. It's a drift-invariant noise estimator: pairwise differences cancel any sustained drift, so δ² stays calibrated to the actual noise level even under sustained latency degradation. See `docs/THEORY.md` §4.2.6 for the derivation.
+For signal-specific state (e.g. `LatencyDrift`'s `logWBar`, `dLogWBarEwma`, `dLogWBarVarEst`, `se`, `zScore`, `tCritical`, `threshold`), use `executor.getSignalState(pool, signalName)`. See `docs/THEORY.md` §4.2 for the derivation of the latency-trend Student-t test and its components.
 
 ## Error Handling
 

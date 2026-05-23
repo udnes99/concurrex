@@ -33,12 +33,10 @@ type Snapshot = {
     throughputDegraded: boolean;
     requestsPerSec: number;
     errorRate: number;
-    // EWMA filter state
-    logW: number | null;
+    // Latency-test filter state (sourced from LatencyDrift signal via getSignalState in v2)
     logWBar: number | null;
     dLogWBarEwma: number | null;
-    dLogWBarVarianceEstimate: number;
-    ewmaSumW2: number;
+    dLogWBarVarEst: number;
     se: number;
     zScore: number;
     tCritical: number;
@@ -138,6 +136,8 @@ function captureSnapshot(
     windowErrorRate: number
 ): Snapshot {
     const rs = executor.getRegulatorState(pool);
+    const latency = executor.getSignalState(pool, "latency-drift");
+    const num = (k: string): number => (latency?.[k] as number | undefined) ?? 0;
     return {
         time: Math.round(performance.now() - startTime),
         concurrencyLimit: executor.getConcurrencyLimit(pool),
@@ -147,15 +147,13 @@ function captureSnapshot(
         throughputDegraded: executor.isThroughputDegraded(pool),
         requestsPerSec: Math.round(requestsPerSec),
         errorRate: Math.round(windowErrorRate * 100) / 100,
-        logW: rs.logW,
-        logWBar: rs.logWBar,
-        dLogWBarEwma: rs.dLogWBarEwma,
-        dLogWBarVarianceEstimate: rs.dLogWBarVarianceEstimate,
-        ewmaSumW2: rs.ewmaSumW2,
-        se: rs.se,
-        zScore: rs.zScore,
-        tCritical: rs.tCritical,
-        threshold: rs.threshold,
+        logWBar: (latency?.logWBar as number | null) ?? null,
+        dLogWBarEwma: (latency?.dLogWBarEwma as number | null) ?? null,
+        dLogWBarVarEst: num("dLogWBarVarEst"),
+        se: num("se"),
+        zScore: num("zScore"),
+        tCritical: num("tCritical"),
+        threshold: num("threshold"),
         regulationPhase: rs.regulationPhase,
         regulationDepth: rs.regulationDepth
     };
