@@ -1,6 +1,14 @@
 import { ResourceExhaustedError, ExecutorNotRunningError, ArgumentError, ConcurrexError } from "../src/errors.js";
 import { DebounceMode, Executor } from "../src/Executor.js";
-import { LatencyDrift, ProbabilisticErrorRate } from "../src/signals.js";
+import {
+    LatencyDrift,
+    EarlyShed,
+    LaneErrorShed,
+    type LatencyDriftState,
+    type LaneErrorShedState,
+    type RegulatorSignal,
+    type AdmissionSignal
+} from "../src/signals.js";
 import type { Logger } from "../src/logger.js";
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -790,6 +798,91 @@ describe("Executor tests", () => {
                 // The lane should be cleaned up after the task completes
                 // Verify pool is healthy after lane cleanup
                 expect(executor.isOverloaded("test")).toBe(false);
+            });
+
+            test("does not leak inFlight when stop() lands between admission and task start", async () => {
+                executor.registerPool("test");
+
+                // run() admits synchronously (capacity is free) but resolution
+                // is deferred to the next tick; stop() in the same tick used to
+                // strand pool.inFlight at 1 forever.
+                const p = executor.run("test", () => 42);
+                executor.stop();
+
+                await expect(p).rejects.toThrow(ExecutorNotRunningError);
+                expect(executor.getInFlight("test")).toBe(0);
+
+                // The pool regains full capacity after a restart.
+                executor.start();
+                await expect(executor.run("test", () => 42)).resolves.toBe(42);
+            });
+
+            test("stop() fires onLaneRemoved for queued lanes; in-flight lanes tear down at completion", async () => {
+                const removed: string[] = [];
+                const spy: AdmissionSignal = {
+                    name: "lane-spy",
+                    shouldShed: () => false,
+                    onLaneRemoved(laneKey) {
+                        removed.push(laneKey);
+                    },
+                    clone() {
+                        return this;
+                    }
+                };
+                executor.registerPool("test", { maximumConcurrency: 1, admissionSignals: [spy] });
+
+                // Occupy the single slot on lane "busy".
+                const inFlight = executor.run("test", () => wait(1000), { lane: "busy" });
+                await drain();
+
+                // Queue a task on lane "waiting" — it never gets a slot.
+                const queued = executor.run("test", () => 1, { lane: "waiting" });
+                executor.stop();
+
+                await expect(queued).rejects.toThrow(ExecutorNotRunningError);
+                // The queued-only lane was torn down at stop(), with signals notified.
+                expect(removed).toContain("waiting");
+                expect(removed).not.toContain("busy");
+
+                // The in-flight task completes normally; its lane tears down then.
+                await vi.advanceTimersByTimeAsync(1000);
+                await expect(inFlight).resolves.toBeUndefined();
+                expect(removed).toContain("busy");
+            });
+        });
+
+        describe("Statistical heartbeat warm-up", () => {
+            test("seeds ewmaSumW2 at 1 so the Student-t gate starts near df = 0", async () => {
+                const observed: Array<{ ewmaSumW2: number; df: number }> = [];
+                const probe: RegulatorSignal = {
+                    name: "probe",
+                    triggered: () => false,
+                    onEvaluate(ctx) {
+                        observed.push({
+                            ewmaSumW2: ctx.regulator.ewmaSumW2,
+                            df: ctx.regulator.df
+                        });
+                    },
+                    clone() {
+                        return this;
+                    }
+                };
+                executor.registerPool("test", { regulatorSignals: [probe] });
+
+                // One task spanning > 1 controlWindow forces a window evaluation.
+                const task = executor.run("test", () => wait(150));
+                await vi.advanceTimersByTimeAsync(150);
+                await task;
+
+                // First evaluation: Σw² has decayed once from the seed of 1 —
+                // (1−α)²·1 + α² ≈ 0.74 — so df ≈ 0.35 and the Cornish-Fisher
+                // critical value diverges (warm-up gate). An unseeded heartbeat
+                // would report Σw² = α² ≈ 0.02 → df ≈ 40 → tCritical ≈ z,
+                // arming the trend test at full sensitivity with no history.
+                expect(observed.length).toBeGreaterThan(0);
+                expect(observed[0].ewmaSumW2).toBeGreaterThan(0.5);
+                expect(observed[0].ewmaSumW2).toBeLessThanOrEqual(1);
+                expect(observed[0].df).toBeLessThan(1);
             });
         });
     });
@@ -2395,7 +2488,7 @@ describe("Executor tests", () => {
 
             expect(realExecutor.isThroughputDegraded("test")).toBe(true);
             const state = realExecutor.getRegulatorState("test");
-            expect(state.degrading).toBe(true);
+            expect(state.overloadDetected).toBe(true);
             // Latency-test internals migrated to signal-specific state in v2.
             const latency = realExecutor.getSignalState("test", "latency-drift");
             expect(latency).toBeDefined();
@@ -2533,7 +2626,7 @@ describe("Executor tests", () => {
         }, 15_000);
     });
 
-    describe("Error-based regulation (per-lane shedding + throughput regulator)", () => {
+    describe("Per-lane error shedding", () => {
         // ESS = round(2 / (1 - exp(-1/σ²))) with σ=2 → 9
         const ESS = Math.round(2 / (1 - Math.exp(-1 / 4)));
         let executor: Executor;
@@ -2550,13 +2643,7 @@ describe("Executor tests", () => {
             randomValue = 0.99; // Default: high random → shedding doesn't fire
             vi.spyOn(performance, "now").mockImplementation(() => currentTime);
             vi.spyOn(Math, "random").mockImplementation(() => randomValue);
-            // These tests exercise v1.2's probabilistic-error-decrease behavior.
-            // In v2.0 that's an opt-in signal; include it explicitly so the
-            // existing tests still validate the intended semantics.
-            executor = new Executor({
-                logger,
-                signals: [new LatencyDrift(), new ProbabilisticErrorRate()]
-            });
+            executor = new Executor({ logger });
             executor.start();
         });
 
@@ -2595,7 +2682,8 @@ describe("Executor tests", () => {
             executor.registerPool("test", {
                 baselineConcurrency: 10,
                 delayThreshold: 60_000,
-                controlWindow: 100
+                controlWindow: 100,
+                admissionSignals: [new LaneErrorShed()]
             });
 
             const lane = "user-A";
@@ -2632,7 +2720,8 @@ describe("Executor tests", () => {
             executor.registerPool("test", {
                 baselineConcurrency: 10,
                 delayThreshold: 60_000,
-                controlWindow: 100
+                controlWindow: 100,
+                admissionSignals: [new LaneErrorShed()]
             });
 
             // Lane A: erroring heavily.
@@ -2659,7 +2748,8 @@ describe("Executor tests", () => {
             executor.registerPool("test", {
                 baselineConcurrency: 10,
                 delayThreshold: 60_000,
-                controlWindow: 100
+                controlWindow: 100,
+                admissionSignals: [new LaneErrorShed()]
             });
 
             const lane = "user-A";
@@ -2693,207 +2783,32 @@ describe("Executor tests", () => {
             expect(result).toBe("ok");
         });
 
-        test("widespread errors across many lanes trigger throughput regulator decrease", async () => {
+        test("default config does NOT shed a failing lane (no LaneErrorShed)", async () => {
+            // The v2 default admission set is [EarlyShed] only — no
+            // LaneErrorShed. A heavily-failing lane must still admit new
+            // requests; errors are domain-specific and don't imply the lane
+            // should be fenced off.
             executor.registerPool("test", {
-                baselineConcurrency: 100,
+                baselineConcurrency: 10,
                 delayThreshold: 60_000,
                 controlWindow: 100
             });
 
-            const initialLimit = executor.getConcurrencyLimit("test");
+            const lane = "user-A";
+            const blocker = executor.run("test", () => wait(60_000), { lane });
+            blocker.catch(() => {});
 
-            // Warm up ESS windows with healthy traffic across many lanes.
-            for (let w = 0; w < ESS; w++) {
-                await advance(110);
-                for (let i = 0; i < 20; i++) {
-                    await executor.run("test", () => "ok", { lane: `lane-${i}` });
-                }
-            }
-
-            // Send 100% errors across 20 distinct lanes for ESS-1 windows,
-            // accumulating errorRateEwma toward 1.0.
-            for (let w = 0; w < ESS - 1; w++) {
-                await advance(110);
-                for (let i = 0; i < 20; i++) {
-                    await executor
-                        .run(
-                            "test",
-                            (): void => {
-                                throw new Error("fail");
-                            },
-                            { lane: `lane-${i}` }
-                        )
-                        .catch(() => {});
-                }
-            }
-
-            // ESS boundary window: set randomValue low so probabilistic
-            // error decrease fires (P = errorRateEwma ≈ 0.5).
-            // Use transient lane to avoid per-lane shedding.
-            randomValue = 0.1;
-            await advance(110);
-            await executor.run("test", () => "ok");
-
-            expect(executor.getConcurrencyLimit("test")).toBeLessThan(initialLimit);
-        });
-
-        test("localized errors in one lane do not trigger throughput regulator decrease", async () => {
-            executor.registerPool("test", {
-                baselineConcurrency: 100,
-                delayThreshold: 60_000,
-                controlWindow: 100
-            });
-
-            // Warm up with clean traffic across many lanes.
-            for (let w = 0; w < ESS; w++) {
-                await advance(110);
-                for (let i = 0; i < 30; i++) {
-                    await executor.run("test", () => "ok", { lane: `good-lane-${i}` });
-                }
-            }
-
-            // Mixed traffic: 1 bad lane + 49 good lanes per window.
-            // Per-lane shedding fences off the bad lane (its error EWMA rises
-            // above ~50% within a few windows, triggering enqueue-time
-            // rejection). Pool-wide error rate stays low (~2%), so the
-            // probabilistic error decrease branch barely fires. The
-            // throughput regulator should NOT drive concurrency to minimum.
-            for (let w = 0; w < ESS * 2; w++) {
-                await advance(110);
-                for (let i = 0; i < 49; i++) {
-                    await executor.run("test", () => "ok", { lane: `good-lane-${i}` });
-                }
+            for (let i = 0; i < 10; i++) {
                 await executor
-                    .run(
-                        "test",
-                        (): void => {
-                            throw new Error("fail");
-                        },
-                        { lane: "bad-lane" }
-                    )
+                    .run("test", (): void => { throw new Error("fail"); }, { lane })
                     .catch(() => {});
             }
 
-            // Per-lane shedding handles the bad lane. The pool-wide error rate
-            // stays low (1/50 = 2%), so probabilistic error decrease barely fires.
-            // The limit stays well above minimum.
-            expect(executor.getConcurrencyLimit("test")).toBeGreaterThanOrEqual(50);
-        });
-
-        test("lockout: sustained 100% error rate triggers continued decrease", async () => {
-            executor.registerPool("test", {
-                baselineConcurrency: 100,
-                delayThreshold: 60_000,
-                controlWindow: 100
-            });
-
-            // Warm up with healthy traffic across many lanes.
-            for (let w = 0; w < ESS; w++) {
-                await advance(110);
-                for (let i = 0; i < 20; i++) {
-                    await executor.run("test", () => "ok", { lane: `lane-${i}` });
-                }
-            }
-
-            // Spike to 100% errors across 20 lanes for ESS-1 windows.
-            for (let w = 0; w < ESS - 1; w++) {
-                await advance(110);
-                for (let i = 0; i < 20; i++) {
-                    await executor
-                        .run(
-                            "test",
-                            (): void => {
-                                throw new Error("fail");
-                            },
-                            { lane: `lane-${i}` }
-                        )
-                        .catch(() => {});
-                }
-            }
-
-            // First ESS boundary: probabilistic error decrease fires.
-            randomValue = 0.1;
-            await advance(110);
-            await executor.run("test", () => "ok");
-            const afterFirstDecrease = executor.getConcurrencyLimit("test");
-            expect(afterFirstDecrease).toBeLessThan(100);
-
-            // Continue 100% errors. The next ESS eval cools (Decreasing → Idle),
-            // and the one after that decreases again. Need 2 more ESS periods.
-            for (let period = 0; period < 2; period++) {
-                randomValue = 0.99;
-                for (let w = 0; w < ESS - 1; w++) {
-                    await advance(110);
-                    for (let i = 0; i < 20; i++) {
-                        await executor
-                            .run(
-                                "test",
-                                (): void => {
-                                    throw new Error("fail");
-                                },
-                                { lane: `lane-${i}` }
-                            )
-                            .catch(() => {});
-                    }
-                }
-                randomValue = 0.1;
-                await advance(110);
-                await executor.run("test", () => "ok");
-            }
-
-            // After decrease → cool → decrease, limit should be lower.
-            expect(executor.getConcurrencyLimit("test")).toBeLessThan(afterFirstDecrease);
-        });
-
-        test("error degradation recovers after errors stop", async () => {
-            executor.registerPool("test", {
-                baselineConcurrency: 100,
-                delayThreshold: 60_000,
-                controlWindow: 100
-            });
-
-            // Warm up.
-            for (let w = 0; w < ESS; w++) {
-                await advance(110);
-                for (let i = 0; i < 20; i++) {
-                    await executor.run("test", () => "ok", { lane: `lane-${i}` });
-                }
-            }
-
-            // Widespread errors for ESS-1 windows to accumulate error rate.
-            for (let w = 0; w < ESS - 1; w++) {
-                await advance(110);
-                for (let i = 0; i < 20; i++) {
-                    await executor
-                        .run(
-                            "test",
-                            (): void => {
-                                throw new Error("fail");
-                            },
-                            { lane: `lane-${i}` }
-                        )
-                        .catch(() => {});
-                }
-            }
-
-            // ESS boundary — probabilistic error decrease fires.
-            randomValue = 0.1;
-            await advance(110);
-            await executor.run("test", () => "ok");
-            const decreasedLimit = executor.getConcurrencyLimit("test");
-            expect(decreasedLimit).toBeLessThan(100);
-
-            // Now send only healthy traffic for many ESS periods — error rate decays.
-            randomValue = 0.99;
-            for (let w = 0; w < ESS * 6; w++) {
-                await advance(110);
-                for (let i = 0; i < 20; i++) {
-                    await executor.run("test", () => "ok", { lane: `lane-${i}` });
-                }
-            }
-
-            // After many clean windows, error signals should have decayed.
-            expect(executor.isThroughputDegraded("test")).toBe(false);
+            // Even with random forced to 0 (would always shed if enabled),
+            // the next request is admitted and runs.
+            randomValue = 0;
+            const result = await executor.run("test", () => "ok", { lane });
+            expect(result).toBe("ok");
         });
     });
 
@@ -3075,7 +2990,7 @@ describe("Executor tests", () => {
             executor.registerPool("test", {
                 baselineConcurrency: 100,
                 controlWindow: 10,
-                signals: [alwaysFire]
+                regulatorSignals: [alwaysFire]
             });
             const initial = executor.getConcurrencyLimit("test");
             for (let i = 0; i < 30; i++) {
@@ -3086,7 +3001,7 @@ describe("Executor tests", () => {
             expect(executor.getConcurrencyLimit("test")).toBeLessThan(initial);
         });
 
-        test("empty signals array disables backpressure-driven decrease", async () => {
+        test("empty regulatorSignals array disables backpressure-driven decrease", async () => {
             vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
             const alwaysFire = {
                 name: "always-fire",
@@ -3095,12 +3010,12 @@ describe("Executor tests", () => {
                 clone() { return alwaysFire; }
             };
             executor.stop();
-            executor = new Executor({ logger, signals: [alwaysFire] });
+            executor = new Executor({ logger, regulatorSignals: [alwaysFire] });
             executor.start();
             executor.registerPool("test", {
                 baselineConcurrency: 50,
                 controlWindow: 10,
-                signals: []  // overrides executor's always-fire — pool stays at baseline
+                regulatorSignals: []  // overrides executor's always-fire — pool stays at baseline
             });
             const initial = executor.getConcurrencyLimit("test");
             for (let i = 0; i < 30; i++) {
@@ -3119,7 +3034,7 @@ describe("Executor tests", () => {
             executor.registerPool("test", {
                 baselineConcurrency: 50,
                 controlWindow: 10,
-                signals: [sig1, sig2, sig3]
+                regulatorSignals: [sig1, sig2, sig3]
             });
             const initial = executor.getConcurrencyLimit("test");
             for (let i = 0; i < 30; i++) {
@@ -3130,18 +3045,36 @@ describe("Executor tests", () => {
             expect(executor.getConcurrencyLimit("test")).toBeLessThan(initial);
         });
 
-        test("clone() produces a stateless copy per pool", () => {
+        test("clone() isolates per-pool state — load on A leaves B untouched", async () => {
+            // Use real timers + a real-duration workload so the LL integral
+            // actually accumulates on A. The vacuous version of this test
+            // (checking only object identity) would pass even for a broken
+            // `clone() { return this }` since state() always returns a fresh object.
+            vi.useRealTimers();
+            const realExecutor = new Executor({ logger });
+            realExecutor.start();
             const drift = new LatencyDrift();
-            // Register the same template with two pools — clone should isolate state.
-            executor.registerPool("a");
-            executor.registerPool("b", { signals: [drift] });
-            // Both pools must have independent signal instances.
-            const stateA = executor.getSignalState("a", "latency-drift");
-            const stateB = executor.getSignalState("b", "latency-drift");
-            expect(stateA).toBeDefined();
-            expect(stateB).toBeDefined();
-            expect(stateA).not.toBe(stateB);
-        });
+            realExecutor.registerPool("a", { baselineConcurrency: 5, controlWindow: 30, regulatorSignals: [drift] });
+            realExecutor.registerPool("b", { baselineConcurrency: 5, controlWindow: 30, regulatorSignals: [drift] });
+            const realWait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+            // Drive load on A only.
+            for (let w = 0; w < 10; w++) {
+                const batch = Array.from({ length: 5 }, () =>
+                    realExecutor.run("a", () => realWait(5))
+                );
+                await Promise.allSettled(batch);
+                await realWait(35);
+            }
+            const stateA = realExecutor.getSignalState<LatencyDriftState>("a", "latency-drift");
+            const stateB = realExecutor.getSignalState<LatencyDriftState>("b", "latency-drift");
+            expect(stateA?.logWBar).not.toBeNull();
+            expect(stateB?.logWBar).toBeNull();
+            realExecutor.stop();
+
+            // Restore fake timers for subsequent tests in this describe block.
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
+            vi.setSystemTime(0);
+        }, 10_000);
 
         test("getSignalState returns undefined for missing signal name", () => {
             executor.registerPool("test");
@@ -3150,6 +3083,104 @@ describe("Executor tests", () => {
 
         test("getSignalState throws for nonexistent pool", () => {
             expect(() => executor.getSignalState("nope", "latency-drift")).toThrow(ArgumentError);
+        });
+
+        test("getSignalState returns undefined for a signal without state()", () => {
+            const noState: RegulatorSignal = {
+                name: "no-state",
+                triggered: () => false,
+                clone() { return this; }
+            };
+            executor.registerPool("test", { regulatorSignals: [noState] });
+            expect(executor.getSignalState("test", "no-state")).toBeUndefined();
+        });
+
+        test("signal with no lifecycle hooks does not break admission/completion", async () => {
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
+            const minimal: RegulatorSignal = {
+                name: "minimal",
+                triggered: () => false,
+                clone() { return this; }
+            };
+            executor.registerPool("test", { baselineConcurrency: 5, controlWindow: 10, regulatorSignals: [minimal] });
+            for (let i = 0; i < 5; i++) {
+                vi.advanceTimersByTime(10);
+                await expect(executor.run("test", () => "ok")).resolves.toBe("ok");
+            }
+            vi.useRealTimers();
+        });
+
+        test("throwing signal hook does not break admission", async () => {
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
+            const bad: RegulatorSignal = {
+                name: "bad",
+                triggered: () => false,
+                onAdmit() { throw new Error("buggy signal in onAdmit"); },
+                onComplete() { throw new Error("buggy signal in onComplete"); },
+                clone() { return this; }
+            };
+            executor.registerPool("test", { baselineConcurrency: 5, controlWindow: 10, regulatorSignals: [bad] });
+            // Tasks must still resolve normally despite signal hook throws.
+            await expect(executor.run("test", () => "ok")).resolves.toBe("ok");
+            vi.useRealTimers();
+        });
+
+        test("throwing admission signal does not break admission", async () => {
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
+            const bad: AdmissionSignal = {
+                name: "bad-admission",
+                shouldShed() { throw new Error("buggy signal in shouldShed"); },
+                clone() { return this; }
+            };
+            executor.registerPool("test", { baselineConcurrency: 5, controlWindow: 10, admissionSignals: [bad] });
+            // A throwing shouldShed is caught → request is admitted, not shed.
+            await expect(executor.run("test", () => "ok")).resolves.toBe("ok");
+            vi.useRealTimers();
+        });
+
+        test("custom admission signal sheds at enqueue", async () => {
+            let open = false;
+            const breaker: AdmissionSignal = {
+                name: "breaker",
+                shouldShed: () => open,
+                clone() { return this; }
+            };
+            executor.registerPool("test", { admissionSignals: [breaker] });
+            await expect(executor.run("test", () => "ok")).resolves.toBe("ok");
+            open = true;
+            await expect(executor.run("test", () => "ok")).rejects.toThrow(ResourceExhaustedError);
+        });
+
+        test("empty admissionSignals disables enqueue shedding", () => {
+            // EarlyShed default is replaced by [] → no admission signal at all.
+            executor.registerPool("test", { admissionSignals: [] });
+            // Nothing to assert beyond construction succeeding + a task running.
+            return expect(executor.run("test", () => "ok")).resolves.toBe("ok");
+        });
+
+        test("registerPool rejects a signal with an empty name", () => {
+            const bad = { name: "", triggered: () => false, clone(): RegulatorSignal { return this; } };
+            expect(() => executor.registerPool("test", { regulatorSignals: [bad as RegulatorSignal] })).toThrow(
+                ArgumentError
+            );
+        });
+
+        test("registerPool rejects duplicate signal names (across both lists)", () => {
+            const reg: RegulatorSignal = { name: "dup", triggered: () => false, clone() { return this; } };
+            const adm: AdmissionSignal = { name: "dup", shouldShed: () => false, clone() { return this; } };
+            expect(() =>
+                executor.registerPool("test", { regulatorSignals: [reg], admissionSignals: [adm] })
+            ).toThrow(ArgumentError);
+        });
+
+        test("registerPool rejects an admission signal missing shouldShed", () => {
+            const bad = { name: "no-shed", clone() { return this; } } as unknown as AdmissionSignal;
+            expect(() => executor.registerPool("test", { admissionSignals: [bad] })).toThrow(ArgumentError);
+        });
+
+        test("registerPool rejects a signal whose clone() returns non-object", () => {
+            const bad = { name: "bad", triggered: () => false, clone(): RegulatorSignal { return null as unknown as RegulatorSignal; } };
+            expect(() => executor.registerPool("test", { regulatorSignals: [bad] })).toThrow(ArgumentError);
         });
     });
 
@@ -3178,11 +3209,10 @@ describe("Executor tests", () => {
             executor.registerPool("test");
             const state = executor.getRegulatorState("test");
 
-            expect(state.degrading).toBe(false);
+            expect(state.overloadDetected).toBe(false);
             expect(state.inFlightEwma).toBeNull();
             expect(state.completionRateEwma).toBeNull();
             expect(state.dropRateEwma).toBeNull();
-            expect(state.errorRateEwma).toBeNull();
             expect(state.regulationPhase).toBe("Idle");
             expect(state.regulationDepth).toBe(0);
             expect(state.elapsedWindows).toBe(0);
@@ -3239,11 +3269,10 @@ describe("Executor tests", () => {
             }
 
             // In v2.0 the δ² state lives in the LatencyDrift signal.
-            const latency = realExecutor.getSignalState("test", "latency-drift");
+            const latency = realExecutor.getSignalState<LatencyDriftState>("test", "latency-drift");
             expect(latency).toBeDefined();
-            const dLogWBarVarEst = latency!.dLogWBarVarEst as number;
-            expect(dLogWBarVarEst).toBeGreaterThan(0);
-            expect(Number.isFinite(dLogWBarVarEst)).toBe(true);
+            expect(latency!.dLogWBarVarEst).toBeGreaterThan(0);
+            expect(Number.isFinite(latency!.dLogWBarVarEst)).toBe(true);
 
             realExecutor.stop();
             vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });

@@ -14,6 +14,7 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { Executor } from "../src/Executor.js";
+import { EarlyShed, LaneErrorShed } from "../src/signals.js";
 import { generateJsonOutput } from "./output.js";
 import { generateHtmlFromJson } from "./generate-html.js";
 
@@ -620,72 +621,6 @@ async function scenarioBackpressure(): Promise<Scenario> {
 
 // ── Error scenarios ──────────────────────────────────────────────────
 
-async function scenarioWidespreadErrors(): Promise<Scenario> {
-    console.log("\n  Running: Widespread Errors (Probabilistic Decrease)");
-    const executor = new Executor({ logger });
-    executor.start();
-    const pool = "errors";
-    executor.registerPool(pool, {
-        baselineConcurrency: 20,
-        minimumConcurrency: 2,
-        maximumConcurrency: 50,
-        delayThreshold: 200,
-        controlWindow: 100
-    });
-
-    completionCount = 0;
-    errorCount = 0;
-    const data: Snapshot[] = [];
-    const startTime = performance.now();
-    const sampler = startSampling(executor, pool, startTime, data);
-
-    const allTasks: Promise<unknown>[] = [];
-
-    // Phase 1 (0–12s): Healthy — no errors, 200 req/sec, 20ms latency.
-    // Warms up EWMAs. Error rate = 0, spread = 0.
-    globalDelay = 20;
-    globalErrorProbability = 0;
-    console.log("    Phase 1: Healthy (0% errors, 12s)...");
-    await submitAtRate(executor, pool, 5, 12_000, allTasks);
-
-    // Phase 2 (12–24s): Widespread errors — 80% failure rate.
-    // Backend responds fast (20ms) but 80% of responses are 500s.
-    // dErrorRate should spike → decrease. Error spread across all transient lanes.
-    console.log("    Phase 2: Widespread errors (80% failure, 12s)...");
-    globalErrorProbability = 0.8;
-    await submitAtRate(executor, pool, 5, 12_000, allTasks);
-
-    // Phase 3 (24–30s): Total lockout — 100% failure.
-    // dErrorRate ≈ 0 (rate stopped changing). Lockout test should sustain decrease.
-    console.log("    Phase 3: Total lockout (100% failure, 6s)...");
-    globalErrorProbability = 1.0;
-    await submitAtRate(executor, pool, 5, 6_000, allTasks);
-
-    // Phase 4 (30–42s): Recovery — errors stop.
-    // Error rate drops, concurrency should recover via gravity/growth.
-    console.log("    Phase 4: Recovery (0% errors, 12s)...");
-    globalErrorProbability = 0;
-    await submitAtRate(executor, pool, 5, 12_000, allTasks);
-
-    await Promise.allSettled(allTasks);
-    await sleep(500);
-
-    clearInterval(sampler);
-    data.push(captureSnapshot(executor, pool, startTime, 0, 0));
-    executor.stop();
-
-    return {
-        name: "Widespread Errors (Probabilistic Decrease)",
-        description:
-            "Baseline: 20, min: 2, max: 50, delayThreshold: 200ms. Backend 20ms throughout. " +
-            "Phase 1 (0–12s): healthy, 200 req/sec — EWMA warm-up. " +
-            "Phase 2 (12–24s): 80% errors — probabilistic error decrease fires frequently (P = errorRateEwma). " +
-            "Phase 3 (24–30s): 100% errors — total failure, sustained decrease. " +
-            "Phase 4 (30–42s): errors stop — error rate decays, concurrency recovers.",
-        data
-    };
-}
-
 async function scenarioLocalizedErrors(): Promise<Scenario> {
     console.log("\n  Running: Localized Errors (Per-Lane Shedding)");
     const executor = new Executor({ logger });
@@ -696,7 +631,9 @@ async function scenarioLocalizedErrors(): Promise<Scenario> {
         minimumConcurrency: 2,
         maximumConcurrency: 50,
         delayThreshold: 200,
-        controlWindow: 100
+        controlWindow: 100,
+        // this scenario demonstrates per-lane shedding (opt-in admission signal)
+        admissionSignals: [new EarlyShed(), new LaneErrorShed()]
     });
 
     completionCount = 0;
@@ -779,67 +716,6 @@ async function scenarioLocalizedErrors(): Promise<Scenario> {
     };
 }
 
-async function scenarioErrorCapacityOverload(): Promise<Scenario> {
-    console.log("\n  Running: Error-Based Capacity Overload");
-    const executor = new Executor({ logger });
-    executor.start();
-    const pool = "errcap";
-    executor.registerPool(pool, {
-        baselineConcurrency: 30,
-        minimumConcurrency: 2,
-        maximumConcurrency: 50,
-        delayThreshold: 500,
-        controlWindow: 100
-    });
-
-    completionCount = 0;
-    errorCount = 0;
-    const data: Snapshot[] = [];
-    const startTime = performance.now();
-    const sampler = startSampling(executor, pool, startTime, data);
-
-    const allTasks: Promise<unknown>[] = [];
-
-    // Phase 1 (0–12s): Healthy baseline. Backend fast, no errors.
-    globalDelay = 10;
-    globalErrorProbability = 0;
-    console.log("    Phase 1: Healthy (10ms, 0% errors, 12s)...");
-    await submitAtRate(executor, pool, 5, 12_000, allTasks);
-
-    // Phase 2 (12–30s): Backend starts failing under load — 50% errors, fast response.
-    // This simulates "baseline concurrency set too high" — the downstream can't handle
-    // 30 concurrent requests. Error rate + spread trigger decrease.
-    // As concurrency drops, error rate should also drop (capacity-related).
-    console.log("    Phase 2: Capacity overload (50% errors, 10ms, 18s)...");
-    globalErrorProbability = 0.5;
-    await submitAtRate(executor, pool, 5, 18_000, allTasks);
-
-    // Phase 3 (30–42s): Downstream recovers — errors stop.
-    console.log("    Phase 3: Recovery (0% errors, 12s)...");
-    globalErrorProbability = 0;
-    await submitAtRate(executor, pool, 5, 12_000, allTasks);
-
-    await Promise.allSettled(allTasks);
-    await sleep(500);
-
-    clearInterval(sampler);
-    data.push(captureSnapshot(executor, pool, startTime, 0, 0));
-    executor.stop();
-
-    return {
-        name: "Error-Based Capacity Overload",
-        description:
-            "Baseline: 30, min: 2, max: 50, delayThreshold: 500ms. Backend 10ms throughout. " +
-            "Phase 1 (0–12s): healthy — warm-up. " +
-            "Phase 2 (12–30s): 50% errors, fast response (10ms). " +
-            "Simulates capacity overload where baseline is too high. " +
-            "dErrorRate fires, regulator decreases. Sawtooth oscillates toward equilibrium. " +
-            "Phase 3 (30–42s): errors stop — system recovers. " +
-            "Shows error-driven regulation for capacity-related failures.",
-        data
-    };
-}
-
 // ── Main ─────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -857,9 +733,7 @@ async function main(): Promise<void> {
     scenarios.push(await scenarioFullOverload());
     scenarios.push(await scenarioGradualRamp());
     scenarios.push(await scenarioBackpressure());
-    scenarios.push(await scenarioWidespreadErrors());
     scenarios.push(await scenarioLocalizedErrors());
-    scenarios.push(await scenarioErrorCapacityOverload());
 
     for (const s of scenarios) {
         const maxQueue = Math.max(...s.data.map((d) => d.queueLength));
@@ -880,7 +754,7 @@ async function main(): Promise<void> {
 
     const jsonPath = generateJsonOutput(import.meta.url, "simulation-live", scenarios, {
         title: "Executor \u2013 Live Simulation",
-        subtitle: "Real HTTP backend, real concurrency, real time. ProDel + Convergent Throughput Regulator (Little\u2019s Law + Error Rate)."
+        subtitle: "Real HTTP backend, real concurrency, real time. ProDel + Convergent Throughput Regulator (Little\u2019s Law / LatencyDrift signal)."
     });
     generateHtmlFromJson(jsonPath);
 

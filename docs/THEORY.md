@@ -1,6 +1,6 @@
 # Executor: Formal Analysis
 
-A formal treatment of the mechanisms in the Executor: **ProDel** (Probabilistic Delay Load-shedding — queue management), **probabilistic early shedding**, and the **throughput regulator** (concurrency regulation). ProDel is a sojourn-based active queue management algorithm where drop probability is proportional to entry staleness. All theorem numbers, definitions, and proofs reference the implementation in `Executor.ts`.
+A formal treatment of the mechanisms in the Executor: **ProDel** (Probabilistic Delay Load-shedding — the core queue engine), the **throughput regulator** driven by pluggable **regulator signals** (concurrency policy; default `LatencyDrift`), and pluggable **admission signals** (enqueue-time shedding; default `EarlyShed`, opt-in `LaneErrorShed`). ProDel is a sojourn-based active queue management algorithm where drop probability is proportional to entry staleness. All theorem numbers, definitions, and proofs reference the implementation in `Executor.ts`.
 
 > **Interactive plots:** See [`theory-plots.html`](theory-plots.html) for Chart.js visualizations of every curve in this document — compare theory against the [live simulation](../simulations/simulation-live.html).
 
@@ -34,11 +34,6 @@ A formal treatment of the mechanisms in the Executor: **ProDel** (Probabilistic 
 - $\hat{v}_k$ — EWMA of shrunk derivative $v_k \cdot s_k$ (`dLogWBarEwma`); asymmetric shrinkage on input
 - $\delta^2_k$ — von Neumann's lag-1 squared-difference noise estimator $\text{EWMA}((v_k - v_{k-1})^2 / 2)$ (`dLogWBarVarianceEstimate`); drift-invariant
 - $W_k^{(2)}$ — sum of squared EWMA weights (`ewmaSumW2`); encodes effective sample size
-
-**Error tracking state.** Per window:
-
-- $e_k$ — errors in window $k$ (`errorsThisWindow`)
-- $\hat{E}_k$ — EWMA of error ratio $e_k / r_k$ (`errorRateEwma`) — used for probabilistic error decrease
 
 **Per-lane state:**
 
@@ -381,39 +376,19 @@ $$\hat\mu_k = (1 - \alpha_c) \hat\mu_{k-1} + \alpha_c r_k \quad (\text{completio
 
 $$\hat\delta_k = (1 - \alpha_c) \hat\delta_{k-1} + \alpha_c d_k \quad (\text{drop rate})$$
 
-$$\hat{E}_k = (1 - \alpha_c) \hat{E}_{k-1} + \alpha_c \tfrac{e_k}{r_k} \quad (\text{error ratio})$$
-
 **Counts** (raw $\alpha_k$ — admissions are not rate-shrunk because they are exact admission events):
 
 $$\hat{a}_k = (1 - \alpha_k) \hat{a}_{k-1} + \alpha_k a_k \quad (\text{admission rate})$$
 
 $$\hat{L}_k = (1 - \alpha_k) \hat{L}_{k-1} + \alpha_k F_k \quad (\text{in-flight count})$$
 
-**Per-lane error rate** (time-weighted, with Bayesian shrinkage on the lane's cumulative completion count $c_\ell$):
+**Per-lane error rate** (computed inside the opt-in `LaneErrorShed` admission signal — time-weighted, with Bayesian shrinkage on the lane's cumulative completion count $c_\ell$):
 
 $$\alpha_\ell^{\text{time}} = 1 - \exp\left(\frac{-\max(1, t - t_\ell)}{H \cdot W}\right), \quad \alpha_\ell = \alpha_\ell^{\text{time}} \cdot \frac{c_\ell}{c_\ell + Z^2}$$
 
 $$\hat{p}_\ell \leftarrow (1 - \alpha_\ell) \hat{p}_\ell + \alpha_\ell\,[e]$$
 
-where $[e] = 1$ if the task errored. The $\max(1, \cdot)$ floor ensures rapid same-tick completions still contribute weight. The shrinkage $c_\ell/(c_\ell + Z^2)$ dampens noisy early estimates (1 completion: 20%, 4 completions: 50%, 10 completions: 71%).
-
-**Error rate (error ratio — errors/completions):**
-
-$$\hat{E}_k = (1 - \alpha_c) \hat{E}_{k-1} + \alpha_c \tfrac{e_k}{r_k}$$
-
-where $\alpha_c = \alpha_k \times r_k / (r_k + Z^2)$ (Bayesian shrinkage-scaled alpha on completions).
-
-**Per-lane error rate (time-weighted with Bayesian shrinkage):**
-
-Each lane's error rate is updated on completion with a time-weighted alpha based on elapsed time since the lane's last completion, scaled by Bayesian shrinkage:
-
-$$\alpha_\ell^{\text{time}} = 1 - \exp\left(\frac{-\max(1, t - t_\ell)}{H \cdot W}\right)$$
-
-$$\alpha_\ell = \alpha_\ell^{\text{time}} \times \frac{c_\ell}{c_\ell + Z^2}$$
-
-$$\hat{p}_\ell \leftarrow (1 - \alpha_\ell) \hat{p}_\ell + \alpha_\ell [e]$$
-
-where $[e] = 1$ if the task errored, $0$ otherwise, and $c_\ell$ is the lane's cumulative completion count. The $\max(1, \cdot)$ ensures rapid completions at the same timestamp still contribute weight. The Bayesian shrinkage factor $c_\ell/(c_\ell + Z^2)$ dampens the update for lanes with few completions — a lane with 1 completion gets only 20% of the full alpha, a lane with 4 completions gets 50%, and a lane with 10 gets 71%, preventing noisy early estimates from causing aggressive per-lane shedding. This uses the same Bayesian framework as all other signals.
+where $[e] = 1$ if the task errored, $0$ otherwise. The $\max(1, \cdot)$ floor ensures rapid same-tick completions still contribute weight. The Bayesian shrinkage $c_\ell/(c_\ell + Z^2)$ dampens noisy early estimates (1 completion: 20%, 4 completions: 50%, 10 completions: 71%), preventing aggressive shedding before a lane has enough history. `LaneErrorShed` is **not** registered by default — the pool-wide error EWMA was removed in v2.0 and this lane-level mechanism is opt-in for the same reason (errors are domain-specific). The signal owns its per-lane state (a `Map`), populated in `onComplete` and released in `onLaneRemoved`.
 
 ### 4.3 Detection Thresholds
 
@@ -553,7 +528,7 @@ If users want joint FPR $\leq \alpha$ across $N$ statistical signals, they Bonfe
 
 **Caveat — "statistical" vs heuristic signals.** The joint FPR bound applies only to signals that participate in the framework (i.e., compose their hypothesis test using the pool's heartbeat). Heuristic signals (predicate-only, e.g., `MemoryPressure`) fire whenever their condition is met — they have no inherent FPR guarantee and are not included in the Bonferroni count.
 
-**Probabilistic error response (opt-in).** v1.x had a hardcoded branch firing with $P = \texttt{errorRateEwma}$. In v2.0 this is the opt-in `ProbabilisticErrorRate` signal — predicate-only, not a hypothesis test, so it's not subject to the Bonferroni bound. Users opting into it should be aware their pool's "auto-decrease" responses include this non-statistical mechanism.
+**Error response is user-defined.** v1.x had a hardcoded probabilistic-error decrease branch firing with $P = \texttt{errorRateEwma}$. In v2.0 the pool-level error EWMA is removed entirely — what counts as an "error" is domain-specific (HTTP status, business vs infrastructure, retryable vs terminal). To drive *concurrency* from errors, implement a `RegulatorSignal` that observes `info.errored` in `onComplete`. To *shed at admission* on a per-lane basis, register the built-in `LaneErrorShed` admission signal (or write your own `AdmissionSignal`). Both are **opt-in** — errors do not necessarily mean a resource is unhealthy.
 
 **Theorem 7 (Upper-bounded false positive rate).** *Under the following assumptions:*
 - *constant $\alpha$ at steady state (or smooth time-varying $\alpha$ as a first-order approximation),*
@@ -613,7 +588,7 @@ $$t = \frac{\hat{v}}{\text{SE}} = \frac{s\mu + O(\sigma_v / \sqrt{\nu})}{\sigma_
 
 *Proof.* Three independent mechanisms cooperate:*
 
-1. *At pool creation, $\delta^2 = 0$ — `isLatencyDegrading` returns false on the explicit $\delta^2 = 0$ guard.*
+1. *At pool creation, $\delta^2 = 0$ — `LatencyDrift.testOutputs` returns null on the explicit $\delta^2 = 0$ guard, and `triggered()` returns false.*
 2. *Before two observations have been seen, the lag-1 difference cannot be computed and $\delta^2$ remains 0 — gated as in (1).*
 3. *After two observations, $W^{(2)} \approx 1$ initially, giving $\nu \approx 0$. In `tScore`, the truncation bound $2\,|g_4/\nu^4|$ diverges as $\nu \to 0^+$ — critical $\to \infty$, test returns false. As $W^{(2)}$ decays geometrically toward $\alpha/(2-\alpha) \approx 0.055$ (under typical $\alpha \approx 0.1$), the bound shrinks smoothly, and the test becomes active once enough independent data has accumulated.*
 
@@ -643,18 +618,17 @@ The factor $f(d)$ is the EWMA absorption fraction after $d$ steps with time cons
 
 #### 4.4.1 Per-Time-Constant Evaluation
 
-Every $H$ windows (when $n_w > 0$ and $n_w \bmod H = 0$), the regulator evaluates six branches in priority order. Warm-up is handled implicitly by the Student-t critical value in branch 1 (Theorem 9) — no separate $n_w \geq H$ guard is needed.
+Every $H$ windows (when $n_w > 0$ and $n_w \bmod H = 0$), the regulator evaluates five branches in priority order. Warm-up is handled implicitly by the Student-t critical value in branch 1 (Theorem 9) — no separate $n_w \geq H$ guard is needed.
 
-1. **Latency degrading** → `applyDecrease`. Retract previous increase or start fresh decrease ramp.
-2. **Cooling** ($\Phi \in \{\texttt{Retracting}, \texttt{Decreasing}\}$, not degrading) → Reset to $\texttt{Idle}$, $d = 0$, $s \leftarrow s/2$ (bisection damping). One time constant evaluation pause after a decrease sequence before allowing increases. Acts as natural momentum — prevents immediate flip-flop between latency-decrease and queue-increase. The halved $s$ ensures the next increase cycle uses finer steps.
+1. **Any signal triggered** → `applyDecrease`. Retract previous increase or start fresh decrease ramp.
+2. **Cooling** ($\Phi \in \{\texttt{Retracting}, \texttt{Decreasing}\}$, no signal triggered) → Reset to $\texttt{Idle}$, $d = 0$, $s \leftarrow s/2$ (bisection damping). One time constant evaluation pause after a decrease sequence before allowing increases. Acts as natural momentum — prevents immediate flip-flop between decrease and queue-increase. The halved $s$ ensures the next increase cycle uses finer steps.
 3. **Queue pressure** ($Q > 0$, not in a decrease sequence — $\Phi \in \{\texttt{Idle}, \texttt{Increasing}, \texttt{Restoring}\}$) → `applyIncrease`. Convergent slow start.
-4. **Probabilistic error decrease** ($\hat{E} > 0$ and $\text{rand}() < \hat{E}$) → `applyDecrease`. Fires with probability equal to the aggregate error rate. Per-lane shedding keeps the aggregate rate low for localized failures, so this only fires frequently for systemic issues. No momentum — the probabilistic nature provides proportional response without needing a separate hold/gravity gate.
-5. **Restoring** ($L \neq B$) → Convergent step toward baseline from current position. Uses the same step formula $\Delta(d)$ with incrementing depth. If $L < B$: cautious probe upward (latency signal can react before overshoot). If $L > B$: shed excess capacity. Phase set to $\texttt{Restoring}$.
-6. **Idle** ($L = B$, no queue, no degradation, no errors) → $d = 0$, $\Phi = \texttt{Idle}$.
+4. **Restoring** ($L \neq B$) → Convergent step toward baseline from current position. Uses the same step formula $\Delta(d)$ with incrementing depth. If $L < B$: cautious probe upward (signals can react before overshoot). If $L > B$: shed excess capacity. Phase set to $\texttt{Restoring}$.
+5. **Idle** ($L = B$, no queue, no signal triggered) → $d = 0$, $\Phi = \texttt{Idle}$.
 
-#### 4.4.2 Decrease (latency degrading or probabilistic error)
+#### 4.4.2 Decrease (any signal triggered)
 
-When latency is degrading, or when the probabilistic error coin fires:
+When any of the pool's configured signals fires:
 
 **Case 1: $\Phi = \texttt{Increasing}$ and $d > 0$.** Transition to Retracting. The current depth $d$ becomes the starting point for retraction. Retraction uses the scaled multiplicative inverse $fs/(1+fs)$ to exactly undo the corresponding increase (which used $f \cdot s$):
 
@@ -705,7 +679,7 @@ At convergence ($d \to \infty$), $\Delta \to L$: each time constant evaluation d
 
 #### 4.4.4 Restoring (gravity)
 
-When $Q = 0$, not degraded, no probabilistic error decrease, and $L \neq B$. On phase transition into Restoring (from any other phase), reset $s = 1$ and $d = 0$ (operating point has changed; next search starts fresh):
+When $Q = 0$, no signal triggered, and $L \neq B$. On phase transition into Restoring (from any other phase), reset $s = 1$ and $d = 0$ (operating point has changed; next search starts fresh):
 
 $$\text{if } \Phi \neq \texttt{Restoring}: \quad s \leftarrow 1, \quad d \leftarrow 0$$
 $$\Phi \leftarrow \texttt{Restoring}, \quad d \leftarrow d + 1$$
@@ -809,16 +783,16 @@ The decrease depths are exactly $d_{\text{peak}}, d_{\text{peak}}-1, \ldots, 1$,
 
 ## 5. Independence of Mechanisms
 
-**Theorem 17 (Orthogonality).** *ProDel, early shedding, and the throughput regulator operate on disjoint state and trigger on different signals.*
+**Theorem 17 (Orthogonality).** *ProDel (the queue engine), admission signals, and the throughput regulator (driven by regulator signals) operate on disjoint state and trigger on different conditions.*
 
-| Property | ProDel | Early Shed | Per-Lane Shedding | Throughput Regulator | Probabilistic Error Decrease |
-|----------|-------|------------|-------------------|----------------------|------------------------------|
-| **Trigger** | Sojourn $\geq \tau$ | `dropping` ∧ $F \geq L$ ∧ $P > \text{rand}()$ | $\text{rand}() < \hat{p}_\ell$ | dLogWBar z-test | $\hat{E} > 0$ ∧ $\text{rand}() < \hat{E}$ |
-| **Action** | Drop head / admit (FIFO or LIFO) | Reject at enqueue | Reject at enqueue | Adjust $L$ | Adjust $L$ |
-| **State** | `dropping`, `dropCount` | `dropRateEwma` (read-only) | `lane.errorRateEwma` | `concurrencyLimit`, `regulationDepth`, `regulationPhase`, `stepScale` | `errorRateEwma` (read-only) |
-| **Execution point** | `processQueue()` | `enqueueAndWait()` | `enqueueAndWait()` | `evaluateControlWindow()` | `evaluateControlWindow()` |
+| Property | ProDel | Admission signals | Throughput regulator |
+|----------|-------|-------------------|----------------------|
+| **Trigger** | Sojourn $\geq \tau$ | any `AdmissionSignal.shouldShed(ctx, lane)` — e.g. `EarlyShed`: `dropping` ∧ $F \geq L$ ∧ $P > \text{rand}()$; `LaneErrorShed`: $\text{rand}() < \hat{p}_\ell$ | any `RegulatorSignal.triggered(ctx)` — e.g. `LatencyDrift` |
+| **Action** | Drop head / admit (FIFO or LIFO) | Reject at enqueue (counted as a drop) | Adjust $L$ |
+| **State** | `dropping`, `dropCount` | per-signal (stateless `EarlyShed`; `LaneErrorShed`'s per-lane map) | `concurrencyLimit`, `regulationDepth`, `regulationPhase`, `stepScale`; per-signal state |
+| **Execution point** | `processQueue()` | `enqueueAndWait()` | `evaluateControlWindow()` |
 
-ProDel never writes to regulator state; the regulator never writes to ProDel state. Per-lane shedding operates on lane-local state, independent of pool-wide regulation — it handles localized failures without triggering systemic backoff. Early shedding reads `dropping` (ProDel state) and `dropRateEwma`/`completionRateEwma` (regulator state) but writes only `dropsThisWindow` (shared counter). Probabilistic error decrease reads `errorRateEwma` (shared tracker) but uses the same `applyDecrease` actuator as latency-driven regulation — it is a separate trigger, not a separate mechanism. The mechanisms converge independently to the appropriate response.
+ProDel never writes to regulator state; the regulator never writes to ProDel state. Admission signals are queried at enqueue and read a frozen `ctx` (pool metrics + heartbeat) plus their own per-lane state; `EarlyShed` reads `dropping` and the drop/completion-rate EWMAs but the only shared write is `dropsThisWindow` (incremented by the executor when any admission signal sheds). The throughput regulator's input is the OR of the regulator signals' `triggered()`; all of them share the same heartbeat and the single `applyDecrease` actuator — separate triggers, shared actuator. The mechanisms converge independently to the appropriate response.
 
 ---
 
@@ -847,8 +821,8 @@ ProDel never writes to regulator state; the regulator never writes to ProDel sta
 | **Single convergent formula** | Same step $\Delta(d)$ for Increasing, Retracting, Decreasing, and Restoring |
 | **Cautious recovery** | Retracting/Decreasing→Increasing starts fresh from depth 0 |
 | **Asymmetric phase transitions** | Only Increasing→decrease triggers retraction; decrease→Increasing does not |
-| **Per-lane shedding is independent** | Lane error rate doesn't affect pool-wide regulation (Theorem 17) |
-| **Probabilistic error decrease** | Systemic errors cause probabilistic decrease (P = errorRate); per-lane shedding filters localized errors (§4.3.2) |
+| **Admission signals are independent** | `LaneErrorShed` (opt-in) and other admission signals reject at enqueue without affecting pool-wide regulation (Theorem 17) |
+| **Pluggable regulator decrease** | Any configured `RegulatorSignal.triggered()` drives the convergent decrease actuator; joint FPR is bounded by Bonferroni across statistical signals (Theorem 7, §4.3.2) |
 | **Gradual restoring** | Convergent steps toward baseline from either direction; no discontinuous snaps (§4.4.4) |
 | **Bisection convergence** | Each increase→retract→cooling cycle halves stepScale; $O(\log L)$ cycles to equilibrium (§4.5) |
 | **One-eval cooling** | After a decrease sequence, one time constant evaluation pause before allowing increases; stepScale halved (§4.4.1) |

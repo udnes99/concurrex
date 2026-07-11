@@ -6,9 +6,12 @@ import {
     type CompletionInfo,
     type EvaluateInfo,
     type RegulatorContext,
-    type Signal,
+    type BaseSignal,
+    type RegulatorSignal,
+    type AdmissionSignal,
     type SignalContext,
-    LatencyDrift
+    LatencyDrift,
+    EarlyShed
 } from "./signals.js";
 import { Statistics } from "./statistics.js";
 
@@ -45,12 +48,6 @@ type Lane = {
     key: string;
     prev: Lane | null;
     next: Lane | null;
-    /** Per-lane error rate EWMA — updated on each completion. */
-    errorRateEwma: number;
-    /** Timestamp of last completion — for time-weighted lane alpha. */
-    lastCompletionTime: number;
-    /** Cumulative completions — for confidence scaling of error rate EWMA. */
-    completions: number;
 };
 
 type DebouncedEntry<T = unknown> = {
@@ -98,11 +95,6 @@ type Pool = {
     dropRateEwma: number | null;
     elapsedWindows: number;
 
-    // Error tracking (downstream health) — pool-wide error rate is tracked
-    // for observability. Per-lane shedding handles error response.
-    errorsThisWindow: number;
-    errorRateEwma: number | null;
-
     // EWMA of in-flight count (for observability).
     inFlightEwma: number | null;
 
@@ -112,7 +104,7 @@ type Pool = {
     // statistical parameters — derived from the pool's zScoreThreshold.
     currentAlpha: number;          // 1 − exp(−Δt/(τ·CW))
     bayesianShrinkage: number;     // r / (r + z²) for current window
-    ewmaSumW2: number;             // Σw² (effective sample size tracker)
+    ewmaSumW2: number;             // Σw² (ESS tracker; seeded at 1 = one effective observation)
 
     // Convergent throughput regulator state
     regulationDepth: number;
@@ -124,9 +116,14 @@ type Pool = {
     // Deferred re-evaluation timer
     processQueueTimer: ReturnType<typeof setTimeout> | null;
 
-    // Backpressure signals — clones of executor/pool templates, owns
-    // its own per-pool state (latency tracking, custom statistics).
-    signals: ReadonlyArray<Signal>;
+    // Pluggable signals — per-pool clones of the executor/pool templates,
+    // each owning its own per-pool state. Regulator signals decide
+    // concurrency; admission signals decide enqueue-time shedding.
+    // `lifecycleSignals` is the union (regulator ++ admission), held
+    // separately so per-task hook dispatch needs no allocation.
+    regulatorSignals: ReadonlyArray<RegulatorSignal>;
+    admissionSignals: ReadonlyArray<AdmissionSignal>;
+    lifecycleSignals: ReadonlyArray<BaseSignal>;
 };
 
 export type PoolOptions = {
@@ -142,22 +139,33 @@ export type PoolOptions = {
     maximumConcurrency?: number;
     /** Time window (ms) for both ProDel grace period and throughput measurement interval. Default: 100. */
     controlWindow?: number;
-    /** Backpressure signals for this pool. Each signal is checked once per
-     *  regulator evaluation cycle; if any returns `triggered() === true`, the
-     *  regulator decreases concurrency.
+    /** Concurrency-policy signals for this pool (see {@link RegulatorSignal}).
+     *  Each is checked once per regulator evaluation cycle; if any returns
+     *  `triggered() === true`, the regulator decreases concurrency.
      *
-     *  When omitted, the pool inherits the executor-level `signals`. When
-     *  provided (even as an empty array), the pool's signals **replace** the
-     *  executor defaults entirely — there is no merge. An empty array means
-     *  "never auto-decrease on backpressure" (gravity and queue pressure still
-     *  apply).
+     *  When omitted, the pool inherits the executor-level regulator signals.
+     *  When provided (even as an empty array), the pool's signals **replace**
+     *  the executor defaults entirely — no merge. An empty array means "never
+     *  auto-decrease on backpressure" (gravity and queue pressure still apply).
      *
-     *  The instances passed are templates: they are cloned via `signal.clone()`
-     *  per pool, so the same template can be safely registered with multiple
-     *  pools without state interleaving.
+     *  Templates are cloned via `clone()` per pool, so one instance can be
+     *  registered with many pools without state interleaving.
      *
-     *  Default executor-level signals: `[new LatencyDrift()]`. */
-    signals?: Signal[];
+     *  Default: `[new LatencyDrift()]`. */
+    regulatorSignals?: RegulatorSignal[];
+    /** Admission-policy signals for this pool (see {@link AdmissionSignal}).
+     *  Each is queried at enqueue with the target lane; if any returns
+     *  `shouldShed() === true`, the request is rejected immediately (counted
+     *  as a drop).
+     *
+     *  When omitted, the pool inherits the executor-level admission signals.
+     *  When provided (even as an empty array), replaces them entirely. An
+     *  empty array disables enqueue-time shedding (ProDel still drops stale
+     *  queued entries).
+     *
+     *  Default: `[new EarlyShed()]` — probabilistic early shedding. Add
+     *  `new LaneErrorShed()` to opt into per-lane error shedding. */
+    admissionSignals?: AdmissionSignal[];
 };
 
 /**
@@ -165,8 +173,8 @@ export type PoolOptions = {
  * (latency-test internals, custom signal statistics) is exposed separately
  * via {@link Executor.getSignalState}.
  *
- * The `degrading` flag is true if any configured signal is currently
- * triggered. To inspect *which* signal and its internals, use
+ * The `overloadDetected` flag is true if any configured signal is
+ * currently triggered. To inspect *which* signal and its internals, use
  * `executor.getSignalState(pool, signalName)`.
  */
 export type RegulatorState = {
@@ -178,8 +186,6 @@ export type RegulatorState = {
     admissionRateEwma: number | null;
     /** EWMA of drop rate (drops per window). */
     dropRateEwma: number | null;
-    /** EWMA of error ratio (errors / completions). */
-    errorRateEwma: number | null;
     /** Current regulation phase. */
     regulationPhase: string;
     /** Current regulation depth. */
@@ -188,7 +194,7 @@ export type RegulatorState = {
     elapsedWindows: number;
     /** Whether any configured signal is currently triggered. Equivalent to
      *  `executor.isThroughputDegraded(pool)`. */
-    degrading: boolean;
+    overloadDetected: boolean;
 };
 
 export type TaskRunOptions = {
@@ -209,7 +215,7 @@ const DEFAULT_Z_SCORE_THRESHOLD = 2;
 /**
  * A ProDel-based executor with adaptive concurrency.
  *
- * Three independent mechanisms cooperate:
+ * Four independent mechanisms cooperate:
  *
  * **ProDel** (Probabilistic Delay Load-shedding): manages queue health using
  * sojourn-proportional probabilistic load shedding. Each stale entry
@@ -217,19 +223,25 @@ const DEFAULT_Z_SCORE_THRESHOLD = 2;
  * Admission is adaptive: FIFO when healthy, LIFO when dropping.
  * `isOverloaded()` returns true during dropping state for upstream back-pressure.
  *
- * **Convergent throughput regulator**: regulates the concurrency limit using
- * shrinkage-dampened EWMA on log-latency as the degradation signal. W = ∫N(t)dt / C
- * per window (finite-interval Little's Law). A shrinkage-dampened EWMA smooths
- * log(W), with throughput-aware dampening at low observation counts. The z-test
- * on dLogWBar (change in filtered log-latency) detects sustained latency trends.
- * Systemic errors are handled by probabilistic decrease (P = errorRateEwma) in
- * the gravity branch.
+ * **Probabilistic early shedding**: when ProDel is dropping and the pool is at
+ * capacity, new arrivals are rejected at enqueue with P = dropRate / (dropRate +
+ * completionRate) × shrinkage. Provides instant rejection for upstream callers
+ * without paying queue cost.
  *
- * **Per-lane error shedding**: each lane tracks its own error rate EWMA.
- * Lanes with high error rates probabilistically reject new requests at enqueue,
- * preventing wasted work on failing resources without affecting other lanes.
- * Per-lane shedding keeps aggregate error rates low for localized failures,
- * so the probabilistic error decrease only fires for systemic issues.
+ * **Convergent throughput regulator**: regulates the concurrency limit based
+ * on pluggable backpressure `Signal`s. The default signal is `LatencyDrift`
+ * (Little's Law over a window, log/EWMA pipeline, Student-t trend test).
+ * Pools can compose multiple signals; any triggered signal drives a decrease.
+ * The regulator itself owns only the statistical heartbeat (α, ESS, df,
+ * shrinkage — derived from a single `zScoreThreshold`) and the concurrency
+ * actuator; signals own their per-pool observation state.
+ *
+ * **Admission signals** decide enqueue-time shedding (see `AdmissionSignal`).
+ * The default is `EarlyShed` — probabilistic early rejection when ProDel is
+ * dropping and the pool is at capacity (queue-health based, domain-agnostic).
+ * `LaneErrorShed` (per-lane error shedding) is an exported opt-in. Pool-wide
+ * error response is not built in; users define their own signal if they want
+ * errors to drive concurrency (see `examples/express-server.ts`).
  *
  * The single constant `zScoreThreshold` controls all detection thresholds,
  * EWMA time constant, shrinkage strength, and warm-up period.
@@ -251,13 +263,12 @@ const DEFAULT_Z_SCORE_THRESHOLD = 2;
  *   - Decreasing: fresh decrease ramp after retraction exhausted.
  *   - Restoring: converging toward baseline via gradual convergent steps.
  *
- * **Six branches per TIME_CONSTANT evaluation** (every TIME_CONSTANT windows after warmup):
- *   1. Latency degrading → decrease (retract or fresh ramp).
+ * **Five branches per TIME_CONSTANT evaluation** (every TIME_CONSTANT windows after warmup):
+ *   1. Any configured signal triggered → decrease (retract or fresh ramp).
  *   2. Cooling (after decrease) → reset to Idle, one-eval pause.
  *   3. Queue pressure → increase (only when not in decrease sequence).
- *   4. Probabilistic error decrease → P = errorRateEwma.
- *   5. Restoring → gradual convergent steps toward baseline.
- *   6. Idle → at baseline, depth = 0.
+ *   4. Restoring → gradual convergent steps toward baseline.
+ *   5. Idle → at baseline, depth = 0.
  *
  * Fair across lanes using round-robin scheduling. When no lane is specified,
  * each request gets its own transient lane for maximum fairness.
@@ -269,28 +280,28 @@ export class Executor {
     public readonly timeConstant: number;
 
     private readonly defaults: Parameters;
-    private readonly defaultSignals: ReadonlyArray<Signal>;
+    private readonly defaultRegulatorSignals: ReadonlyArray<RegulatorSignal>;
+    private readonly defaultAdmissionSignals: ReadonlyArray<AdmissionSignal>;
     private readonly logger: Logger;
     private running = false;
 
     private readonly pools = new Map<string, Pool>();
     private transientLaneCounter = 0;
 
-    /** Yield to the event loop between admitted tasks so CPU-bound work doesn't block I/O. */
-    private schedule(fn: () => void): void {
-        const g = globalThis as Record<string, unknown>;
-        typeof g.setImmediate === "function" ? (g.setImmediate as (fn: () => void) => void)(fn) : queueMicrotask(fn);
-    }
-
     constructor(options?: {
         logger?: Logger;
         zScoreThreshold?: number;
-        /** Default backpressure signals for pools that do not override. The
-         *  templates passed are cloned per pool — the same instance can be
+        /** Default regulator (concurrency) signals for pools that do not
+         *  override. Templates are cloned per pool — one instance can be
          *  safely registered with multiple executors/pools.
          *
          *  When omitted, defaults to `[new LatencyDrift()]`. */
-        signals?: Signal[];
+        regulatorSignals?: RegulatorSignal[];
+        /** Default admission (enqueue-shedding) signals for pools that do not
+         *  override. Templates are cloned per pool.
+         *
+         *  When omitted, defaults to `[new EarlyShed()]`. */
+        admissionSignals?: AdmissionSignal[];
     }) {
         this.logger = options?.logger ?? console;
         const z = options?.zScoreThreshold ?? DEFAULT_Z_SCORE_THRESHOLD;
@@ -300,16 +311,12 @@ export class Executor {
         this.defaults = Executor.deriveParameters(z);
         this.zScoreThreshold = this.defaults.zScoreThreshold;
         this.timeConstant = this.defaults.timeConstant;
-        this.defaultSignals = Object.freeze(
-            (options?.signals ?? [new LatencyDrift()]).slice()
+        this.defaultRegulatorSignals = Object.freeze(
+            (options?.regulatorSignals ?? [new LatencyDrift()]).slice()
         );
-    }
-
-    /** Derive all statistical parameters from a single z-score threshold. */
-    private static deriveParameters(zScoreThreshold: number): Parameters {
-        const z2 = zScoreThreshold * zScoreThreshold;
-        const timeConstant = Math.round(2 / (1 - Math.exp(-1 / z2)));
-        return { zScoreThreshold, timeConstant, z2 };
+        this.defaultAdmissionSignals = Object.freeze(
+            (options?.admissionSignals ?? [new EarlyShed()]).slice()
+        );
     }
 
     /** Get parameters for a pool — pool-level override if set, else executor default. */
@@ -400,9 +407,22 @@ export class Executor {
 
         // Pool-level signals replace executor defaults entirely (no merge).
         // Each template is cloned to a fresh per-pool instance so state never
-        // interleaves across pools.
-        const templateSignals = options?.signals ?? this.defaultSignals;
-        const signals = Object.freeze(templateSignals.map((s) => s.clone()));
+        // interleaves across pools. Names must be unique across BOTH lists —
+        // `getSignalState` looks up by name across regulator + admission.
+        const seenNames = new Set<string>();
+        const regulatorSignals = Executor.cloneSignals(
+            options?.regulatorSignals ?? this.defaultRegulatorSignals,
+            "triggered",
+            name,
+            seenNames
+        ) as ReadonlyArray<RegulatorSignal>;
+        const admissionSignals = Executor.cloneSignals(
+            options?.admissionSignals ?? this.defaultAdmissionSignals,
+            "shouldShed",
+            name,
+            seenNames
+        ) as ReadonlyArray<AdmissionSignal>;
+        const lifecycleSignals = Object.freeze([...regulatorSignals, ...admissionSignals]);
 
         this.pools.set(name, {
             name,
@@ -431,18 +451,63 @@ export class Executor {
             dropsThisWindow: 0,
             dropRateEwma: null,
             elapsedWindows: 0,
-            errorsThisWindow: 0,
-            errorRateEwma: null,
             inFlightEwma: null,
             currentAlpha: 0,
             bayesianShrinkage: 0,
-            ewmaSumW2: 0,
+            // Seed Σw² at 1: a just-seeded EWMA has all weight on a single
+            // observation (ESS = 1, df = 0), which makes the Cornish-Fisher
+            // Student-t critical value diverge and gates every statistical
+            // signal off until real evidence accumulates — the warm-up gate.
+            // Starting from 0 would claim infinite effective samples (the
+            // maximally overconfident prior) and arm the test at first data.
+            ewmaSumW2: 1,
             regulationDepth: 0,
             regulationPhase: RegulationPhase.Idle,
             stepScale: 1,
             processQueueTimer: null,
-            signals
+            regulatorSignals,
+            admissionSignals,
+            lifecycleSignals
         });
+    }
+
+    /** Validate and clone a list of signal templates into fresh per-pool
+     *  instances. `decisionMethod` is the required method name for the kind
+     *  (`triggered` for regulator signals, `shouldShed` for admission). Names
+     *  must be unique across the shared `seenNames` set. */
+    private static cloneSignals(
+        templates: ReadonlyArray<BaseSignal>,
+        decisionMethod: "triggered" | "shouldShed",
+        poolName: string,
+        seenNames: Set<string>
+    ): ReadonlyArray<BaseSignal> {
+        for (const s of templates) {
+            if (typeof s?.name !== "string" || s.name.length === 0) {
+                throw new ArgumentError(`Signal in pool "${poolName}" must have a non-empty string \`name\`.`);
+            }
+            const members = s as unknown as Record<string, unknown>;
+            if (typeof members[decisionMethod] !== "function") {
+                throw new ArgumentError(`Signal "${s.name}" in pool "${poolName}" must implement \`${decisionMethod}\`.`);
+            }
+            if (typeof members.clone !== "function") {
+                throw new ArgumentError(`Signal "${s.name}" in pool "${poolName}" must implement \`clone\`.`);
+            }
+            if (seenNames.has(s.name)) {
+                throw new ArgumentError(
+                    `Duplicate signal name "${s.name}" in pool "${poolName}". Each signal must have a unique name (\`getSignalState\` looks up by name).`
+                );
+            }
+            seenNames.add(s.name);
+        }
+        return Object.freeze(
+            templates.map((s) => {
+                const cloned = (s as unknown as { clone(): BaseSignal }).clone();
+                if (cloned == null || typeof cloned !== "object") {
+                    throw new ArgumentError(`Signal "${s.name}".clone() must return a signal, got ${cloned}.`);
+                }
+                return cloned;
+            })
+        );
     }
 
     /**
@@ -457,10 +522,10 @@ export class Executor {
         return p.dropping;
     }
 
-    /** Returns true if any of the pool's configured backpressure signals is
-     *  currently triggered. The default signal is `LatencyDrift` (the v1.x
-     *  Student-t trend test); pools may add `ErrorRateThreshold`,
-     *  `ProbabilisticErrorRate`, or any custom `Signal`. */
+    /** Returns true if any of the pool's configured regulator signals is
+     *  currently triggered. The default is `LatencyDrift` (the v1.x Student-t
+     *  trend test); pools may add any custom `RegulatorSignal`. Note this
+     *  reflects *concurrency* signals only, not admission shedding. */
     public isThroughputDegraded(pool: string): boolean {
         const p = this.pools.get(pool);
         if (!p) throw new ArgumentError(`Pool "${pool}" does not exist.`);
@@ -469,21 +534,34 @@ export class Executor {
 
     /** Returns the current state snapshot of a named signal on a pool, or
      *  `undefined` if the signal is not configured on the pool or doesn't
-     *  expose state. Use this to inspect signal-specific metrics (e.g.
-     *  `LatencyDrift`'s zScore, dLogWBarVarianceEstimate, tCritical, etc.). */
-    public getSignalState(pool: string, signalName: string): Record<string, unknown> | undefined {
+     *  expose state. Searches both regulator and admission signals. Use this
+     *  to inspect signal-specific metrics (e.g. `LatencyDrift`'s zScore,
+     *  dLogWBarVarEst, tCritical; `LaneErrorShed`'s per-lane rates).
+     *
+     *  Pass the signal's state type as `S` to get a typed result back:
+     *  `getSignalState<LatencyDriftState>(pool, "latency-drift")`. */
+    public getSignalState<S = unknown>(
+        pool: string,
+        signalName: string
+    ): S | undefined {
         const p = this.pools.get(pool);
         if (!p) throw new ArgumentError(`Pool "${pool}" does not exist.`);
-        const signal = p.signals.find((s) => s.name === signalName);
-        return signal?.state?.();
+        const signal = p.lifecycleSignals.find((s) => s.name === signalName);
+        return signal?.state?.() as S | undefined;
     }
 
-    /** Iterate the pool's signals; return true on the first triggered one. */
+    /** Iterate the pool's regulator signals; return true on the first
+     *  triggered one. Exceptions are caught so a buggy signal cannot stall
+     *  regulation. */
     private anySignalTriggered(pool: Pool): boolean {
-        if (pool.signals.length === 0) return false;
+        if (pool.regulatorSignals.length === 0) return false;
         const ctx = this.buildSignalContext(pool);
-        for (const s of pool.signals) {
-            if (s.triggered(ctx)) return true;
+        for (const s of pool.regulatorSignals) {
+            try {
+                if (s.triggered(ctx)) return true;
+            } catch (err) {
+                this.logger.error?.(`Signal "${s.name}" threw in triggered:`, err);
+            }
         }
         return false;
     }
@@ -496,7 +574,6 @@ export class Executor {
             completionRateEwma: pool.completionRateEwma,
             admissionRateEwma: pool.admissionRateEwma,
             dropRateEwma: pool.dropRateEwma,
-            errorRateEwma: pool.errorRateEwma,
             inFlightEwma: pool.inFlightEwma,
             regulationPhase: RegulationPhase[pool.regulationPhase],
             regulationDepth: pool.regulationDepth,
@@ -516,8 +593,26 @@ export class Executor {
             concurrencyLimit: pool.concurrencyLimit,
             inFlight: pool.inFlight,
             queueLength: pool.queueLength,
+            dropping: pool.dropping,
             regulator
         });
+    }
+
+    /** Dispatch a lifecycle hook to every signal on the pool, catching and
+     *  logging any exception so a buggy signal cannot break the engine. */
+    private dispatchLifecycle(
+        pool: Pool,
+        invoke: (signal: BaseSignal, ctx: SignalContext) => void
+    ): void {
+        if (pool.lifecycleSignals.length === 0) return;
+        const ctx = this.buildSignalContext(pool);
+        for (const s of pool.lifecycleSignals) {
+            try {
+                invoke(s, ctx);
+            } catch (err) {
+                this.logger.error?.(`Signal "${s.name}" threw in a lifecycle hook:`, err);
+            }
+        }
     }
 
     /** Returns the number of tasks waiting in the queue for a pool. */
@@ -552,11 +647,10 @@ export class Executor {
             completionRateEwma: p.completionRateEwma,
             admissionRateEwma: p.admissionRateEwma,
             dropRateEwma: p.dropRateEwma,
-            errorRateEwma: p.errorRateEwma,
             regulationPhase: RegulationPhase[p.regulationPhase],
             regulationDepth: p.regulationDepth,
             elapsedWindows: p.elapsedWindows,
-            degrading: this.anySignalTriggered(p)
+            overloadDetected: this.anySignalTriggered(p)
         };
     }
 
@@ -654,16 +748,20 @@ export class Executor {
             }
 
             // Reject all queued entries so callers don't hang forever.
-            for (const lane of pool.lanes.values()) {
+            // Idle lanes are torn down via removeLane so signals get their
+            // onLaneRemoved notification; lanes with in-flight tasks stay
+            // registered — the normal completion path removes them (and
+            // notifies signals) once their last task finishes.
+            for (const lane of [...pool.lanes.values()]) {
                 for (const entry of lane.entries) {
                     entry.callback.reject(new ExecutorNotRunningError());
                 }
+                pool.queueLength -= lane.entries.length;
                 lane.entries = [];
+                if (lane.inFlight === 0) {
+                    this.removeLane(pool, lane);
+                }
             }
-            pool.lanes.clear();
-            pool.laneHead = null;
-            pool.laneTail = null;
-            pool.queueLength = 0;
 
             // Reject debounced entries so their promises don't hang.
             for (const entry of pool.debounceMap.values()) {
@@ -698,56 +796,46 @@ export class Executor {
         lane.next = null;
     }
 
-    /** Remove lane from both map and linked list. */
+    /** Remove lane from both map and linked list, and notify signals so they
+     *  can release per-lane state. `onLaneRemoved` takes only the lane key
+     *  (teardown needs no context), keeping it cheap under transient-lane churn. */
     private removeLane(pool: Pool, lane: Lane): void {
         this.unlinkLane(pool, lane);
         pool.lanes.delete(lane.key);
+        for (const s of pool.lifecycleSignals) {
+            if (!s.onLaneRemoved) continue;
+            try {
+                s.onLaneRemoved(lane.key);
+            } catch (err) {
+                this.logger.error?.(`Signal "${s.name}" threw in onLaneRemoved:`, err);
+            }
+        }
     }
 
     private enqueueAndWait(pool: Pool, laneKey: string): Promise<void> {
-        // Probabilistic early shedding: when ProDel is actively dropping and
-        // the pool is at capacity, new arrivals are likely doomed to queue and
-        // be dropped. Reject early with P = shrinkage × dropRate / (dropRate +
-        // completionRate) so they get an instant 503 instead of waiting in
-        // queue. Only at capacity — if there's room to admit, let the request
-        // through.
-        if (
-            pool.dropping &&
-            pool.inFlight >= pool.concurrencyLimit &&
-            pool.dropRateEwma !== null &&
-            pool.dropRateEwma > 0 &&
-            pool.completionRateEwma !== null &&
-            pool.completionRateEwma > 0
-        ) {
-            // Bayesian shrinkage dampens the probability at low throughput
-            // where the drop/completion rate EWMAs are based on few observations.
-            const P =
-                (pool.dropRateEwma / (pool.dropRateEwma + pool.completionRateEwma)) *
-                this.shrinkage(pool.completionRateEwma, this.params(pool).z2);
-            if (Math.random() < P) {
-                pool.dropsThisWindow++;
-                return Promise.reject(
-                    new ResourceExhaustedError(
-                        `Pool "${pool.name}" is overloaded (early shed, P=${P.toFixed(2)})`
-                    )
-                );
+        // Admission signals decide enqueue-time shedding. Any signal returning
+        // `shouldShed === true` rejects the request immediately (counted as a
+        // drop) — the default `EarlyShed` rejects arrivals likely to queue and
+        // be dropped; opt-in `LaneErrorShed` fences off a failing lane.
+        // Exceptions are caught so a buggy signal cannot break admission.
+        if (pool.admissionSignals.length > 0) {
+            const ctx = this.buildSignalContext(pool);
+            for (const s of pool.admissionSignals) {
+                let shed = false;
+                try {
+                    shed = s.shouldShed(ctx, laneKey);
+                } catch (err) {
+                    this.logger.error?.(`Signal "${s.name}" threw in shouldShed:`, err);
+                }
+                if (shed) {
+                    pool.dropsThisWindow++;
+                    return Promise.reject(
+                        new ResourceExhaustedError(
+                            `Pool "${pool.name}" shed at admission by signal "${s.name}" (lane "${laneKey}")`
+                        )
+                    );
+                }
             }
-        }
-
-        // Per-lane error shedding: if this lane has been failing recently,
-        // probabilistically shed to avoid wasting a slot on a likely failure.
-        // Only applies to persistent lanes (transient lanes have no history).
-        const existingLane = pool.lanes.get(laneKey);
-        if (
-            existingLane &&
-            existingLane.errorRateEwma > 0 &&
-            Math.random() < existingLane.errorRateEwma
-        ) {
-            return Promise.reject(
-                new ResourceExhaustedError(
-                    `Pool "${pool.name}" lane "${laneKey}" is failing (error rate: ${(existingLane.errorRateEwma * 100).toFixed(0)}%)`
-                )
-            );
         }
 
         const entry: QueueEntry = {
@@ -762,10 +850,7 @@ export class Executor {
                 inFlight: 0,
                 key: laneKey,
                 prev: null,
-                next: null,
-                errorRateEwma: 0,
-                lastCompletionTime: performance.now(),
-                completions: 0
+                next: null
             };
             pool.lanes.set(laneKey, lane);
             this.appendLane(pool, lane);
@@ -997,23 +1082,38 @@ export class Executor {
         const entry = (pool.dropping ? lane.entries.pop() : lane.entries.shift())!;
         pool.queueLength--;
         const now = performance.now();
+        // CONTRACT: signal `onAdmit` hooks MUST fire *after* `pool.inFlight++`.
+        // LatencyDrift derives the pre-change count as `ctx.inFlight − 1`.
         pool.inFlight++;
         lane.inFlight++;
         pool.admissionsThisWindow++;
 
-        // Notify signals after the inFlight count is updated.
-        if (pool.signals.length > 0) {
-            const ctx = this.buildSignalContext(pool);
-            const info: AdmitInfo = { lane: lane.key, admitTime: now };
-            for (const s of pool.signals) s.onAdmit?.(ctx, info);
-        }
+        // Notify signals after the inFlight count is updated. Exceptions
+        // from a buggy user signal must not corrupt admission state.
+        const info: AdmitInfo = { lane: lane.key, admitTime: now };
+        this.dispatchLifecycle(pool, (s, ctx) => s.onAdmit?.(ctx, info));
 
         // If stop() is called between here and the scheduled callback firing,
         // reject with ExecutorNotRunningError rather than silently dropping the
-        // promise — otherwise the caller's run() hangs forever.
+        // promise — and undo the admission bookkeeping, since the task will
+        // never run and inFlight is only ever decremented in executeTask's
+        // finally. Without the undo, the pool permanently loses a concurrency
+        // slot across stop()/start(), and signals integrate a phantom task.
         this.schedule(() => {
-            if (this.running) entry.callback.resolve();
-            else entry.callback.reject(new ExecutorNotRunningError());
+            if (this.running) {
+                entry.callback.resolve();
+                return;
+            }
+            pool.inFlight--;
+            lane.inFlight--;
+            if (
+                lane.entries.length === 0 &&
+                lane.inFlight === 0 &&
+                pool.lanes.get(lane.key) === lane
+            ) {
+                this.removeLane(pool, lane);
+            }
+            entry.callback.reject(new ExecutorNotRunningError());
         });
     }
 
@@ -1048,20 +1148,19 @@ export class Executor {
      * z² = 4 pseudo-observations. At low throughput, the shrinkage dampens
      * updates from sparse windows. Detection uses a uniform σ × SE threshold.
      *
-     * **Six branches per TIME_CONSTANT evaluation:**
-     *   1. latency degrading → decrease (retract or fresh ramp)
+     * **Five branches per TIME_CONSTANT evaluation:**
+     *   1. any signal triggered → decrease (retract or fresh ramp)
      *   2. cooling (Retracting/Decreasing → Idle) → one-eval pause
      *   3. queue pressure → increase (only when not in decrease sequence)
-     *   4. probabilistic error decrease (P = errorRateEwma)
-     *   5. restoring → gradual convergent steps toward baseline
-     *   6. idle → at baseline, depth = 0
+     *   4. restoring → gradual convergent steps toward baseline
+     *   5. idle → at baseline, depth = 0
      *
      * **Completion-driven.** This function is only invoked from `executeTask`'s
      * `finally` block. A pool whose tasks are all stuck (no completions) will
      * not advance its window state, which means:
      *   - `elapsedWindows` does not increment.
-     *   - EWMAs (completion rate, error rate, W, dW, V, sumW2) do not decay.
-     *   - `isLatencyDegrading` returns whatever its last-computed state was.
+     *   - EWMAs (completion rate, drop rate, sumW2) do not decay.
+     *   - Each signal's cached `triggered()` reflects its last-computed state.
      *   - The regulator cannot decrease concurrency on a stuck pool.
      * This is the intended behavior — without data, there's no signal to
      * regulate on — but callers relying on `isThroughputDegraded` for
@@ -1088,7 +1187,13 @@ export class Executor {
         // Effective sample size: exact Σw² recursion under time-varying α.
         pool.ewmaSumW2 = (1 - alpha) * (1 - alpha) * pool.ewmaSumW2 + alpha * alpha;
         pool.currentAlpha = alpha;
-        pool.bayesianShrinkage = windowShrinkage;
+        // Hold the last non-zero shrinkage across empty windows so signals
+        // reading `ctx.regulator.bayesianShrinkage` mid-window (e.g. from an
+        // onComplete hook) don't see a transient 0 that would silently
+        // disable any input multiplied by it.
+        if (pool.completionsThisWindow > 0) {
+            pool.bayesianShrinkage = windowShrinkage;
+        }
 
         const countAlpha = alpha * windowShrinkage;
 
@@ -1116,19 +1221,6 @@ export class Executor {
         }
         pool.dropsThisWindow = 0;
 
-        // Update error rate EWMA (errors/completions). Tracked for observability
-        // and read by built-in error signals (ErrorRateThreshold,
-        // ProbabilisticErrorRate).
-        if (pool.completionsThisWindow > 0) {
-            const instantErrorRate = pool.errorsThisWindow / pool.completionsThisWindow;
-            if (pool.errorRateEwma === null) {
-                pool.errorRateEwma = instantErrorRate;
-            } else {
-                pool.errorRateEwma = (1 - countAlpha) * pool.errorRateEwma + countAlpha * instantErrorRate;
-            }
-        }
-
-        pool.errorsThisWindow = 0;
         pool.elapsedWindows++;
 
         // Update in-flight count EWMA (observability).
@@ -1140,17 +1232,14 @@ export class Executor {
         // ── Notify signals at window boundary ──
         // Each signal updates its own derived state (e.g., LatencyDrift's
         // operational-LL integral, log/EWMA/dLogW/δ²/SE pipeline).
-        if (pool.signals.length > 0) {
-            const ctx = this.buildSignalContext(pool);
-            const evalInfo: EvaluateInfo = {
-                windowStart: pool.windowStart,
-                windowEnd: now,
-                elapsed,
-                completions: pool.completionsThisWindow,
-                admissions
-            };
-            for (const s of pool.signals) s.onEvaluate?.(ctx, evalInfo);
-        }
+        const evalInfo: EvaluateInfo = {
+            windowStart: pool.windowStart,
+            windowEnd: now,
+            elapsed,
+            completions: pool.completionsThisWindow,
+            admissions
+        };
+        this.dispatchLifecycle(pool, (s, ctx) => s.onEvaluate?.(ctx, evalInfo));
 
         // ── Periodic convergent throughput regulation + gravity ──
         // Fires every TIME_CONSTANT windows so signals have time (~63%
@@ -1227,48 +1316,30 @@ export class Executor {
             errored = true;
             throw err;
         } finally {
-            if (errored) {
-                pool.errorsThisWindow++;
-            }
             pool.completionsThisWindow++;
 
             const completionNow = performance.now();
+            // CONTRACT: signal `onComplete` hooks MUST fire *after* `pool.inFlight--`.
+            // LatencyDrift derives the pre-change count as `ctx.inFlight + 1`.
             pool.inFlight--;
 
-            // Notify signals after the inFlight count is decremented.
-            if (pool.signals.length > 0) {
-                const ctx = this.buildSignalContext(pool);
-                const info: CompletionInfo = {
-                    lane: laneKey,
-                    admitTime,
-                    completionTime: completionNow,
-                    serviceTime: completionNow - admitTime,
-                    errored
-                };
-                for (const s of pool.signals) s.onComplete?.(ctx, info);
-            }
+            // Notify signals after the inFlight count is decremented. A
+            // throwing user signal must not replace the task's own result —
+            // this runs inside the caller's `finally`, so any uncaught throw
+            // would overwrite both the resolution and the error path.
+            // `dispatchLifecycle` catches per-signal exceptions.
+            const info: CompletionInfo = {
+                lane: laneKey,
+                admitTime,
+                completionTime: completionNow,
+                serviceTime: completionNow - admitTime,
+                errored
+            };
+            this.dispatchLifecycle(pool, (s, ctx) => s.onComplete?.(ctx, info));
 
             const lane = pool.lanes.get(laneKey);
             if (lane) {
                 lane.inFlight--;
-
-                // Update per-lane error rate EWMA, time-weighted by elapsed
-                // time since last completion. Rapid completions → small alpha
-                // (each sample less weight). Long gaps → large alpha (old data stale).
-                const now = performance.now();
-                // Ensure at least 1ms elapsed so rapid completions at the
-                // same tick still contribute weight to the EWMA.
-                lane.completions++;
-                const laneElapsed = Math.max(1, now - lane.lastCompletionTime);
-                const { timeConstant: hl, z2: z2_ } = this.params(pool);
-                const timeAlpha = 1 - Math.exp(-laneElapsed / (hl * pool.controlWindow));
-                // Bayesian shrinkage: dampens updates for lanes with few
-                // completions — prevents noisy early estimates from causing
-                // aggressive per-lane shedding.
-                const laneAlpha = timeAlpha * this.shrinkage(lane.completions, z2_);
-                lane.errorRateEwma = (1 - laneAlpha) * lane.errorRateEwma + laneAlpha * (errored ? 1 : 0);
-                lane.lastCompletionTime = now;
-
                 if (lane.entries.length === 0 && lane.inFlight === 0) {
                     this.removeLane(pool, lane);
                 }
@@ -1277,14 +1348,6 @@ export class Executor {
             this.evaluateControlWindow(pool);
             this.processQueue(pool);
         }
-    }
-
-    /** Bayesian shrinkage factor: n/(n+z²). Weights an observation of n samples
-     *  against a prior of z² pseudo-observations. At z=2, n=1: 0.20, n=10: 0.71,
-     *  n=100: 0.96. Used for parameter
-     *  estimation (level, rates, proportions) — not for the hypothesis test. */
-    private shrinkage(n: number, z2: number): number {
-        return n / (n + z2);
     }
 
     // Note: tScore and isLatencyDegrading have been moved into the
@@ -1350,5 +1413,18 @@ export class Executor {
         const f = 1 - Math.exp(-pool.regulationDepth / this.params(pool).timeConstant);
         const step = Math.max(1, Math.ceil(pool.concurrencyLimit * f * pool.stepScale));
         pool.concurrencyLimit = Math.min(pool.maximumConcurrency, pool.concurrencyLimit + step);
+    }
+
+    /** Yield to the event loop between admitted tasks so CPU-bound work doesn't block I/O. */
+    private schedule(fn: () => void): void {
+        const g = globalThis as Record<string, unknown>;
+        typeof g.setImmediate === "function" ? (g.setImmediate as (fn: () => void) => void)(fn) : queueMicrotask(fn);
+    }
+
+    /** Derive all statistical parameters from a single z-score threshold. */
+    private static deriveParameters(zScoreThreshold: number): Parameters {
+        const z2 = zScoreThreshold * zScoreThreshold;
+        const timeConstant = Math.round(2 / (1 - Math.exp(-1 / z2)));
+        return { zScoreThreshold, timeConstant, z2 };
     }
 }

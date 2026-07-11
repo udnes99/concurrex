@@ -2,63 +2,79 @@
 "concurrex": major
 ---
 
-**v2.0**: Pluggable backpressure signals with a shared statistical foundation.
+**v2.0**: Pluggable policy signals with a shared statistical foundation.
 
-The throughput regulator no longer implements detection logic itself. It computes a single statistical *heartbeat* (α, ESS, df, shrinkage — all derived from the pool's `zScoreThreshold`) and exposes it to signals. Each signal observes raw task events via lifecycle hooks and decides whether to fire. The latency-trend hypothesis test is now a built-in `LatencyDrift` signal that composes the heartbeat with its own inline EWMAs and δ² noise estimator.
+The executor no longer hardcodes detection or shedding logic. It owns the *engine* — the queue (ProDel), lanes, the statistical *heartbeat* (α, ESS, df, shrinkage — all derived from the pool's single `zScoreThreshold`), and the concurrency/admission actuators — and delegates *policy* to two kinds of pluggable signal:
+
+- **`RegulatorSignal`** decides *concurrency*: `triggered()` is checked once per evaluation cycle; if any fires, the regulator decreases the limit. Default: `LatencyDrift` (the v1.x latency-trend Student-t test, now a first-class signal).
+- **`AdmissionSignal`** decides *admission*: `shouldShed(ctx, laneKey)` is queried per request at enqueue; if any returns `true`, the request is rejected instantly. Default: `EarlyShed` (the v1.x probabilistic early shedding). `LaneErrorShed` (the v1.x per-lane error shedding) is an exported opt-in.
 
 ## What's new
 
 ```typescript
-import { Executor, LatencyDrift, ErrorRateThreshold, ProbabilisticErrorRate, Statistics } from "concurrex";
+import { Executor, LatencyDrift, EarlyShed, LaneErrorShed } from "concurrex";
 
-// Default behavior: identical to v1.x — just LatencyDrift
+// Default behavior: LatencyDrift (concurrency) + EarlyShed (admission)
 const exec = new Executor();
 
-// Compose: latency + opt-in error threshold
-const exec2 = new Executor({
-    signals: [
-        new LatencyDrift(),
-        new ErrorRateThreshold({ threshold: 0.5 })
-    ]
-});
-
-// Per-pool override (replaces executor defaults entirely)
+// Per-pool override — each list replaces the executor defaults entirely
 exec.registerPool("api", {
-    signals: [new LatencyDrift(), new ProbabilisticErrorRate()]
+    regulatorSignals: [new LatencyDrift()],
+    admissionSignals: [new EarlyShed(), new LaneErrorShed()] // opt into per-lane shedding
 });
 
-// Custom signal — implement the Signal interface inline
+// Custom signals — implement the interface inline
 exec.registerPool("ingest", {
-    signals: [new LatencyDrift(), {
+    regulatorSignals: [new LatencyDrift(), {
         name: "memory-pressure",
-        onAdmit() {}, onComplete() {}, onEvaluate() {},
         triggered: () => process.memoryUsage().heapUsed > 1_000_000_000,
+        clone() { return this; }
+    }],
+    admissionSignals: [new EarlyShed(), {
+        name: "circuit-breaker",
+        shouldShed: () => myBreaker.isOpen(),
         clone() { return this; }
     }]
 });
 ```
 
-### Signal interface
+### Signal interfaces
 
 ```typescript
-interface Signal {
+interface BaseSignal<S = unknown> {
     readonly name: string;
-    onAdmit(ctx: SignalContext, info: AdmitInfo): void;
-    onComplete(ctx: SignalContext, info: CompletionInfo): void;
-    onEvaluate(ctx: SignalContext, info: EvaluateInfo): void;
+    onAdmit?(ctx: SignalContext, info: AdmitInfo): void;
+    onComplete?(ctx: SignalContext, info: CompletionInfo): void;
+    onEvaluate?(ctx: SignalContext, info: EvaluateInfo): void;
+    onLaneRemoved?(laneKey: string): void;   // release per-lane state
+    state?(): S;
+}
+interface RegulatorSignal<S = unknown> extends BaseSignal<S> {
     triggered(ctx: SignalContext): boolean;
-    clone(): Signal;
-    state?(): Record<string, unknown>;
+    clone(): RegulatorSignal<S>;
+}
+interface AdmissionSignal<S = unknown> extends BaseSignal<S> {
+    shouldShed(ctx: SignalContext, laneKey: string): boolean;
+    clone(): AdmissionSignal<S>;
 }
 ```
 
-Signals own their per-pool observation state and use `Statistics.*` utilities (tScore, timeWeightedAlpha, bayesianShrinkage, studentTTrendSE) to compose their hypothesis test. The pool's heartbeat is the single source of truth for the control loop's statistical parameters — every signal on a pool reads the same `currentAlpha`, `ewmaSumW2`, `df`, `zScoreThreshold` via `ctx.regulator`.
+Both kinds share lifecycle hooks (all optional) and a generic `state()`. Built-ins declare their state type — `LatencyDrift implements RegulatorSignal<LatencyDriftState>` — and the matching state interfaces (`LatencyDriftState`, `LaneErrorShedState`) are exported for typed diagnostics:
+
+```typescript
+const latency = executor.getSignalState<LatencyDriftState>("api", "latency-drift");
+latency?.zScore;  // number, no cast needed
+```
+
+Signals own their per-pool state (cloned per pool) and use `Statistics.*` utilities to compose their decision. The pool's heartbeat is the single source of truth — every signal on a pool reads the same `currentAlpha`, `ewmaSumW2`, `df`, `zScoreThreshold` via `ctx.regulator`. The executor catches and logs exceptions from any hook or decision method, so a buggy signal cannot break the engine.
 
 ### Built-in signals
 
-- **`LatencyDrift`** — the v1.x latency-trend Student-t test, now a first-class signal. Default for every pool. Composes the heartbeat with its own operational-LL integral, log/EWMA/δ²/SE pipeline.
-- **`ErrorRateThreshold({ threshold })`** — fires when `errorRateEwma > threshold`. Deterministic, stateless.
-- **`ProbabilisticErrorRate`** — fires with `P = errorRateEwma`. Preserves v1.2 default behavior; opt-in for v2.0+.
+- **`LatencyDrift`** (regulator, default) — the v1.x latency-trend Student-t test. Composes the heartbeat with its own operational-LL integral, log/EWMA/δ²/SE pipeline.
+- **`EarlyShed`** (admission, default) — the v1.x probabilistic early shedding (`P = dropRate/(dropRate+completionRate) × shrinkage` when ProDel is dropping and at capacity). Queue-health based, domain-agnostic, stateless.
+- **`LaneErrorShed`** (admission, opt-in) — the v1.x per-lane error shedding. Tracks each lane's error-rate EWMA in its own map and sheds new requests to a failing lane. **Off by default** — an "error" is domain-specific (a 404, a validation failure, or a business rejection is not an infrastructure failure).
+
+There is no built-in *pool-wide* error signal. To make errors drive concurrency, write a `RegulatorSignal` that observes `info.errored` in `onComplete` — see `examples/express-server.ts`.
 
 ### Statistics namespace
 
@@ -79,30 +95,69 @@ Statistics.studentTTrendSE({ sigmaSqEstimate, ewmaSumW2 });
 Latency-test internals moved from `RegulatorState` into `LatencyDrift`'s per-signal state. Removed fields:
 
 - `logW`, `logWBar`
-- `dLogWBarEwma`, `dLogWBarVarianceEstimate`
+- `dLogWBarEwma`, `dLogWBarVarianceEstimate` (formerly `dLogWBarSM` in v1.1)
 - `ewmaSumW2`, `se`, `zScore`, `tCritical`, `threshold`
 - `alpha`
+- `errorRateEwma` — pool-wide error tracking removed (see "Hardcoded probabilistic-error-decrease is gone")
 
-Inspect them via:
+Renamed:
+
+- `degrading` → `overloadDetected` (new semantics: "any configured regulator signal triggered", not specifically the latency test)
+
+Added:
+
+- `admissionRateEwma` — admission-rate observability counterpart to `completionRateEwma`/`dropRateEwma`.
+
+Inspect the removed latency-test fields via:
 
 ```typescript
 const latency = executor.getSignalState("api", "latency-drift");
 console.log(latency.dLogWBarEwma, latency.zScore, latency.tCritical);
 ```
 
-The `degrading` field on `RegulatorState` is preserved but its semantics changed: it now means "any configured signal is currently triggered" (equivalent to `isThroughputDegraded`), not specifically the latency test.
+### `signals` option → `regulatorSignals` + `admissionSignals`
 
-### Hardcoded probabilistic-error-decrease is gone
-
-The v1.2 regulator branch that fired with `P = errorRateEwma` is removed. Pools that relied on it must opt in:
+The single `signals` option (executor and per-pool) is split into two: `regulatorSignals` (concurrency) and `admissionSignals` (admission). Each replaces the corresponding executor default entirely when provided. The `Signal` type is renamed `RegulatorSignal`; `AdmissionSignal` and `BaseSignal` are new.
 
 ```typescript
-new Executor({
-    signals: [new LatencyDrift(), new ProbabilisticErrorRate()]
-});
+// v1.x / earlier v2 preview
+new Executor({ signals: [new LatencyDrift()] });
+// v2.0
+new Executor({ regulatorSignals: [new LatencyDrift()], admissionSignals: [new EarlyShed()] });
 ```
 
-Default behavior is now `[new LatencyDrift()]` only — the regulator decreases on sustained latency drift, but errors don't drive concurrency unless you opt in.
+### Hardcoded probabilistic-error-decrease is gone — and so is the pool-wide error EWMA
+
+The v1.2 regulator branch that fired concurrency decreases with `P = errorRateEwma` is removed. The pool-level `errorRateEwma` field that fed it is also removed — both from `RegulatorState` (observability) and `RegulatorContext` (signal input).
+
+Per-lane error shedding (rejecting new requests to a recently-failing lane at enqueue) still exists but is now the **opt-in `LaneErrorShed` admission signal**, off by default. Add it to a pool's `admissionSignals` to restore the v1.x behavior:
+
+```typescript
+exec.registerPool("api", { admissionSignals: [new EarlyShed(), new LaneErrorShed()] });
+```
+
+It was unconditional in v1.x; in v2.0 the library no longer assumes a task failure means a lane should be fenced off.
+
+To make errors drive *concurrency*, define your own `RegulatorSignal`:
+
+```typescript
+class HttpErrorRate implements RegulatorSignal {
+    readonly name = "http-error-rate";
+    private rateEwma: number | null = null;
+    constructor(private threshold = 0.1) {}
+    onComplete(ctx: SignalContext, info: CompletionInfo) {
+        const alpha = Statistics.timeWeightedAlpha(/* … */);
+        const sample = info.errored ? 1 : 0;
+        this.rateEwma = this.rateEwma === null
+            ? sample
+            : (1 - alpha) * this.rateEwma + alpha * sample;
+    }
+    triggered() { return this.rateEwma !== null && this.rateEwma > this.threshold; }
+    clone() { return new HttpErrorRate(this.threshold); }
+}
+```
+
+See `examples/express-server.ts` for a complete example. Default behavior is now `[new LatencyDrift()]` (regulator) + `[new EarlyShed()]` (admission); errors don't drive concurrency unless you wire up a signal.
 
 ### `getRegulatorState` field removals
 
@@ -113,9 +168,9 @@ Code reading the removed fields will fail to type-check. Migration is one line p
 const state = executor.getRegulatorState("api");
 const zScore = state.zScore;
 
-// v2.0
-const latency = executor.getSignalState("api", "latency-drift");
-const zScore = latency?.zScore as number;
+// v2.0 — pass the state type for a typed result
+const latency = executor.getSignalState<LatencyDriftState>("api", "latency-drift");
+const zScore = latency?.zScore;
 ```
 
 ## Why this design
@@ -131,7 +186,7 @@ The split between *what's observed* (signal-local state) and *how the test works
 
 ## Theorems extended
 
-Theorem 7' (Joint FPR bound): under H₀ for a pool with N signals participating in the statistical framework (i.e., signals that use `Statistics.*` with the pool's `zScoreThreshold`), the joint FPR is bounded by Bonferroni:
+Theorem 7' (Joint FPR bound): under H₀ for a pool with N regulator signals participating in the statistical framework (i.e., signals that use `Statistics.*` with the pool's `zScoreThreshold`), the joint FPR is bounded by Bonferroni:
 
 $$P(\text{any signal fires} \mid H_0) \leq \sum_{i=1}^{N} \Phi(-z_i) = N \cdot \Phi(-z)$$
 
@@ -139,12 +194,19 @@ where all signals share the same z = `zScoreThreshold` via the heartbeat. v1.x i
 
 ## Migration
 
-If you used v1.x with default settings: **no migration needed** — the default `LatencyDrift` signal preserves v1.x latency-test behavior identically.
+**If you used v1.x with default settings:** no code changes are required, but two default behaviors changed:
 
-If you read `RegulatorState.zScore` (or similar latency fields): migrate to `executor.getSignalState(pool, "latency-drift")`.
+- **Per-lane error shedding is now opt-in.** v1.x unconditionally rejected new requests to lanes with a high error-rate EWMA. To restore it, add the signal explicitly: `registerPool("api", { admissionSignals: [new EarlyShed(), new LaneErrorShed()] })`.
+- **Error-driven concurrency decrease is removed.** The v1.2 regulator branch that decreased concurrency with `P = errorRateEwma` is gone. To make errors drive concurrency, write a `RegulatorSignal` that observes `info.errored` in `onComplete` — see `examples/express-server.ts`.
 
-If you relied on v1.2's default probabilistic-error-decrease: add `new ProbabilisticErrorRate()` to your signals.
+The latency test (`LatencyDrift`) and early shedding (`EarlyShed`) are preserved: same statistics, same parameters, same defaults.
+
+If you passed `signals: [...]`: rename to `regulatorSignals: [...]` (and add `admissionSignals: [...]` if you customize shedding). The `Signal` type is now `RegulatorSignal`.
+
+If you read `RegulatorState.zScore` (or similar latency fields): migrate to `executor.getSignalState<LatencyDriftState>(pool, "latency-drift")`.
+
+If you read `RegulatorState.errorRateEwma`: that field is gone. Track the EWMA inside your custom error signal (or `LaneErrorShed`'s `state()` for the per-lane rates).
 
 ## Tests
 
-116/116 tests pass. New tests added for the Signal interface, signal cloning, OR-composition, and per-signal state inspection.
+133/133 tests pass. New tests added for the regulator/admission signal interfaces, signal cloning, OR-composition, per-signal state inspection, hook + decision-method exception safety, custom admission signals, opt-in `LaneErrorShed` (on and off), `stop()` lifecycle cleanup (`onLaneRemoved` teardown, no in-flight leak across stop/start), and the statistical warm-up gate (`ewmaSumW2` seeded at 1). Tests for the removed probabilistic-error-decrease branch were dropped along with the feature.

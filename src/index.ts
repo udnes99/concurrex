@@ -17,16 +17,19 @@ export {
 } from "./errors.js";
 
 export {
-    type Signal,
+    type BaseSignal,
+    type RegulatorSignal,
+    type AdmissionSignal,
     type SignalContext,
     type RegulatorContext,
     type AdmitInfo,
     type CompletionInfo,
     type EvaluateInfo,
-    type ErrorRateThresholdOptions,
+    type LatencyDriftState,
+    type LaneErrorShedState,
     LatencyDrift,
-    ErrorRateThreshold,
-    ProbabilisticErrorRate,
+    EarlyShed,
+    LaneErrorShed,
 } from "./signals.js";
 
 export { Statistics } from "./statistics.js";

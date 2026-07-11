@@ -14,18 +14,22 @@ export class Statistics {
     private constructor() {} // namespace only — not instantiable
 
     /** Time-weighted EWMA smoothing factor: α = 1 − exp(−Δt / (τ · CW)).
-     *  Continuous-time analog of the discrete EWMA λ = exp(−1/τ). */
+     *  Continuous-time analog of the discrete EWMA λ = exp(−1/τ).
+     *  Clamps negative `elapsedMs` to 0 so clock skew or mocked timers
+     *  can't corrupt downstream EWMA recursions. */
     static timeWeightedAlpha(elapsedMs: number, timeConstant: number, controlWindow: number): number {
-        return 1 - Math.exp(-elapsedMs / (timeConstant * controlWindow));
+        const dt = Math.max(0, elapsedMs);
+        return 1 - Math.exp(-dt / (timeConstant * controlWindow));
     }
 
     /** Bayesian shrinkage factor: n/(n + z²).
      *
      *  Optimal weight for combining n new observations against a prior
      *  of strength z² pseudo-observations. Same denominator as the
-     *  Wilson score interval. */
+     *  Wilson score interval. Returns 0 if both n and z² are 0. */
     static bayesianShrinkage(n: number, z2: number): number {
-        return n / (n + z2);
+        const denom = n + z2;
+        return denom === 0 ? 0 : n / denom;
     }
 
     /** Derive the EWMA time constant from a z-score threshold:
@@ -47,7 +51,8 @@ export class Statistics {
      *  autocorrelation ρ_h = −α(1−α)^(h−1)/2 (see THEORY.md §4.3.1).
      *  The caller must pass an unbiased σ̂² estimate (typically δ²/(1+α/2)). */
     static studentTTrendSE(args: { sigmaSqEstimate: number; ewmaSumW2: number }): number {
-        return Math.sqrt(args.sigmaSqEstimate * args.ewmaSumW2 * (1 + args.ewmaSumW2) / 2);
+        const sigmaSq = Math.max(0, args.sigmaSqEstimate);
+        return Math.sqrt(sigmaSq * args.ewmaSumW2 * (1 + args.ewmaSumW2) / 2);
     }
 
     /** One-sided Student-t critical value (safe upper bound) at upper-tail
