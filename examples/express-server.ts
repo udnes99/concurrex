@@ -71,7 +71,7 @@ class HttpErrorRate implements RegulatorSignal<HttpErrorRateState> {
             // prior to blend against.
             this.errorRateEwma = sample;
         } else {
-            const { timeConstant, controlWindow } = ctx.regulator;
+            const { timeConstant, controlWindow } = ctx.inference;
             const elapsed = info.completionTime - (this.lastUpdate ?? info.completionTime);
             const alpha = Statistics.timeWeightedAlpha(elapsed, timeConstant, controlWindow);
             this.errorRateEwma = (1 - alpha) * this.errorRateEwma + alpha * sample;

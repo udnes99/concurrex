@@ -851,6 +851,49 @@ describe("Executor tests", () => {
             });
         });
 
+        describe("LatencyDrift options and state snapshot", () => {
+            test("clone preserves the configured name", () => {
+                const template = new LatencyDrift({ name: "custom-drift" });
+                const cloned = template.clone();
+                expect(cloned).not.toBe(template);
+                expect(cloned.name).toBe("custom-drift");
+            });
+
+            test("custom names allow multiple instances on one pool", async () => {
+                executor.registerPool("test", {
+                    regulatorSignals: [
+                        new LatencyDrift(),
+                        new LatencyDrift({ name: "latency-drift-b" })
+                    ]
+                });
+
+                // Drive a couple of windows so both signals evaluate.
+                for (let i = 0; i < 3; i++) {
+                    const t = executor.run("test", () => wait(150));
+                    await vi.advanceTimersByTimeAsync(150);
+                    await t;
+                }
+
+                const a = executor.getSignalState<LatencyDriftState>("test", "latency-drift");
+                const b = executor.getSignalState<LatencyDriftState>("test", "latency-drift-b");
+                expect(a).toBeDefined();
+                expect(b).toBeDefined();
+                // Both instances observe the same events independently.
+                for (const s of [a!, b!]) {
+                    expect(s.logWBar).not.toBeNull();
+                    expect(s.degrading).toBe(false);
+                }
+            });
+
+            test("default LatencyDrift name and behavior are unchanged", () => {
+                executor.registerPool("test");
+                const state = executor.getSignalState<LatencyDriftState>("test", "latency-drift");
+                expect(state).toBeDefined();
+                expect(state!.se).toBe(0); // no data yet → test not evaluable
+                expect(state!.degrading).toBe(false);
+            });
+        });
+
         describe("Statistical heartbeat warm-up", () => {
             test("seeds ewmaSumW2 at 1 so the Student-t gate starts near df = 0", async () => {
                 const observed: Array<{ ewmaSumW2: number; df: number }> = [];
@@ -859,8 +902,8 @@ describe("Executor tests", () => {
                     triggered: () => false,
                     onEvaluate(ctx) {
                         observed.push({
-                            ewmaSumW2: ctx.regulator.ewmaSumW2,
-                            df: ctx.regulator.df
+                            ewmaSumW2: ctx.inference.ewmaSumW2,
+                            df: ctx.inference.df
                         });
                     },
                     clone() {
@@ -2944,7 +2987,7 @@ describe("Executor tests", () => {
             }
 
             // Each pool's z propagates into its LatencyDrift signal via the
-            // shared heartbeat (ctx.regulator.zScoreThreshold). The signal's
+            // shared inference state (ctx.inference.zScoreThreshold). The signal's
             // triggered() compares its trend against tScore(z, df) — so a
             // lower-z pool fires sooner. We assert the cadence + sensitivity
             // both differ: relaxed (z=3) should not fire under the load that

@@ -20,10 +20,11 @@
  * cloned per pool at `registerPool`, so one template can be registered
  * with many pools without state interleaving.
  *
- * The statistical heartbeat (α, ESS, df, shrinkage — all from the pool's
- * single `zScoreThreshold`) is exposed to every signal via
- * `ctx.regulator`, so custom statistical signals get the framework's
- * rigor for free. Use the `Statistics.*` utilities to compose tests.
+ * The pool's shared statistical inference state (α, ESS, df, shrinkage —
+ * all from the pool's single `zScoreThreshold`) is exposed to every
+ * signal via `ctx.inference`, so custom statistical signals get the
+ * framework's rigor for free. Use the `Statistics.*` utilities to
+ * compose tests.
  */
 
 import { Statistics } from "./statistics.js";
@@ -38,31 +39,34 @@ export interface SignalContext {
     readonly queueLength: number;
     /** True while ProDel is actively shedding stale queued entries. */
     readonly dropping: boolean;
-    /** General-purpose metrics + the statistical framework's heartbeat. */
+    /** The pool's shared statistical inference state — informally, its
+     *  "heartbeat". Everything a signal needs to run a calibrated
+     *  hypothesis test. */
+    readonly inference: Inference;
+    /** The concurrency controller's state and smoothed observations. */
     readonly regulator: RegulatorContext;
 }
 
 /**
- * General-purpose regulator metrics + the heartbeat of the statistical
- * framework. The heartbeat is computed once per evaluation by the
- * executor and is the same for every signal on the pool — there is one
- * α, one ESS, one df, one shrinkage per pool, derived from the pool's
- * single `zScoreThreshold`.
+ * The pool's shared statistical inference state, computed once per
+ * window evaluation by the executor and identical for every signal on
+ * the pool — one α, one ESS, one df, one shrinkage per pool, all
+ * derived from the pool's single `zScoreThreshold`.
  *
- * Signals use these to compose their own hypothesis test (typically
- * a Student-t trend test on a signal-specific observation stream).
+ * It describes the *sampling process* (when windows close, how fast the
+ * pool forgets, how much evidence arrived), never the observed values —
+ * which is why it is reusable across signals: any EWMA updated on the
+ * pool's window boundaries with `currentAlpha` shares this weight
+ * vector, and therefore this effective sample size and df. Signals
+ * combine these fields with the `Statistics.*` primitives to compose
+ * their own hypothesis test (typically a Student-t trend test on a
+ * signal-specific observation stream); see `LatencyDrift` for the
+ * canonical pattern.
+ *
+ * Constants (fixed at pool registration): `zScoreThreshold`, `z2`,
+ * `timeConstant`, `controlWindow`. All other fields evolve per window.
  */
-export interface RegulatorContext {
-    // ── General-purpose metrics ──
-    readonly completionRateEwma: number | null;
-    readonly admissionRateEwma: number | null;
-    readonly dropRateEwma: number | null;
-    readonly inFlightEwma: number | null;
-    readonly regulationPhase: string;
-    readonly regulationDepth: number;
-    readonly elapsedWindows: number;
-
-    // ── Statistical heartbeat ──
+export interface Inference {
     /** Single z-score threshold for the whole control loop. */
     readonly zScoreThreshold: number;
     /** z² — the Bayesian prior strength in pseudo-observations. */
@@ -77,10 +81,28 @@ export interface RegulatorContext {
     /** Bayesian shrinkage for the current window: r / (r + z²). */
     readonly bayesianShrinkage: number;
     /** Effective sample size tracker: Σw² updated via the EWMA-weights
-     *  recursion (1−α)²·prev + α². */
+     *  recursion (1−α)²·prev + α². Seeded at 1 (one effective
+     *  observation), which gates statistical tests off during warm-up. */
     readonly ewmaSumW2: number;
     /** Satterthwaite degrees of freedom: 1/W^(2) − 1. */
     readonly df: number;
+    /** Number of control windows evaluated since pool registration. */
+    readonly elapsedWindows: number;
+}
+
+/**
+ * The concurrency controller's state (regulation phase and depth) and
+ * its smoothed rate observations. Distinct from {@link Inference}: this
+ * describes what the *regulator* is doing and observing; `Inference`
+ * describes the statistical basis every signal shares.
+ */
+export interface RegulatorContext {
+    readonly completionRateEwma: number | null;
+    readonly admissionRateEwma: number | null;
+    readonly dropRateEwma: number | null;
+    readonly inFlightEwma: number | null;
+    readonly regulationPhase: string;
+    readonly regulationDepth: number;
 }
 
 export interface AdmitInfo {
@@ -244,8 +266,23 @@ export interface LatencyDriftState {
     tCritical: number;
     /** Decision threshold on the trend: `tCritical * se`. */
     threshold: number;
-    /** Cached `triggered()` outcome from the last evaluation. */
+    /** `triggered()` outcome from the last evaluation. */
     degrading: boolean;
+}
+
+/** One complete test evaluation — the outputs of a single window's
+ *  hypothesis test, stored atomically (see `LatencyDrift.lastTest`). */
+type LatencyDriftTest = Pick<
+    LatencyDriftState,
+    "se" | "zScore" | "tCritical" | "threshold" | "degrading"
+>;
+
+/** Configuration for {@link LatencyDrift}. */
+export interface LatencyDriftOptions {
+    /** Signal name — must be unique within a pool. Override to run two
+     *  differently-configured instances side by side. Default:
+     *  `"latency-drift"`. */
+    name?: string;
 }
 
 /**
@@ -261,11 +298,22 @@ export interface LatencyDriftState {
  *   5. Trend EWMA with asymmetric shrinkage on input
  *   6. von Neumann's δ² noise estimator (drift-invariant)
  *
- * Uses the pool's heartbeat (α, ESS, df, shrinkage from `ctx.regulator`)
- * — no signal-local statistical parameters.
+ * Uses the pool's shared inference state (α, ESS, df, shrinkage from
+ * `ctx.inference`) — no signal-local statistical parameters.
  *
  * **Test**: `t = v̂ / SE` against the Cornish-Fisher Student-t critical
  * value at df = 1/W^(2) − 1.
+ *
+ * **Independence assumption**: the calibration corrects exactly for the
+ * correlation the pipeline itself induces (a derived function of α) and
+ * assumes window-to-window noise is otherwise independent. Latency noise
+ * correlated *across* windows — GC pauses or noise correlation times
+ * exceeding `controlWindow` — understates the noise floor and over-fires
+ * the test. The remedy is configuration, not correction: size
+ * `controlWindow` above the longest routine pause / noise correlation
+ * time. See `docs/THEORY.md` §4.2.6 for the measured boundary, why
+ * estimated corrections were investigated and rejected, and the planned
+ * decision-timescale noise estimator.
  *
  * **State** (all reset on `clone()`):
  *   - `inFlightMs`, `lastInFlightChange` — operational LL integral
@@ -284,7 +332,7 @@ export interface LatencyDriftState {
  * (`lastLevelUpdateTime`) so empty windows don't inflate the rate.
  */
 export class LatencyDrift implements RegulatorSignal<LatencyDriftState> {
-    public readonly name = "latency-drift";
+    public readonly name: string;
 
     // ── Operational Little's Law integral ──
     private inFlightMs = 0;
@@ -297,12 +345,15 @@ export class LatencyDrift implements RegulatorSignal<LatencyDriftState> {
     private dLogWBarVarEst = 0;
     private lastDLogWBarRate: number | null = null;
 
-    // ── Cached test outputs (refreshed by testOutputs()) ──
-    private cachedSe = 0;
-    private cachedZScore = 0;
-    private cachedTCritical = 0;
-    private cachedThreshold = 0;
-    private cachedDegrading = false;
+    // ── Last test evaluation ──
+    // Atomic snapshot, replaced wholesale at each window boundary by
+    // `onEvaluate`. `null` means the test was not evaluable (insufficient
+    // data or warm-up df gate) — partial staleness is unrepresentable.
+    private lastTest: LatencyDriftTest | null = null;
+
+    constructor(options?: LatencyDriftOptions) {
+        this.name = options?.name ?? "latency-drift";
+    }
 
     public onAdmit(ctx: SignalContext, info: AdmitInfo): void {
         if (this.lastInFlightChange !== null) {
@@ -325,7 +376,7 @@ export class LatencyDrift implements RegulatorSignal<LatencyDriftState> {
     }
 
     public onEvaluate(ctx: SignalContext, info: EvaluateInfo): void {
-        const { currentAlpha, bayesianShrinkage, controlWindow } = ctx.regulator;
+        const { currentAlpha, bayesianShrinkage, controlWindow } = ctx.inference;
 
         // Close out the in-flight integral at the window boundary. No
         // task event happened — the slice ran at `ctx.inFlight`.
@@ -389,66 +440,67 @@ export class LatencyDrift implements RegulatorSignal<LatencyDriftState> {
         // Reset integral only after a successful W computation.
         this.inFlightMs = 0;
 
-        // Refresh cached test outputs so state() reflects the latest window.
-        this.testOutputs(ctx);
+        // Atomically replace the last test snapshot for triggered()/state().
+        this.lastTest = this.evaluateTest(ctx);
     }
 
     public triggered(_ctx: SignalContext): boolean {
-        // `onEvaluate` refreshes the cache at every window boundary; the
-        // regulator calls `triggered` immediately after the heartbeat tick,
-        // so the cached value is current.
-        return this.cachedDegrading;
+        // `onEvaluate` replaces the snapshot at every window boundary; the
+        // regulator calls `triggered` immediately after the heartbeat tick.
+        return this.lastTest?.degrading ?? false;
     }
 
     public state(): LatencyDriftState {
+        // Test fields are zero until the test is evaluable (warm-up).
+        const test = this.lastTest ?? {
+            se: 0,
+            zScore: 0,
+            tCritical: 0,
+            threshold: 0,
+            degrading: false
+        };
         return {
             logWBar: this.logWBar,
             dLogWBarEwma: this.dLogWBarEwma,
             dLogWBarVarEst: this.dLogWBarVarEst,
             inFlightMs: this.inFlightMs,
-            // Cached test outputs from the last evaluation. Zero until
-            // there's enough data to run the test.
-            se: this.cachedSe,
-            zScore: this.cachedZScore,
-            tCritical: this.cachedTCritical,
-            threshold: this.cachedThreshold,
-            degrading: this.cachedDegrading
+            ...test
         };
     }
 
     public clone(): LatencyDrift {
-        return new LatencyDrift();
+        return new LatencyDrift({ name: this.name });
     }
 
-    /** Computes SE, zScore, tCritical, threshold using the current pool heartbeat.
-     *  Caches the values for later inspection via state(). Returns null when
-     *  the test cannot be evaluated (insufficient data). */
-    private testOutputs(ctx: SignalContext): { zScore: number; tCritical: number } | null {
-        if (this.dLogWBarEwma === null || this.dLogWBarVarEst === 0) {
-            this.cachedSe = 0;
-            this.cachedZScore = 0;
-            this.cachedTCritical = 0;
-            this.cachedThreshold = 0;
-            this.cachedDegrading = false;
-            return null;
-        }
-        const { currentAlpha, ewmaSumW2, df, zScoreThreshold } = ctx.regulator;
-        if (ewmaSumW2 === 0) return null;
+    /** Evaluate the hypothesis test against the current shared inference
+     *  state. Reads pipeline state, mutates nothing — returns a complete
+     *  snapshot, or `null` when the test cannot be evaluated (insufficient
+     *  data, or the warm-up df gate). */
+    private evaluateTest(ctx: SignalContext): LatencyDriftTest | null {
+        if (this.dLogWBarEwma === null || this.dLogWBarVarEst === 0) return null;
+        const { currentAlpha, ewmaSumW2, df, zScoreThreshold } = ctx.inference;
+        // df ≤ 0: not enough effective evidence to reject (warm-up gate).
+        if (ewmaSumW2 === 0 || df <= 0) return null;
 
         const sigmaSqEstimate = this.dLogWBarVarEst / (1 + currentAlpha / 2);
         const se = Statistics.studentTTrendSE({ sigmaSqEstimate, ewmaSumW2 });
         if (se === 0) return null;
 
-        const tCritical = Statistics.tScore(zScoreThreshold, df);
+        // The t-quantile's df is the VARIANCE estimator's effective df —
+        // δ²'s overlapping squared differences carry ~1/1.45 the
+        // independent evidence of the weight count (theorem in α; see
+        // Statistics.mssdEffectiveDf). The heartbeat df (mean-type ESS)
+        // still gates evaluability above.
+        const dfEff = Statistics.mssdEffectiveDf(currentAlpha, ewmaSumW2);
+        const tCritical = Statistics.tScore(zScoreThreshold, dfEff);
         const threshold = tCritical * se;
-        const zScore = this.dLogWBarEwma / se;
-
-        this.cachedSe = se;
-        this.cachedZScore = zScore;
-        this.cachedTCritical = tCritical;
-        this.cachedThreshold = threshold;
-        this.cachedDegrading = this.dLogWBarEwma > threshold;
-        return { zScore, tCritical };
+        return {
+            se,
+            zScore: this.dLogWBarEwma / se,
+            tCritical,
+            threshold,
+            degrading: this.dLogWBarEwma > threshold
+        };
     }
 }
 
@@ -470,7 +522,8 @@ export class EarlyShed implements AdmissionSignal {
 
     public shouldShed(ctx: SignalContext, _laneKey: string): boolean {
         if (!ctx.dropping || ctx.inFlight < ctx.concurrencyLimit) return false;
-        const { dropRateEwma, completionRateEwma, z2 } = ctx.regulator;
+        const { dropRateEwma, completionRateEwma } = ctx.regulator;
+        const { z2 } = ctx.inference;
         if (
             dropRateEwma === null ||
             dropRateEwma <= 0 ||
@@ -537,7 +590,7 @@ export class LaneErrorShed implements AdmissionSignal<LaneErrorShedState> {
     private readonly lanes = new Map<string, LaneErrorEntry>();
 
     public onComplete(ctx: SignalContext, info: CompletionInfo): void {
-        const { timeConstant, controlWindow, z2 } = ctx.regulator;
+        const { timeConstant, controlWindow, z2 } = ctx.inference;
         let entry = this.lanes.get(info.lane);
         if (entry === undefined) {
             entry = { errorRateEwma: 0, lastCompletionTime: info.completionTime, completions: 0 };

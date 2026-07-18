@@ -48,7 +48,7 @@ The executor owns the *engine* — the queue, lanes, the statistical heartbeat, 
 3. **Admission signals** — decide *enqueue-time shedding*. Each pool runs a list of `AdmissionSignal`s queried per request with the target lane; if any returns `shouldShed()`, the request is rejected instantly (OR semantics). The built-in default is `EarlyShed` — probabilistic early rejection (`P = dropRate/(dropRate+completionRate) * shrinkage`) when ProDel is dropping and the pool is at capacity. `LaneErrorShed` (per-lane error shedding) is an exported opt-in. Error-driven backpressure is domain-specific (HTTP 5xx vs business errors vs timeouts) — see `examples/express-server.ts`.
 4. **Fair lane scheduling** — round-robin across lanes (per-tenant, per-user, or shared). Prevents noisy neighbors from monopolizing capacity.
 
-All statistical parameters in the framework — α, ESS, df, Bayesian shrinkage, time constant — derive from a single `zScoreThreshold` per pool. The pool computes this "heartbeat" once per evaluation and exposes it to every signal via `SignalContext.regulator`. The framework's rigor is preserved when composing multiple signals.
+All statistical parameters in the framework — α, ESS, df, Bayesian shrinkage, time constant — derive from a single `zScoreThreshold` per pool. The pool computes this shared inference state (informally, its "heartbeat") once per evaluation and exposes it to every signal via `SignalContext.inference`. The framework's rigor is preserved when composing multiple signals.
 
 ## Single-Constant Design
 
@@ -113,7 +113,7 @@ executor.registerPool("debug", { regulatorSignals: [], admissionSignals: [] });
 
 ### Built-in signals
 
-- **`LatencyDrift`** (regulator, default) — fires when the trend test detects sustained upward latency drift. Uses the pool's heartbeat (α, ESS, df from `zScoreThreshold`) and composes its own EWMAs + δ² inline.
+- **`LatencyDrift`** (regulator, default) — fires when the trend test detects sustained upward latency drift. Uses the pool's shared inference state (α, ESS, df from `zScoreThreshold`) and composes its own EWMAs + δ² inline. The calibration corrects exactly for the correlation the pipeline itself induces and assumes window-to-window noise is otherwise independent — size `controlWindow` above your longest routine pause (GC, compaction) or latency-noise correlation time (see `docs/THEORY.md` §4.2.6 for the measured boundary).
 - **`EarlyShed`** (admission, default) — sheds an arrival when ProDel is dropping and the pool is at capacity, with `P = dropRate/(dropRate+completionRate) * shrinkage`. Queue-health based, domain-agnostic.
 - **`LaneErrorShed`** (admission, opt-in) — tracks each lane's error-rate EWMA and sheds new requests to a failing lane (`P = lane.errorRateEwma`). Off by default — an "error" is domain-specific (a 404, a validation failure, or a business rejection is not an infrastructure failure), so the executor does not assume errors should shed work.
 
@@ -121,7 +121,7 @@ There is no built-in *pool-wide* error signal. To make errors drive concurrency,
 
 ### Custom signals
 
-Implement `RegulatorSignal` or `AdmissionSignal`. The pool's heartbeat (α, ESS, df, shrinkage) is exposed via `ctx.regulator` — use it (with `Statistics.*` utilities) to build statistically rigorous detectors, or just write a predicate.
+Implement `RegulatorSignal` or `AdmissionSignal`. The pool's shared inference state (α, ESS, df, shrinkage) is exposed via `ctx.inference` — use it (with `Statistics.*` utilities) to build statistically rigorous detectors, or just write a predicate. Controller state and smoothed rate observations are separate, under `ctx.regulator`.
 
 ```typescript
 import type { RegulatorSignal, AdmissionSignal } from "concurrex";

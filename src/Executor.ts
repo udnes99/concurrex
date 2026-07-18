@@ -5,6 +5,7 @@ import {
     type AdmitInfo,
     type CompletionInfo,
     type EvaluateInfo,
+    type Inference,
     type RegulatorContext,
     type BaseSignal,
     type RegulatorSignal,
@@ -98,10 +99,11 @@ type Pool = {
     // EWMA of in-flight count (for observability).
     inFlightEwma: number | null;
 
-    // ── Statistical heartbeat ──
+    // ── Shared statistical inference state ──
     // Computed once per window evaluation. Exposed to signals via
-    // RegulatorContext. Single source of truth for the control loop's
-    // statistical parameters — derived from the pool's zScoreThreshold.
+    // SignalContext.inference. Single source of truth for the control
+    // loop's statistical parameters — derived from the pool's
+    // zScoreThreshold.
     currentAlpha: number;          // 1 − exp(−Δt/(τ·CW))
     bayesianShrinkage: number;     // r / (r + z²) for current window
     ewmaSumW2: number;             // Σw² (ESS tracker; seeded at 1 = one effective observation)
@@ -232,9 +234,10 @@ const DEFAULT_Z_SCORE_THRESHOLD = 2;
  * on pluggable backpressure `Signal`s. The default signal is `LatencyDrift`
  * (Little's Law over a window, log/EWMA pipeline, Student-t trend test).
  * Pools can compose multiple signals; any triggered signal drives a decrease.
- * The regulator itself owns only the statistical heartbeat (α, ESS, df,
- * shrinkage — derived from a single `zScoreThreshold`) and the concurrency
- * actuator; signals own their per-pool observation state.
+ * The pool owns the shared statistical inference state (α, ESS, df,
+ * shrinkage — derived from a single `zScoreThreshold`, exposed as
+ * `ctx.inference`); the regulator owns only the concurrency actuator;
+ * signals own their per-pool observation state.
  *
  * **Admission signals** decide enqueue-time shedding (see `AdmissionSignal`).
  * The default is `EarlyShed` — probabilistic early rejection when ProDel is
@@ -570,15 +573,9 @@ export class Executor {
     private buildSignalContext(pool: Pool): SignalContext {
         const params = pool.parameters ?? this.defaults;
         const df = pool.ewmaSumW2 > 0 ? 1 / pool.ewmaSumW2 - 1 : 0;
-        const regulator: RegulatorContext = Object.freeze({
-            completionRateEwma: pool.completionRateEwma,
-            admissionRateEwma: pool.admissionRateEwma,
-            dropRateEwma: pool.dropRateEwma,
-            inFlightEwma: pool.inFlightEwma,
-            regulationPhase: RegulationPhase[pool.regulationPhase],
-            regulationDepth: pool.regulationDepth,
-            elapsedWindows: pool.elapsedWindows,
-            // Statistical heartbeat — single source of truth
+        // Shared statistical inference state — single source of truth for
+        // every signal's hypothesis test.
+        const inference: Inference = Object.freeze({
             zScoreThreshold: params.zScoreThreshold,
             z2: params.z2,
             timeConstant: params.timeConstant,
@@ -586,7 +583,16 @@ export class Executor {
             currentAlpha: pool.currentAlpha,
             bayesianShrinkage: pool.bayesianShrinkage,
             ewmaSumW2: pool.ewmaSumW2,
-            df
+            df,
+            elapsedWindows: pool.elapsedWindows
+        });
+        const regulator: RegulatorContext = Object.freeze({
+            completionRateEwma: pool.completionRateEwma,
+            admissionRateEwma: pool.admissionRateEwma,
+            dropRateEwma: pool.dropRateEwma,
+            inFlightEwma: pool.inFlightEwma,
+            regulationPhase: RegulationPhase[pool.regulationPhase],
+            regulationDepth: pool.regulationDepth
         });
         return Object.freeze({
             pool: pool.name,
@@ -594,6 +600,7 @@ export class Executor {
             inFlight: pool.inFlight,
             queueLength: pool.queueLength,
             dropping: pool.dropping,
+            inference,
             regulator
         });
     }
@@ -1178,9 +1185,9 @@ export class Executor {
         const rate = pool.completionsThisWindow;
         const { timeConstant, z2 } = this.params(pool);
 
-        // ── Heartbeat: compute the statistical framework's pulse ──
+        // ── Shared inference state: the statistical framework's pulse ──
         // Single source of truth for the control loop's parameters. Signals
-        // read these via ctx.regulator — no signal-local α or shrinkage.
+        // read these via ctx.inference — no signal-local α or shrinkage.
         const alpha = Statistics.timeWeightedAlpha(elapsed, timeConstant, pool.controlWindow);
         const windowShrinkage = Statistics.bayesianShrinkage(pool.completionsThisWindow, z2);
 
@@ -1188,7 +1195,7 @@ export class Executor {
         pool.ewmaSumW2 = (1 - alpha) * (1 - alpha) * pool.ewmaSumW2 + alpha * alpha;
         pool.currentAlpha = alpha;
         // Hold the last non-zero shrinkage across empty windows so signals
-        // reading `ctx.regulator.bayesianShrinkage` mid-window (e.g. from an
+        // reading `ctx.inference.bayesianShrinkage` mid-window (e.g. from an
         // onComplete hook) don't see a transient 0 that would silently
         // disable any input multiplied by it.
         if (pool.completionsThisWindow > 0) {

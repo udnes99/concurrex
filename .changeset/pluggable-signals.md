@@ -66,11 +66,11 @@ const latency = executor.getSignalState<LatencyDriftState>("api", "latency-drift
 latency?.zScore;  // number, no cast needed
 ```
 
-Signals own their per-pool state (cloned per pool) and use `Statistics.*` utilities to compose their decision. The pool's heartbeat is the single source of truth — every signal on a pool reads the same `currentAlpha`, `ewmaSumW2`, `df`, `zScoreThreshold` via `ctx.regulator`. The executor catches and logs exceptions from any hook or decision method, so a buggy signal cannot break the engine.
+Signals own their per-pool state (cloned per pool) and use `Statistics.*` utilities to compose their decision. The pool's shared inference state (the `Inference` interface — informally, its "heartbeat") is the single source of truth: every signal on a pool reads the same `currentAlpha`, `ewmaSumW2`, `df`, `zScoreThreshold` via `ctx.inference`. Controller state and smoothed rate observations are exposed separately via `ctx.regulator` (`RegulatorContext`). The executor catches and logs exceptions from any hook or decision method, so a buggy signal cannot break the engine.
 
 ### Built-in signals
 
-- **`LatencyDrift`** (regulator, default) — the v1.x latency-trend Student-t test. Composes the heartbeat with its own operational-LL integral, log/EWMA/δ²/SE pipeline.
+- **`LatencyDrift`** (regulator, default) — the v1.x latency-trend Student-t test. Composes the shared inference state with its own operational-LL integral, log/EWMA/δ²/SE pipeline. The calibration assumes window-to-window noise independence: size `controlWindow` above routine pause durations (GC) and latency-noise correlation times — the measured robustness boundary and its guidance are documented in `docs/THEORY.md` §4.2.6, with autocorrelation-corrected variants investigated, rejected (a level step's smooth transient is indistinguishable from correlated noise, so corrections suppress step detection), and retained as research artifacts in `simulations/benchmark-fpr.ts` Mode D. New: a `name` constructor option allows multiple `LatencyDrift` instances per pool.
 - **`EarlyShed`** (admission, default) — the v1.x probabilistic early shedding (`P = dropRate/(dropRate+completionRate) × shrinkage` when ProDel is dropping and at capacity). Queue-health based, domain-agnostic, stateless.
 - **`LaneErrorShed`** (admission, opt-in) — the v1.x per-lane error shedding. Tracks each lane's error-rate EWMA in its own map and sheds new requests to a failing lane. **Off by default** — an "error" is domain-specific (a 404, a validation failure, or a business rejection is not an infrastructure failure).
 
@@ -128,7 +128,7 @@ new Executor({ regulatorSignals: [new LatencyDrift()], admissionSignals: [new Ea
 
 ### Hardcoded probabilistic-error-decrease is gone — and so is the pool-wide error EWMA
 
-The v1.2 regulator branch that fired concurrency decreases with `P = errorRateEwma` is removed. The pool-level `errorRateEwma` field that fed it is also removed — both from `RegulatorState` (observability) and `RegulatorContext` (signal input).
+The v1.2 regulator branch that fired concurrency decreases with `P = errorRateEwma` is removed. The pool-level `errorRateEwma` field that fed it is also removed — both from `RegulatorState` (observability) and the signal context (signal input).
 
 Per-lane error shedding (rejecting new requests to a recently-failing lane at enqueue) still exists but is now the **opt-in `LaneErrorShed` admission signal**, off by default. Add it to a pool's `admissionSignals` to restore the v1.x behavior:
 

@@ -5,10 +5,10 @@
  * to compose its hypothesis test. State (EWMAs, integrals, δ², etc.)
  * lives inside the signal itself.
  *
- * The control loop's "heartbeat" — α, ESS, df, shrinkage — is computed
- * by the executor using these primitives and exposed to signals via
- * `RegulatorContext`. Signals read the heartbeat and apply their own
- * inline math to derive a test statistic and threshold.
+ * The control loop's shared inference state — α, ESS, df, shrinkage —
+ * is computed by the executor using these primitives and exposed to
+ * signals via `SignalContext.inference`. Signals read it and apply
+ * their own inline math to derive a test statistic and threshold.
  */
 export class Statistics {
     private constructor() {} // namespace only — not instantiable
@@ -53,6 +53,26 @@ export class Statistics {
     static studentTTrendSE(args: { sigmaSqEstimate: number; ewmaSumW2: number }): number {
         const sigmaSq = Math.max(0, args.sigmaSqEstimate);
         return Math.sqrt(sigmaSq * args.ewmaSumW2 * (1 + args.ewmaSumW2) / 2);
+    }
+
+    /** Effective χ² degrees of freedom of the δ² (MSSD/2) EWMA noise
+     *  estimator, by variance matching: df = 2·E[δ²]²/Var(δ²) = 1/(Σw²·c).
+     *
+     *  Successive squared differences overlap — Δ_k and Δ_{k+1} share a
+     *  rate — so δ² carries fewer independent observations than its
+     *  weight count suggests. Under the pipeline's derived ARMA(1,1)
+     *  structure (Gaussian fourth moments via Isserlis; lags ≥ 2 are
+     *  O(α⁶) and dropped):
+     *
+     *    ρ_Δ(1) = −(1 + α/2 + α²/2) / (2(1 + α/2))   (≈ −0.503 at α ≈ 0.105)
+     *    c      = 1 + 2(1−α)·ρ_Δ(1)²                  (≈ 1.45)
+     *
+     *  giving df ≈ 0.69/Σw² instead of 1/Σw² — a ~3% higher Student-t
+     *  critical value at steady state. See THEORY.md §4.2.7. */
+    static mssdEffectiveDf(alpha: number, ewmaSumW2: number): number {
+        const rho1 = -(1 + alpha / 2 + (alpha * alpha) / 2) / (2 * (1 + alpha / 2));
+        const c = 1 + 2 * (1 - alpha) * rho1 * rho1;
+        return 1 / (ewmaSumW2 * c);
     }
 
     /** One-sided Student-t critical value (safe upper bound) at upper-tail
