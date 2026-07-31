@@ -315,6 +315,141 @@ class BlockNoisePowerDegraded implements RegulatorSignal<BlockNoiseState> {
     }
 }
 
+// ── EProcess: anytime-valid arming via a mixture test martingale ─────
+
+/** Φ(x) — standard normal CDF (Abramowitz–Stegun 26.2.17). Used to map the
+ *  σ_D constant to the e-process rejection threshold 1/α, α = Φ(−σ_D). */
+function normalCdf(x: number): number {
+    const t = 1 / (1 + 0.2316419 * Math.abs(x));
+    const d = 0.3989422804 * Math.exp((-x * x) / 2);
+    const p = d * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+    return x >= 0 ? 1 - p : p;
+}
+
+interface EProcessState {
+    degrading: boolean;
+    wealth: number;
+    blocks: number;
+}
+
+/**
+ * PROTOTYPE — the PowerDegraded arming channel reformulated as an
+ * ANYTIME-VALID sequential test. Same front end (Little's-law residence,
+ * level EWMA, τ-block accumulation as in the batch-means floor), but the
+ * fixed-σ_D Student-t crossing is replaced by a **mixture test martingale**
+ * over the drift-invariant block rates b_j.
+ *
+ * Under H0 (E[b_j]=0) the block rates are ~independent N(0, σ²_B). The
+ * likelihood-ratio martingale for a fixed per-block drift ν is
+ * exp(ν·s/σ²_B − Jν²/(2σ²_B)) with s=Σb_j; mixing over ν~N(0,τ²) gives the
+ * closed form below. By Ville's inequality, rejecting when wealth ≥ 1/α
+ * bounds P(EVER fire | H0) ≤ α at *every* stopping time — no fixed-sample
+ * assumption, no latch needed to manage repeated looks. The prior width is
+ * self-scaling (τ²=σ²_B, "detect drifts of order one block-noise SD"), so no
+ * absolute constant is added; α=Φ(−σ_D) reuses the one σ_D knob. σ²_B is the
+ * drift-invariant batch-means estimate. Latches on (never resets) so its
+ * anytime-valid FPR is "fraction of runs that ever fire".
+ */
+class EProcessPowerDegraded implements RegulatorSignal<EProcessState> {
+    public readonly name = "eprocess-power-degraded";
+
+    private inFlightMs = 0;
+    private lastInFlightChange: number | null = null;
+    private logWBar: number | null = null;
+    private lastLevelUpdateTime: number | null = null;
+
+    private blockRateSum = 0;
+    private blockDtSum = 0;
+    private lastBlockRate: number | null = null;
+    private blockVarEst = 0; // σ²_B (drift-invariant)
+    private s = 0; // Σ b_j
+    private blocks = 0; // J
+    private wealth = 1;
+    private everFired = false;
+
+    onAdmit(ctx: SignalContext, info: { admitTime: number }): void {
+        if (this.lastInFlightChange !== null) {
+            this.inFlightMs += (ctx.inFlight - 1) * (info.admitTime - this.lastInFlightChange);
+        }
+        this.lastInFlightChange = info.admitTime;
+    }
+
+    onComplete(ctx: SignalContext, info: { completionTime: number }): void {
+        if (this.lastInFlightChange !== null) {
+            this.inFlightMs += (ctx.inFlight + 1) * (info.completionTime - this.lastInFlightChange);
+        }
+        this.lastInFlightChange = info.completionTime;
+    }
+
+    onEvaluate(ctx: SignalContext, info: EvaluateInfo): void {
+        const { currentAlpha, bayesianShrinkage, controlWindow, timeConstant, zScoreThreshold } =
+            ctx.inference;
+
+        if (this.lastInFlightChange !== null) {
+            this.inFlightMs += ctx.inFlight * (info.windowEnd - this.lastInFlightChange);
+            this.lastInFlightChange = info.windowEnd;
+        }
+        if (info.completions === 0 || this.inFlightMs === 0) return;
+
+        const logInstantW = Math.log(this.inFlightMs / info.completions);
+        const levelAlpha = currentAlpha * bayesianShrinkage;
+        const prevLevel = this.logWBar;
+        const prevUpdate = this.lastLevelUpdateTime;
+        this.logWBar =
+            this.logWBar === null ? logInstantW : (1 - levelAlpha) * this.logWBar + levelAlpha * logInstantW;
+        this.lastLevelUpdateTime = info.windowEnd;
+
+        if (prevLevel !== null && prevUpdate !== null) {
+            const dt = (info.windowEnd - prevUpdate) / controlWindow;
+            if (dt > 0) {
+                const rate = (this.logWBar - prevLevel) / dt;
+                this.blockRateSum += rate * dt;
+                this.blockDtSum += dt;
+                if (this.blockDtSum >= timeConstant) {
+                    const b = this.blockRateSum / this.blockDtSum;
+                    if (this.lastBlockRate !== null) {
+                        const diff = b - this.lastBlockRate;
+                        this.blockVarEst =
+                            (1 - currentAlpha) * this.blockVarEst + (currentAlpha * diff * diff) / 2;
+                        // Update the martingale once σ²_B is estimable. The
+                        // variance used is the estimate BEFORE this block's own
+                        // contribution — predictable, so the martingale property
+                        // holds to first order.
+                        if (this.blockVarEst > 0) {
+                            this.s += b;
+                            this.blocks++;
+                            const v0 = this.blockVarEst;
+                            const tau2 = v0; // self-scaling prior
+                            const J = this.blocks;
+                            this.wealth =
+                                Math.sqrt(v0 / (v0 + J * tau2)) *
+                                Math.exp((tau2 * this.s * this.s) / (2 * v0 * (v0 + J * tau2)));
+                            const alpha = normalCdf(-zScoreThreshold);
+                            if (this.s > 0 && this.wealth >= 1 / alpha) this.everFired = true;
+                        }
+                    }
+                    this.lastBlockRate = b;
+                    this.blockRateSum = 0;
+                    this.blockDtSum = 0;
+                }
+            }
+        }
+        this.inFlightMs = 0;
+    }
+
+    triggered(): boolean {
+        return this.everFired;
+    }
+
+    state(): EProcessState {
+        return { degrading: this.everFired, wealth: this.wealth, blocks: this.blocks };
+    }
+
+    clone(): EProcessPowerDegraded {
+        return new EProcessPowerDegraded();
+    }
+}
+
 // ── RhoCorrected: rejected research variant (kept for the ablation) ──
 
 interface RhoCorrectedState {
@@ -815,7 +950,79 @@ const pct = (x: number) => `${(100 * x).toFixed(3)}%`;
 
 // ── Main ─────────────────────────────────────────────────────────────
 
+/**
+ * E-process evaluation (--eprocess): measures the anytime-valid arming
+ * variant's two defining properties — P(ever fire | H0) ≤ α (Ville), and its
+ * detection delay vs the shipped fixed-σ_D latch (the conservatism cost).
+ */
+async function runEProcess(): Promise<void> {
+    const z = 2;
+    const alpha = normalCdf(-z);
+    const N = argNum("eseeds", 30);
+    console.log("── E-process (anytime-valid arming): mixture test martingale ──\n");
+    console.log("Anytime-valid FPR — P(EVER fire | H0), which Ville bounds at α (a whole-run guarantee,");
+    console.log("not a per-window rate):");
+    const h0: Array<[string, Workload]> = [
+        ["iid", iidWorkload(BATCH)],
+        ["ar1(0.8)", ar1Workload(BATCH, 0.8)],
+        ["gc(5x)", gcWorkload(BATCH, 5)]
+    ];
+    for (const [name, wl] of h0) {
+        let ever = 0;
+        for (let i = 0; i < N; i++) {
+            const rng = mulberry32(SEED + 4242 + i);
+            const samples = await runScenario({
+                z,
+                signalNames: ["eprocess-power-degraded"],
+                regulatorSignals: [new EProcessPowerDegraded()],
+                rng,
+                workload: wl
+            });
+            if (samples.some((s) => s.firing[0])) ever++;
+        }
+        console.log(
+            `  ${name.padEnd(10)} P(ever fire) = ${((100 * ever) / N).toFixed(1)}%   ` +
+                `vs α = Φ(−${z}) = ${(100 * alpha).toFixed(2)}%   (${ever}/${N} runs)`
+        );
+    }
+
+    console.log("\nDetection delay (windows after a +0.5%/window drift onset at window 100), median/N:");
+    const variants: Array<[string, string, () => RegulatorSignal]> = [
+        ["e-process (anytime-valid)", "eprocess-power-degraded", () => new EProcessPowerDegraded()],
+        ["PowerDegraded (fixed-σ_D)", "power-degraded", () => new PowerDegraded()]
+    ];
+    for (const [label, sname, mk] of variants) {
+        const delays: number[] = [];
+        for (let i = 0; i < N; i++) {
+            const rng = mulberry32(SEED + 7373 + i);
+            const samples = await runScenario({
+                z,
+                signalNames: [sname],
+                regulatorSignals: [mk()],
+                rng,
+                workload: driftingWorkload(BATCH, 100, 0.005)
+            });
+            const first = samples.findIndex((s, k) => k >= 100 && s.firing[0]);
+            if (first >= 0) delays.push(first - 100);
+        }
+        delays.sort((a, b) => a - b);
+        const med = delays.length ? delays[Math.floor(delays.length / 2)] : NaN;
+        console.log(
+            `  ${label.padEnd(26)} median = ${isNaN(med) ? "never" : med + " windows"}   ` +
+                `(fired in ${delays.length}/${N})`
+        );
+    }
+    console.log(
+        "\nRead: the e-process trades detection speed for a whole-run validity guarantee that holds\n" +
+            "under arbitrary peeking — the fixed-σ_D latch is faster but its guarantee is per-evaluation.\n"
+    );
+}
+
 async function main(): Promise<void> {
+    if (process.argv.includes("--eprocess")) {
+        await runEProcess();
+        return;
+    }
     console.log(`FPR calibration benchmark — ${WINDOWS} windows/config, ${BATCH} tasks/window, seed ${SEED}`);
     console.log(`Shrinkage at this batch size: s = r/(r+z²) with r = ${BATCH}\n`);
 
