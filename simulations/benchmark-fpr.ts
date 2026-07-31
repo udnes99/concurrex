@@ -561,6 +561,51 @@ class EProcessCusum implements RegulatorSignal<EProcessState> {
     }
 }
 
+/**
+ * PROTOTYPE v3 — the CUSUM e-process with c and h DERIVED from the single σ_D
+ * constant, so no new per-deployment knob is introduced.
+ *   c = 1        (unit SNR — detect drifts of order one block-noise SD; a
+ *                 fixed design constant, orthogonal to the confidence z)
+ *   h = log(1/(α·τ)),  α = Φ(−z),  τ = deriveTimeConstant(z)
+ *                (the CUSUM's mean run length to false alarm is ≈ e^h blocks
+ *                 = e^h·τ windows, so per-window FAR ≈ 1/(e^h·τ); setting that
+ *                 to α gives this h — same false-positive target as the σ_D
+ *                 test, expressed at the decision timescale).
+ * Everything else is EProcessCusum. One constant in, everything derived.
+ */
+class EProcessAuto implements RegulatorSignal<EProcessState> {
+    public readonly name = "eprocess-auto";
+    private inner: EProcessCusum | null = null;
+
+    private ensure(ctx: SignalContext): EProcessCusum {
+        if (this.inner === null) {
+            const { zScoreThreshold, timeConstant } = ctx.inference;
+            const alpha = normalCdf(-zScoreThreshold);
+            const h = Math.log(1 / (alpha * timeConstant));
+            this.inner = new EProcessCusum(1, h, this.name);
+        }
+        return this.inner;
+    }
+    onAdmit(ctx: SignalContext, info: { admitTime: number }): void {
+        this.ensure(ctx).onAdmit(ctx, info);
+    }
+    onComplete(ctx: SignalContext, info: { completionTime: number }): void {
+        this.ensure(ctx).onComplete(ctx, info);
+    }
+    onEvaluate(ctx: SignalContext, info: EvaluateInfo): void {
+        this.ensure(ctx).onEvaluate(ctx, info);
+    }
+    triggered(): boolean {
+        return this.inner?.triggered() ?? false;
+    }
+    state(): EProcessState {
+        return this.inner?.state() ?? { degrading: false, wealth: 0, blocks: 0 };
+    }
+    clone(): EProcessAuto {
+        return new EProcessAuto();
+    }
+}
+
 // ── RhoCorrected: rejected research variant (kept for the ablation) ──
 
 interface RhoCorrectedState {
@@ -1177,15 +1222,68 @@ async function runEProcess(): Promise<void> {
             );
         }
     }
+    // ── Derived config: c=1, h=log(1/(α·τ)) — no new knob ──
+    console.log("\n── Derived e-process (c=1, h from z) vs the fixed-σ_D latch — ONE constant ──\n");
+    console.log("signal                z    FAR iid  FAR ar1   FAR gc    detect(drift)   power");
+    const farOf = async (mk: () => RegulatorSignal, sname: string, zz: number, wl: Workload) => {
+        let fires = 0;
+        let total = 0;
+        for (let i = 0; i < N; i++) {
+            const rng = mulberry32(SEED + 5150 + i);
+            const samples = await runScenario({
+                z: zz,
+                signalNames: [sname],
+                regulatorSignals: [mk()],
+                rng,
+                workload: wl
+            });
+            fires += samples.filter((s) => s.firing[0]).length;
+            total += samples.length;
+        }
+        return (100 * fires) / total;
+    };
+    const detectOf = async (mk: () => RegulatorSignal, sname: string, zz: number) => {
+        const delays: number[] = [];
+        for (let i = 0; i < N; i++) {
+            const rng = mulberry32(SEED + 7373 + i);
+            const samples = await runScenario({
+                z: zz,
+                signalNames: [sname],
+                regulatorSignals: [mk()],
+                rng,
+                workload: driftingWorkload(BATCH, 100, 0.005)
+            });
+            const first = samples.findIndex((s, k) => k >= 100 && s.firing[0]);
+            if (first >= 0) delays.push(first - 100);
+        }
+        delays.sort((a, b) => a - b);
+        return { med: delays.length ? delays[Math.floor(delays.length / 2)] : NaN, fired: delays.length };
+    };
+    const rowFor = async (label: string, mk: () => RegulatorSignal, sname: string, zz: number) => {
+        const fi = await farOf(mk, sname, zz, iidWorkload(BATCH));
+        const fa = await farOf(mk, sname, zz, ar1Workload(BATCH, 0.8));
+        const fg = await farOf(mk, sname, zz, gcWorkload(BATCH, 5));
+        const d = await detectOf(mk, sname, zz);
+        console.log(
+            `${label.padEnd(22)}${zz.toFixed(0)}   ${fi.toFixed(2).padStart(5)}%  ${fa.toFixed(2).padStart(5)}%  ` +
+                `${fg.toFixed(2).padStart(5)}%   ${(isNaN(d.med) ? "never" : d.med + " win").padStart(9)}    ${d.fired}/${N}`
+        );
+    };
+    for (const zz of [2, 3]) {
+        await rowFor("e-process (derived)", () => new EProcessAuto(), "eprocess-auto", zz);
+        await rowFor("fixed-σ_D latch", () => new PowerDegraded(), "power-degraded", zz);
+    }
+
     console.log(
         "\nResult: the CUSUM e-process DOMINATES the fixed-σ_D latch (56 win, 17/20 power). At c=1,h=1\n" +
             "it detects the same drift in ~31 windows with 20/20 power at FAR ≈ 1.3% (iid) / 1.5% (ar1) —\n" +
             "faster, higher power, valid, AND correlation-robust for free (the block rates are drift-\n" +
             "invariant, so sub-τ correlation is priced automatically). The reset IS the per-episode\n" +
             "anytime-valid guarantee (each excursion is a fresh SPRT); CUSUM is Lorden-optimal for delay.\n" +
-            "Caveats before it could replace the default: this is one drift magnitude + one workload set;\n" +
-            "needs the full FAR suite (gc/stragglers/spikes), a drift-magnitude sweep, sharp-incident\n" +
-            "detection, and a story for deriving (c,h) from σ_D (two knobs vs the current one).\n"
+            "The DERIVED version (c=1, h=log(1/(α·τ)) — one constant, no new knob) dominates at z=2 on\n" +
+            "every axis (faster, higher power, lower FAR on iid/ar1/gc). Remaining before it could replace\n" +
+            "the default: a drift-MAGNITUDE sweep (sharp vs subtle), sharp-incident (anatomy) detection,\n" +
+            "and an overshoot correction to keep the derived h from getting conservative at large z.\n"
     );
 }
 
