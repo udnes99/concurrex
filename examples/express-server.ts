@@ -2,7 +2,7 @@
  * Express server with Concurrex admission control.
  *
  * Demonstrates two signals working together:
- *   - `LatencyDrift` (built-in) — fires on sustained latency degradation
+ *   - `PowerDegraded` (built-in) — fires on sustained latency degradation
  *   - `HttpErrorRate` (defined here) — fires when 5xx EWMA crosses a
  *     user-defined threshold
  *
@@ -22,11 +22,11 @@
 import express from "express";
 import {
     Executor,
-    LatencyDrift,
+    PowerDegraded,
     ResourceExhaustedError,
     Statistics,
     type CompletionInfo,
-    type LatencyDriftState,
+    type PowerDegradedState,
     type RegulatorSignal,
     type SignalContext
 } from "concurrex";
@@ -58,7 +58,7 @@ class HttpErrorRate implements RegulatorSignal<HttpErrorRateState> {
 
     onComplete(ctx: SignalContext, info: CompletionInfo): void {
         // Per-event time-weighted EWMA. `Statistics.timeWeightedAlpha` is
-        // typically used by per-window signals (like LatencyDrift's
+        // typically used by per-window signals (like PowerDegraded's
         // `onEvaluate`); here we use it per completion event so the EWMA
         // tracks recent error rate with continuous-time decay. Half-life
         // scales with traffic — sparse traffic gives larger per-event α
@@ -99,7 +99,7 @@ executor.registerPool("http", {
     baselineConcurrency: 50,
     delayThreshold: 200,
     minimumConcurrency: 5,
-    regulatorSignals: [new LatencyDrift(), new HttpErrorRate(0.1)] // 10% 5xx rate triggers backoff
+    regulatorSignals: [new PowerDegraded(), new HttpErrorRate(0.1)] // 10% 5xx rate triggers backoff
 });
 executor.start();
 
@@ -134,7 +134,7 @@ app.get("/", async (_req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-    const latency = executor.getSignalState<LatencyDriftState>("http", "latency-drift");
+    const latency = executor.getSignalState<PowerDegradedState>("http", "power-degraded");
     const errors = executor.getSignalState<HttpErrorRateState>("http", "http-error-rate");
     res.json({
         overloaded: executor.isOverloaded("http"),

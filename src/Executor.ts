@@ -11,7 +11,7 @@ import {
     type RegulatorSignal,
     type AdmissionSignal,
     type SignalContext,
-    LatencyDrift,
+    PowerDegraded,
     EarlyShed
 } from "./signals.js";
 import { Statistics } from "./statistics.js";
@@ -88,6 +88,12 @@ type Pool = {
     // Throughput monitor state (capacity regulation)
     windowStart: number;
     completionsThisWindow: number;
+    /** Peak in-flight reached this window — the high-water mark of actual
+     *  concurrency. Since inFlight ≤ L, this equals L when the limit binds
+     *  and sits below it when slack; the decrease actuator clamps L to it
+     *  so a throttle bites immediately instead of walking down inert
+     *  headroom. Reset to the current inFlight at each window boundary. */
+    maxInFlight: number;
     /** Admissions this window — tasks that entered in-flight. */
     admissionsThisWindow: number;
     admissionRateEwma: number | null;
@@ -153,7 +159,7 @@ export type PoolOptions = {
      *  Templates are cloned via `clone()` per pool, so one instance can be
      *  registered with many pools without state interleaving.
      *
-     *  Default: `[new LatencyDrift()]`. */
+     *  Default: `[new PowerDegraded()]`. */
     regulatorSignals?: RegulatorSignal[];
     /** Admission-policy signals for this pool (see {@link AdmissionSignal}).
      *  Each is queried at enqueue with the target lane; if any returns
@@ -231,7 +237,7 @@ const DEFAULT_Z_SCORE_THRESHOLD = 2;
  * without paying queue cost.
  *
  * **Convergent throughput regulator**: regulates the concurrency limit based
- * on pluggable backpressure `Signal`s. The default signal is `LatencyDrift`
+ * on pluggable backpressure `Signal`s. The default signal is `PowerDegraded`
  * (Little's Law over a window, log/EWMA pipeline, Student-t trend test).
  * Pools can compose multiple signals; any triggered signal drives a decrease.
  * The pool owns the shared statistical inference state (α, ESS, df,
@@ -298,7 +304,7 @@ export class Executor {
          *  override. Templates are cloned per pool — one instance can be
          *  safely registered with multiple executors/pools.
          *
-         *  When omitted, defaults to `[new LatencyDrift()]`. */
+         *  When omitted, defaults to `[new PowerDegraded()]`. */
         regulatorSignals?: RegulatorSignal[];
         /** Default admission (enqueue-shedding) signals for pools that do not
          *  override. Templates are cloned per pool.
@@ -315,7 +321,7 @@ export class Executor {
         this.zScoreThreshold = this.defaults.zScoreThreshold;
         this.timeConstant = this.defaults.timeConstant;
         this.defaultRegulatorSignals = Object.freeze(
-            (options?.regulatorSignals ?? [new LatencyDrift()]).slice()
+            (options?.regulatorSignals ?? [new PowerDegraded()]).slice()
         );
         this.defaultAdmissionSignals = Object.freeze(
             (options?.admissionSignals ?? [new EarlyShed()]).slice()
@@ -448,6 +454,7 @@ export class Executor {
             dropNext: 0,
             windowStart: performance.now(),
             completionsThisWindow: 0,
+            maxInFlight: 0,
             admissionsThisWindow: 0,
             admissionRateEwma: null,
             completionRateEwma: null,
@@ -526,9 +533,10 @@ export class Executor {
     }
 
     /** Returns true if any of the pool's configured regulator signals is
-     *  currently triggered. The default is `LatencyDrift` (the v1.x Student-t
-     *  trend test); pools may add any custom `RegulatorSignal`. Note this
-     *  reflects *concurrency* signals only, not admission shedding. */
+     *  currently triggered. The default is `PowerDegraded` (a Student-t
+     *  trend test on log throughput minus log latency); pools may add any
+     *  custom `RegulatorSignal`. Note this reflects *concurrency* signals
+     *  only, not admission shedding. */
     public isThroughputDegraded(pool: string): boolean {
         const p = this.pools.get(pool);
         if (!p) throw new ArgumentError(`Pool "${pool}" does not exist.`);
@@ -538,11 +546,11 @@ export class Executor {
     /** Returns the current state snapshot of a named signal on a pool, or
      *  `undefined` if the signal is not configured on the pool or doesn't
      *  expose state. Searches both regulator and admission signals. Use this
-     *  to inspect signal-specific metrics (e.g. `LatencyDrift`'s zScore,
-     *  dLogWBarVarEst, tCritical; `LaneErrorShed`'s per-lane rates).
+     *  to inspect signal-specific metrics (e.g. `PowerDegraded`'s latched,
+     *  referenceLevel, epsilon, recoveryMargin; `LaneErrorShed`'s per-lane rates).
      *
      *  Pass the signal's state type as `S` to get a typed result back:
-     *  `getSignalState<LatencyDriftState>(pool, "latency-drift")`. */
+     *  `getSignalState<PowerDegradedState>(pool, "power-degraded")`. */
     public getSignalState<S = unknown>(
         pool: string,
         signalName: string
@@ -598,6 +606,7 @@ export class Executor {
             pool: pool.name,
             concurrencyLimit: pool.concurrencyLimit,
             inFlight: pool.inFlight,
+            maxInFlight: pool.maxInFlight,
             queueLength: pool.queueLength,
             dropping: pool.dropping,
             inference,
@@ -726,13 +735,22 @@ export class Executor {
                     }
 
                     const result = await this.executeTask(p, laneKey, task);
-                    if (mode === DebounceMode.BeforeResult) {
+                    // Only clear the key if it still routes to this entry — a
+                    // stop()/start() cycle while the task ran can hand the key
+                    // to a successor whose dedupe window must not be destroyed.
+                    if (mode === DebounceMode.BeforeResult && p.debounceMap.get(key) === entry) {
                         p.debounceMap.delete(key);
                     }
                     entry.callback.resolve(result);
                 } catch (err) {
                     entry.callback.reject(err);
-                    p.debounceMap.delete(key);
+                    // Only clear the key if it still routes to this entry. In
+                    // BeforeExecution mode the key was already released at
+                    // admission and may now belong to a successor whose dedupe
+                    // window must not be destroyed by this task's failure.
+                    if (p.debounceMap.get(key) === entry) {
+                        p.debounceMap.delete(key);
+                    }
                 }
             })();
         });
@@ -1090,8 +1108,9 @@ export class Executor {
         pool.queueLength--;
         const now = performance.now();
         // CONTRACT: signal `onAdmit` hooks MUST fire *after* `pool.inFlight++`.
-        // LatencyDrift derives the pre-change count as `ctx.inFlight − 1`.
+        // PowerDegraded derives the pre-change count as `ctx.inFlight − 1`.
         pool.inFlight++;
+        if (pool.inFlight > pool.maxInFlight) pool.maxInFlight = pool.inFlight;
         lane.inFlight++;
         pool.admissionsThisWindow++;
 
@@ -1237,8 +1256,8 @@ export class Executor {
                 : (1 - alpha) * pool.inFlightEwma + alpha * pool.inFlight;
 
         // ── Notify signals at window boundary ──
-        // Each signal updates its own derived state (e.g., LatencyDrift's
-        // operational-LL integral, log/EWMA/dLogW/δ²/SE pipeline).
+        // Each signal updates its own derived state (e.g., PowerDegraded's
+        // operational-LL integral, log-power EWMA/dLogP/δ²/SE pipeline).
         const evalInfo: EvaluateInfo = {
             windowStart: pool.windowStart,
             windowEnd: now,
@@ -1306,8 +1325,10 @@ export class Executor {
             }
         }
 
-        // Reset window.
+        // Reset window. The peak restarts at the current in-flight level —
+        // tasks already running are the floor of the new window's high-water mark.
         pool.completionsThisWindow = 0;
+        pool.maxInFlight = pool.inFlight;
         pool.admissionsThisWindow = 0;
         pool.windowStart = now;
     }
@@ -1327,7 +1348,7 @@ export class Executor {
 
             const completionNow = performance.now();
             // CONTRACT: signal `onComplete` hooks MUST fire *after* `pool.inFlight--`.
-            // LatencyDrift derives the pre-change count as `ctx.inFlight + 1`.
+            // PowerDegraded derives the pre-change count as `ctx.inFlight + 1`.
             pool.inFlight--;
 
             // Notify signals after the inFlight count is decremented. A
@@ -1358,7 +1379,7 @@ export class Executor {
     }
 
     // Note: tScore and isLatencyDegrading have been moved into the
-    // LatencyDrift signal class (see src/signals.ts). The executor no
+    // PowerDegraded signal class (see src/signals.ts). The executor no
     // longer implements detection logic — signals own their state.
 
     /**
@@ -1403,7 +1424,28 @@ export class Executor {
             1,
             Math.ceil(pool.concurrencyLimit * (retraction ? sf / (1 + sf) : sf))
         );
-        pool.concurrencyLimit = Math.max(pool.minimumConcurrency, pool.concurrencyLimit - step);
+        const candidate = pool.concurrencyLimit - step;
+
+        // Operating-concurrency clamp (decrease path only): never leave the
+        // limit above this window's peak in-flight. When the limit sits on
+        // inert headroom (maxInFlight ≪ L), a bisection step would walk down
+        // dead space for several ticks before biting; instead we *snap* to
+        // the binding point in one move. The snap removes only headroom
+        // (inFlight ≤ maxInFlight, so no live concurrency is cut) and has no
+        // plant effect — it re-anchors the actuator where it can actually
+        // act. Because the jump is not a bisection step, we reset the
+        // bisection bookkeeping and treat it as a fresh decrease origin.
+        // Guard maxInFlight > 0 so a fresh/idle window never snaps to the
+        // floor. The signal re-anchors its own experiment origin on the
+        // resulting binding transition (concurrencyLimit ≤ maxInFlight).
+        if (pool.maxInFlight > 0 && pool.maxInFlight < candidate) {
+            pool.concurrencyLimit = Math.max(pool.minimumConcurrency, pool.maxInFlight);
+            pool.stepScale = 1;
+            pool.regulationDepth = 0;
+            pool.regulationPhase = RegulationPhase.Decreasing;
+        } else {
+            pool.concurrencyLimit = Math.max(pool.minimumConcurrency, candidate);
+        }
     }
 
     /** Convergent increase: queue pressure with stable latency. */

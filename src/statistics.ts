@@ -75,14 +75,24 @@ export class Statistics {
         return 1 / (ewmaSumW2 * c);
     }
 
-    /** One-sided Student-t critical value (safe upper bound) at upper-tail
-     *  probability Φ(−z), degrees of freedom ν.
+    /** One-sided Student-t critical value at upper-tail probability Φ(−z),
+     *  degrees of freedom ν — an upper bound on the true quantile at every
+     *  ν, by returning a finite value only where the bound is certified:
      *
-     *  4th-order Cornish-Fisher inverse-t series (Hill, G. W. "Algorithm 396:
-     *  Student's t-quantiles." Communications of the ACM 13.10 (1970): 619–620)
-     *  plus an asymptotic-series truncation bound 2·|g₄/ν⁴|. As ν → 0 the bound
-     *  diverges, naturally gating the test off — no clamp needed. */
+     *  - ν ≥ 5: classical 4th-order Fisher–Cornish inverse-t series
+     *    (Abramowitz & Stegun 26.7.5; Hill 1970) plus the truncation bound
+     *    2·|g₄/ν⁴| — valid here, where the series terms decay geometrically
+     *    with ratio ≤ 1/2 (numerically verified for z ≤ 4).
+     *  - ν < 5: Infinity. The asymptotic series is outside its certified
+     *    domain (the true quantile grows exponentially in 1/ν and outruns
+     *    any polynomial), so no finite bound is claimed and the test cannot
+     *    fire. df reaches 5 roughly 1.2 time constants after cold start or
+     *    an idle reset — the implicit warm-up gate.
+     *
+     *  Infinity is safe downstream: `v̂ > Infinity · SE` is false for any
+     *  finite SE (and false via NaN when SE = 0). */
     static tScore(z: number, df: number): number {
+        if (!(df >= 5)) return Number.POSITIVE_INFINITY;
         const z2 = z * z;
         const z4 = z2 * z2;
         const z6 = z4 * z2;

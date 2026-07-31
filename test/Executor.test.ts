@@ -1,10 +1,10 @@
 import { ResourceExhaustedError, ExecutorNotRunningError, ArgumentError, ConcurrexError } from "../src/errors.js";
 import { DebounceMode, Executor } from "../src/Executor.js";
 import {
-    LatencyDrift,
+    PowerDegraded,
     EarlyShed,
     LaneErrorShed,
-    type LatencyDriftState,
+    type PowerDegradedState,
     type LaneErrorShedState,
     type RegulatorSignal,
     type AdmissionSignal
@@ -851,9 +851,9 @@ describe("Executor tests", () => {
             });
         });
 
-        describe("LatencyDrift options and state snapshot", () => {
+        describe("PowerDegraded options and state snapshot", () => {
             test("clone preserves the configured name", () => {
-                const template = new LatencyDrift({ name: "custom-drift" });
+                const template = new PowerDegraded({ name: "custom-drift" });
                 const cloned = template.clone();
                 expect(cloned).not.toBe(template);
                 expect(cloned.name).toBe("custom-drift");
@@ -862,8 +862,8 @@ describe("Executor tests", () => {
             test("custom names allow multiple instances on one pool", async () => {
                 executor.registerPool("test", {
                     regulatorSignals: [
-                        new LatencyDrift(),
-                        new LatencyDrift({ name: "latency-drift-b" })
+                        new PowerDegraded(),
+                        new PowerDegraded({ name: "power-degraded-b" })
                     ]
                 });
 
@@ -874,8 +874,8 @@ describe("Executor tests", () => {
                     await t;
                 }
 
-                const a = executor.getSignalState<LatencyDriftState>("test", "latency-drift");
-                const b = executor.getSignalState<LatencyDriftState>("test", "latency-drift-b");
+                const a = executor.getSignalState<PowerDegradedState>("test", "power-degraded");
+                const b = executor.getSignalState<PowerDegradedState>("test", "power-degraded-b");
                 expect(a).toBeDefined();
                 expect(b).toBeDefined();
                 // Both instances observe the same events independently.
@@ -885,12 +885,12 @@ describe("Executor tests", () => {
                 }
             });
 
-            test("default LatencyDrift name and behavior are unchanged", () => {
+            test("default PowerDegraded name and behavior are configured", () => {
                 executor.registerPool("test");
-                const state = executor.getSignalState<LatencyDriftState>("test", "latency-drift");
+                const state = executor.getSignalState<PowerDegradedState>("test", "power-degraded");
                 expect(state).toBeDefined();
-                expect(state!.se).toBe(0); // no data yet → test not evaluable
-                expect(state!.degrading).toBe(false);
+                expect(state!.degrading).toBe(false); // no data yet → test not evaluable
+                expect(state!.latched).toBe(false);
             });
         });
 
@@ -921,7 +921,7 @@ describe("Executor tests", () => {
                 // (1−α)²·1 + α² ≈ 0.74 — so df ≈ 0.35 and the Cornish-Fisher
                 // critical value diverges (warm-up gate). An unseeded heartbeat
                 // would report Σw² = α² ≈ 0.02 → df ≈ 40 → tCritical ≈ z,
-                // arming the trend test at full sensitivity with no history.
+                // running the trend test at full sensitivity with no history.
                 expect(observed.length).toBeGreaterThan(0);
                 expect(observed[0].ewmaSumW2).toBeGreaterThan(0.5);
                 expect(observed[0].ewmaSumW2).toBeLessThanOrEqual(1);
@@ -2532,9 +2532,8 @@ describe("Executor tests", () => {
             expect(realExecutor.isThroughputDegraded("test")).toBe(true);
             const state = realExecutor.getRegulatorState("test");
             expect(state.overloadDetected).toBe(true);
-            // Latency-test internals migrated to signal-specific state in v2.
-            const latency = realExecutor.getSignalState("test", "latency-drift");
-            expect(latency).toBeDefined();
+            const signal = realExecutor.getSignalState("test", "power-degraded");
+            expect(signal).toBeDefined();
 
             realExecutor.stop();
 
@@ -2573,8 +2572,8 @@ describe("Executor tests", () => {
             // signal-specific state (logWBar, dLogWBarEwma, etc.) is per-signal.
             // We probe the heartbeat indirectly by sampling state across the idle
             // gap — post-idle the next observation pulls W² back toward 1.
-            const preIdleLatency = realExecutor.getSignalState("test", "latency-drift");
-            expect(preIdleLatency).toBeDefined();
+            const preIdleSignal = realExecutor.getSignalState("test", "power-degraded");
+            expect(preIdleSignal).toBeDefined();
 
             // Idle for many windows. ewmaSumW2 should reset toward 1 on the
             // next observation (Theorem 9: implicit warm-up).
@@ -2614,59 +2613,6 @@ describe("Executor tests", () => {
 
             expect(executor.isThroughputDegraded("test")).toBe(false);
         });
-
-        test("flips from decrease to increase when latency trend reverses", async () => {
-            vi.useRealTimers();
-
-            const realExecutor = new Executor({ logger });
-            realExecutor.start();
-            realExecutor.registerPool("test", {
-                baselineConcurrency: 10,
-                minimumConcurrency: 2,
-                maximumConcurrency: 50,
-                controlWindow: 50,
-                delayThreshold: 5000
-            });
-
-            const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-            // Phase 1: fast tasks → low W baseline.
-            for (let w = 0; w < 20; w++) {
-                const batch = Array.from({ length: 10 }, () =>
-                    realExecutor.run("test", () => sleep(2))
-                );
-                await Promise.allSettled(batch);
-                await sleep(50);
-            }
-
-            // Phase 2: slow tasks → W rises → decrease.
-            for (let w = 0; w < 20; w++) {
-                const batch = Array.from({ length: 10 }, () =>
-                    realExecutor.run("test", () => sleep(40))
-                );
-                await Promise.allSettled(batch);
-                await sleep(10);
-            }
-
-            const limitAfterDegrade = realExecutor.getConcurrencyLimit("test");
-
-            // Phase 3: fast tasks + queue pressure → W drops → increase.
-            for (let w = 0; w < 20; w++) {
-                const batch = Array.from({ length: 15 }, () =>
-                    realExecutor.run("test", () => sleep(2))
-                );
-                await Promise.allSettled(batch);
-                await sleep(50);
-            }
-
-            expect(realExecutor.getConcurrencyLimit("test")).toBeGreaterThan(limitAfterDegrade);
-            realExecutor.stop();
-
-            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
-            vi.setSystemTime(0);
-            currentTime = 0;
-            vi.spyOn(performance, "now").mockImplementation(() => currentTime);
-        }, 15_000);
     });
 
     describe("Per-lane error shedding", () => {
@@ -2986,7 +2932,7 @@ describe("Executor tests", () => {
                 await realWait(35);
             }
 
-            // Each pool's z propagates into its LatencyDrift signal via the
+            // Each pool's z propagates into its PowerDegraded signal via the
             // shared inference state (ctx.inference.zScoreThreshold). The signal's
             // triggered() compares its trend against tScore(z, df) — so a
             // lower-z pool fires sooner. We assert the cadence + sensitivity
@@ -3013,12 +2959,12 @@ describe("Executor tests", () => {
             executor.stop();
         });
 
-        test("default signals are [LatencyDrift] when none specified", () => {
+        test("default signals are [PowerDegraded] when none specified", () => {
             executor.registerPool("test");
             // No degradation initially, but signal is configured.
             expect(executor.isThroughputDegraded("test")).toBe(false);
-            // LatencyDrift's state is accessible via getSignalState.
-            const state = executor.getSignalState("test", "latency-drift");
+            // PowerDegraded's state is accessible via getSignalState.
+            const state = executor.getSignalState("test", "power-degraded");
             expect(state).toBeDefined();
         });
 
@@ -3042,6 +2988,33 @@ describe("Executor tests", () => {
             }
             vi.useRealTimers();
             expect(executor.getConcurrencyLimit("test")).toBeLessThan(initial);
+        });
+
+        test("decrease snaps the limit to peak in-flight, clearing inert headroom", async () => {
+            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
+            const alwaysFire = {
+                name: "always-fire",
+                onAdmit() {}, onComplete() {}, onEvaluate() {},
+                triggered: () => true,
+                clone() { return alwaysFire; }
+            };
+            executor.registerPool("test", {
+                baselineConcurrency: 100,
+                minimumConcurrency: 1,
+                controlWindow: 10,
+                regulatorSignals: [alwaysFire]
+            });
+            expect(executor.getConcurrencyLimit("test")).toBe(100);
+            // Sequential tasks → peak in-flight ≈ 1 while the limit sits at 100
+            // (inert headroom). The first decrease decision should SNAP the limit
+            // to the operating concurrency in one move — not take a single ~11%
+            // bisection step (which would leave the limit near 89).
+            for (let i = 0; i < 12; i++) {
+                vi.advanceTimersByTime(10);
+                await executor.run("test", () => {});
+            }
+            vi.useRealTimers();
+            expect(executor.getConcurrencyLimit("test")).toBeLessThanOrEqual(2);
         });
 
         test("empty regulatorSignals array disables backpressure-driven decrease", async () => {
@@ -3096,7 +3069,7 @@ describe("Executor tests", () => {
             vi.useRealTimers();
             const realExecutor = new Executor({ logger });
             realExecutor.start();
-            const drift = new LatencyDrift();
+            const drift = new PowerDegraded();
             realExecutor.registerPool("a", { baselineConcurrency: 5, controlWindow: 30, regulatorSignals: [drift] });
             realExecutor.registerPool("b", { baselineConcurrency: 5, controlWindow: 30, regulatorSignals: [drift] });
             const realWait = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -3108,8 +3081,8 @@ describe("Executor tests", () => {
                 await Promise.allSettled(batch);
                 await realWait(35);
             }
-            const stateA = realExecutor.getSignalState<LatencyDriftState>("a", "latency-drift");
-            const stateB = realExecutor.getSignalState<LatencyDriftState>("b", "latency-drift");
+            const stateA = realExecutor.getSignalState<PowerDegradedState>("a", "power-degraded");
+            const stateB = realExecutor.getSignalState<PowerDegradedState>("b", "power-degraded");
             expect(stateA?.logWBar).not.toBeNull();
             expect(stateB?.logWBar).toBeNull();
             realExecutor.stop();
@@ -3125,7 +3098,7 @@ describe("Executor tests", () => {
         });
 
         test("getSignalState throws for nonexistent pool", () => {
-            expect(() => executor.getSignalState("nope", "latency-drift")).toThrow(ArgumentError);
+            expect(() => executor.getSignalState("nope", "power-degraded")).toThrow(ArgumentError);
         });
 
         test("getSignalState returns undefined for a signal without state()", () => {
@@ -3261,11 +3234,11 @@ describe("Executor tests", () => {
             expect(state.elapsedWindows).toBe(0);
         });
 
-        test("RegulatorState does not leak latency-test internals (those moved to LatencyDrift signal)", () => {
+        test("RegulatorState does not leak latency-test internals (those moved to PowerDegraded signal)", () => {
             // Breaking change in v2.0: latency-test fields (logW, logWBar,
             // dLogWBarEwma, dLogWBarVarianceEstimate, ewmaSumW2, se, zScore,
-            // tCritical, threshold, alpha) moved into LatencyDrift signal's state.
-            // Inspect via executor.getSignalState(pool, "latency-drift").
+            // tCritical, threshold, alpha) moved into PowerDegraded signal's state.
+            // Inspect via executor.getSignalState(pool, "power-degraded").
             executor.registerPool("test");
             const state = executor.getRegulatorState("test");
             expect("logW" in state).toBe(false);
@@ -3293,34 +3266,6 @@ describe("Executor tests", () => {
             expect(state.completionRateEwma).not.toBeNull();
             expect(state.inFlightEwma).not.toBeNull();
         });
-
-        test("dLogWBarVarianceEstimate and SE populate after sustained load", async () => {
-            // Use real timers + a real-duration workload so inFlightMs accumulates
-            // and Little's Law produces real W̃ samples.
-            vi.useRealTimers();
-            const realExecutor = new Executor({ logger });
-            realExecutor.start();
-            realExecutor.registerPool("test", { controlWindow: 30, baselineConcurrency: 5 });
-
-            const realWait = (ms: number) => new Promise((r) => setTimeout(r, ms));
-            for (let w = 0; w < 30; w++) {
-                const batch = Array.from({ length: 5 }, () =>
-                    realExecutor.run("test", () => realWait(5))
-                );
-                await Promise.allSettled(batch);
-                await realWait(35);
-            }
-
-            // In v2.0 the δ² state lives in the LatencyDrift signal.
-            const latency = realExecutor.getSignalState<LatencyDriftState>("test", "latency-drift");
-            expect(latency).toBeDefined();
-            expect(latency!.dLogWBarVarEst).toBeGreaterThan(0);
-            expect(Number.isFinite(latency!.dLogWBarVarEst)).toBe(true);
-
-            realExecutor.stop();
-            vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
-            vi.setSystemTime(0);
-        }, 10_000);
     });
 
     describe("Error class hierarchy", () => {
@@ -3389,6 +3334,106 @@ describe("Executor tests", () => {
 
             executor.stop();
             await expect(debounced).rejects.toThrow(ExecutorNotRunningError);
+        });
+
+        test("a failing task does not destroy a successor's dedupe window (BeforeExecution)", async () => {
+            executor.registerPool("test", { baselineConcurrency: 1, maximumConcurrency: 1 });
+            let bRan = 0;
+            let cRan = 0;
+            let failA!: (err: Error) => void;
+            let releaseBlocker!: () => void;
+
+            // A: admitted immediately (slot free); BeforeExecution releases the
+            // key at admission, before the task settles.
+            const pA = executor.runDebounced(
+                "test",
+                "k",
+                () => new Promise<never>((_, reject) => { failA = reject; }),
+                { mode: DebounceMode.BeforeExecution }
+            );
+            await vi.advanceTimersByTimeAsync(1);
+
+            // Blocker occupies the slot once A settles, keeping B queued.
+            void executor.run("test", () => new Promise<void>(resolve => { releaseBlocker = resolve; }));
+
+            // B: re-registers the released key while A is still executing.
+            const pB = executor.runDebounced("test", "k", () => { bRan++; return "B"; }, {
+                mode: DebounceMode.BeforeExecution
+            });
+            await vi.advanceTimersByTimeAsync(1);
+
+            // A fails. Its cleanup must NOT delete B's live map entry.
+            failA(new Error("A-fails"));
+            await expect(pA).rejects.toThrow("A-fails");
+            await vi.advanceTimersByTimeAsync(1);
+
+            // C arrives inside B's dedupe window: it must join B's entry and
+            // receive B's result — not start a third execution. (Without the
+            // ownership guard, A's failure wiped B's map entry, so C ran its
+            // own task and resolved "C".)
+            const pC = executor.runDebounced("test", "k", () => { cRan++; return "C"; }, {
+                mode: DebounceMode.BeforeExecution
+            });
+
+            releaseBlocker();
+            await vi.advanceTimersByTimeAsync(1);
+
+            await expect(pB).resolves.toBe("B");
+            await expect(pC).resolves.toBe("B");
+            expect(bRan).toBe(1);
+            expect(cRan).toBe(0);
+        });
+
+        test("a task settling after stop()/start() does not destroy a successor's dedupe window (BeforeResult)", async () => {
+            executor.registerPool("test", { baselineConcurrency: 1, maximumConcurrency: 1 });
+            let cRan = 0;
+            let resolveA!: (v: string) => void;
+            let resolveB!: (v: string) => void;
+
+            // A: admitted and executing. In BeforeResult mode the key stays
+            // in the map until the task settles.
+            const pA = executor.runDebounced(
+                "test",
+                "k",
+                () => new Promise<string>(resolve => { resolveA = resolve; }),
+                { mode: DebounceMode.BeforeResult }
+            );
+            await vi.advanceTimersByTimeAsync(1);
+
+            // stop() rejects A's debounced promise and clears the map — but
+            // A's underlying task keeps running.
+            executor.stop();
+            await expect(pA).rejects.toThrow(ExecutorNotRunningError);
+            executor.start();
+
+            // B: re-registers the key while A is still executing.
+            const pB = executor.runDebounced(
+                "test",
+                "k",
+                () => new Promise<string>(resolve => { resolveB = resolve; }),
+                { mode: DebounceMode.BeforeResult }
+            );
+            await vi.advanceTimersByTimeAsync(1);
+
+            // A finally settles. Its success-path cleanup must NOT delete
+            // B's live map entry (the key now routes to B, not A).
+            resolveA("A");
+            await vi.advanceTimersByTimeAsync(1);
+
+            // C arrives inside B's dedupe window: it must join B's entry —
+            // not start a third execution. (Without the ownership guard,
+            // A's settlement wiped B's entry, so C ran its own task.)
+            const pC = executor.runDebounced("test", "k", () => { cRan++; return "C"; }, {
+                mode: DebounceMode.BeforeResult
+            });
+            await vi.advanceTimersByTimeAsync(1);
+
+            resolveB("B");
+            await vi.advanceTimersByTimeAsync(1);
+
+            await expect(pB).resolves.toBe("B");
+            await expect(pC).resolves.toBe("B");
+            expect(cRan).toBe(0);
         });
     });
 

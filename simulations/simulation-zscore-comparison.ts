@@ -109,7 +109,7 @@ function captureSnapshot(
     windowErrorRate: number
 ): Snapshot {
     const rs = executor.getRegulatorState(pool);
-    const latency = executor.getSignalState(pool, "latency-drift");
+    const latency = executor.getSignalState(pool, "power-degraded");
     return {
         time: Math.round(performance.now() - startTime),
         concurrencyLimit: executor.getConcurrencyLimit(pool),

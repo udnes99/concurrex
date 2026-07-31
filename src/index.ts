@@ -26,10 +26,10 @@ export {
     type AdmitInfo,
     type CompletionInfo,
     type EvaluateInfo,
-    type LatencyDriftState,
-    type LatencyDriftOptions,
+    type PowerDegradedState,
+    type PowerDegradedOptions,
     type LaneErrorShedState,
-    LatencyDrift,
+    PowerDegraded,
     EarlyShed,
     LaneErrorShed,
 } from "./signals.js";

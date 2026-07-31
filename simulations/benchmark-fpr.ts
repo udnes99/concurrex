@@ -9,13 +9,13 @@
  *
  * Two modes, run back to back:
  *
- *   A. **LatencyDrift end-to-end** — a real Executor pool driven with a
+ *   A. **PowerDegraded end-to-end** — a real Executor pool driven with a
  *      stationary (drift-free) log-normal latency workload, across
  *      several zScoreThreshold values. Every `degrading` window after
  *      warm-up is a false positive.
  *
  *   B. **Bonferroni composition** — N independent `NoiseTrend` signals
- *      (the canonical LatencyDrift pipeline applied to independent
+ *      (the canonical PowerDegraded pipeline applied to independent
  *      synthetic N(0,1) observation streams, using the pool's shared
  *      `ctx.inference` state) on one pool. Measures each signal's
  *      marginal rate and the joint any-signal rate vs. N·Φ(−z).
@@ -43,8 +43,8 @@
 import { Executor } from "../src/Executor.js";
 import { Statistics } from "../src/statistics.js";
 import {
-    LatencyDrift,
-    type LatencyDriftState,
+    PowerDegraded,
+    type PowerDegradedState,
     type RegulatorSignal,
     type SignalContext,
     type EvaluateInfo
@@ -112,7 +112,7 @@ interface NoiseTrendState {
 }
 
 /**
- * LatencyDrift's exact pipeline (level EWMA → dt-normalized derivative →
+ * PowerDegraded's exact pipeline (level EWMA → dt-normalized derivative →
  * trend EWMA with shrinkage → von Neumann δ² → Student-t test), applied
  * to an independent i.i.d. N(0,1) observation stream instead of latency.
  * Under H0 by construction — every trigger is a false positive. All
@@ -188,7 +188,7 @@ interface BlockNoiseState {
 }
 
 /**
- * PROTOTYPE — LatencyDrift's exact signal path (Little's-law integral,
+ * PROTOTYPE — PowerDegraded's exact signal path (Little's-law integral,
  * level EWMA, trend EWMA) with ONE change: the noise floor is estimated
  * at the DECISION timescale instead of the sampling timescale.
  *
@@ -202,8 +202,8 @@ interface BlockNoiseState {
  * df comes from the block-estimator's own ESS (Σw² over block updates,
  * seeded at 1), so warm-up gating is inherited at block granularity.
  */
-class BlockNoiseLatencyDrift implements RegulatorSignal<BlockNoiseState> {
-    public readonly name = "block-latency-drift";
+class BlockNoisePowerDegraded implements RegulatorSignal<BlockNoiseState> {
+    public readonly name = "block-power-degraded";
 
     private inFlightMs = 0;
     private lastInFlightChange: number | null = null;
@@ -310,8 +310,8 @@ class BlockNoiseLatencyDrift implements RegulatorSignal<BlockNoiseState> {
         return { degrading: this.degrading };
     }
 
-    clone(): BlockNoiseLatencyDrift {
-        return new BlockNoiseLatencyDrift();
+    clone(): BlockNoisePowerDegraded {
+        return new BlockNoisePowerDegraded();
     }
 }
 
@@ -330,8 +330,8 @@ interface RhoCorrectedState {
  * correlation and suppresses step detection. Kept here so the Mode D
  * ablation documents the rejection empirically.
  */
-class RhoCorrectedLatencyDrift implements RegulatorSignal<RhoCorrectedState> {
-    public readonly name = "latency-drift-corrected";
+class RhoCorrectedPowerDegraded implements RegulatorSignal<RhoCorrectedState> {
+    public readonly name = "power-degraded-corrected";
 
     private inFlightMs = 0;
     private lastInFlightChange: number | null = null;
@@ -431,8 +431,118 @@ class RhoCorrectedLatencyDrift implements RegulatorSignal<RhoCorrectedState> {
         return { degrading: this.degrading, rhoHat: this.rhoHat };
     }
 
-    clone(): RhoCorrectedLatencyDrift {
-        return new RhoCorrectedLatencyDrift();
+    clone(): RhoCorrectedPowerDegraded {
+        return new RhoCorrectedPowerDegraded();
+    }
+}
+
+// ── Welford: centered-variance noise floor (saturation comparator) ──
+
+interface WelfordState {
+    degrading: boolean;
+}
+
+/**
+ * RESEARCH ARTIFACT — the same pipeline as `PowerDegraded` but with a
+ * *centered* variance noise floor (EWMA mean + EWMA of squared
+ * residuals, Welford-style) instead of von Neumann's δ² (MSSD/2).
+ *
+ * The failure mode this exhibits is the reason δ² ships (THEORY.md
+ * Theorem 8): a level step's transient enters the residuals, so the
+ * noise floor inflates with the *square* of the step magnitude while the
+ * trend numerator grows only linearly — the test statistic saturates,
+ * and larger incidents become harder to detect, not easier. δ² sees only
+ * successive differences, which the transient leaves quickly, so its
+ * detection delay is flat in magnitude.
+ */
+class WelfordPowerDegraded implements RegulatorSignal<WelfordState> {
+    public readonly name = "welford-power-degraded";
+
+    private inFlightMs = 0;
+    private lastInFlightChange: number | null = null;
+    private logWBar: number | null = null;
+    private lastLevelUpdateTime: number | null = null;
+    private trend: number | null = null;
+    private rateMean: number | null = null; // centered-variance mean tracker
+    private varEst = 0; // EWMA[(rate − mean)²]
+    private degrading = false;
+
+    onAdmit(ctx: SignalContext, info: { admitTime: number }): void {
+        if (this.lastInFlightChange !== null) {
+            this.inFlightMs += (ctx.inFlight - 1) * (info.admitTime - this.lastInFlightChange);
+        }
+        this.lastInFlightChange = info.admitTime;
+    }
+
+    onComplete(ctx: SignalContext, info: { completionTime: number }): void {
+        if (this.lastInFlightChange !== null) {
+            this.inFlightMs += (ctx.inFlight + 1) * (info.completionTime - this.lastInFlightChange);
+        }
+        this.lastInFlightChange = info.completionTime;
+    }
+
+    onEvaluate(ctx: SignalContext, info: EvaluateInfo): void {
+        const { currentAlpha, bayesianShrinkage, controlWindow, ewmaSumW2, zScoreThreshold } =
+            ctx.inference;
+
+        if (this.lastInFlightChange !== null) {
+            this.inFlightMs += ctx.inFlight * (info.windowEnd - this.lastInFlightChange);
+            this.lastInFlightChange = info.windowEnd;
+        }
+        if (info.completions === 0 || this.inFlightMs === 0) return;
+
+        const logInstantW = Math.log(this.inFlightMs / info.completions);
+        const levelAlpha = currentAlpha * bayesianShrinkage;
+        const previousLevel = this.logWBar;
+        const previousUpdate = this.lastLevelUpdateTime;
+        this.logWBar =
+            this.logWBar === null
+                ? logInstantW
+                : (1 - levelAlpha) * this.logWBar + levelAlpha * logInstantW;
+        this.lastLevelUpdateTime = info.windowEnd;
+
+        if (previousLevel !== null && previousUpdate !== null) {
+            const dt = (info.windowEnd - previousUpdate) / controlWindow;
+            if (dt > 0) {
+                const rate = (this.logWBar - previousLevel) / dt;
+                this.trend =
+                    this.trend === null
+                        ? rate * bayesianShrinkage
+                        : (1 - currentAlpha) * this.trend + currentAlpha * (rate * bayesianShrinkage);
+                // Centered variance: residual against the *previous* mean
+                // (standard EWMA-Welford update order).
+                if (this.rateMean !== null) {
+                    const residual = rate - this.rateMean;
+                    this.varEst = (1 - currentAlpha) * this.varEst + currentAlpha * residual * residual;
+                }
+                this.rateMean =
+                    this.rateMean === null ? rate : (1 - currentAlpha) * this.rateMean + currentAlpha * rate;
+            }
+        }
+        this.inFlightMs = 0;
+
+        this.degrading = false;
+        if (this.trend !== null && this.varEst > 0 && ewmaSumW2 > 0) {
+            const df = 1 / ewmaSumW2 - 1;
+            if (df > 0) {
+                const se = Statistics.studentTTrendSE({ sigmaSqEstimate: this.varEst, ewmaSumW2 });
+                if (se > 0) {
+                    this.degrading = this.trend > Statistics.tScore(zScoreThreshold, df) * se;
+                }
+            }
+        }
+    }
+
+    triggered(): boolean {
+        return this.degrading;
+    }
+
+    state(): WelfordState {
+        return { degrading: this.degrading };
+    }
+
+    clone(): WelfordPowerDegraded {
+        return new WelfordPowerDegraded();
     }
 }
 
@@ -549,7 +659,7 @@ function gcWorkload(batch: number, factor: number): Workload {
 /** H1 workload: stationary, then an instantaneous latency level step of
  *  `factor`× at `startWindow`. The step's smooth transient through the
  *  level filter is curvature — the ρ̂ estimator's blind spot. */
-function stepWorkload(batch: number, startWindow: number, factor: number): Workload {
+function stepWorkload(batch: number, startWindow: number, factor: number, noiseSd = 0.3): Workload {
     let k = 0;
     return {
         name: `step(${factor}x)`,
@@ -559,7 +669,7 @@ function stepWorkload(batch: number, startWindow: number, factor: number): Workl
             k++;
             return {
                 batch,
-                serviceTime: Math.min(scale * 20 * Math.exp(0.3 * gaussian(rng)), 0.9 * CONTROL_WINDOW)
+                serviceTime: Math.min(scale * 20 * Math.exp(noiseSd * gaussian(rng)), 0.9 * CONTROL_WINDOW)
             };
         }
     };
@@ -662,11 +772,15 @@ async function runScenario(opts: {
         const elapsedWindows = executor.getRegulatorState("bench").elapsedWindows;
         samples.push({
             evaluated: elapsedWindows > lastElapsedWindows,
-            firing: opts.signalNames.map(
-                (n) =>
-                    (executor.getSignalState<NoiseTrendState | LatencyDriftState>("bench", n)
-                        ?.degrading ?? false) === true
-            )
+            firing: opts.signalNames.map((n) => {
+                // For the real PowerDegraded the operative firing state
+                // is the latch (what triggered() reports); research variants
+                // expose only the per-evaluation test outcome.
+                const s = executor.getSignalState<
+                    (NoiseTrendState | PowerDegradedState) & { latched?: boolean }
+                >("bench", n);
+                return (s?.latched ?? s?.degrading ?? false) === true;
+            })
         });
         lastElapsedWindows = elapsedWindows;
     }
@@ -705,16 +819,16 @@ async function main(): Promise<void> {
     console.log(`FPR calibration benchmark — ${WINDOWS} windows/config, ${BATCH} tasks/window, seed ${SEED}`);
     console.log(`Shrinkage at this batch size: s = r/(r+z²) with r = ${BATCH}\n`);
 
-    // ── Mode A: LatencyDrift end-to-end under stationary latency ──
-    console.log("── Mode A: LatencyDrift on a drift-free latency stream ──");
+    // ── Mode A: PowerDegraded end-to-end under stationary latency ──
+    console.log("── Mode A: PowerDegraded on a drift-free latency stream ──");
     console.log("z      bound Φ(−z)   shrink-adj Φ(−z/s)   empirical      ±CI95      windows");
     for (const z of [1.5, 2, 3]) {
         const tau = Statistics.deriveTimeConstant(z);
         const rng = mulberry32(SEED + z * 1000);
         const samples = await runScenario({
             z,
-            signalNames: ["latency-drift"],
-            regulatorSignals: [new LatencyDrift()],
+            signalNames: ["power-degraded"],
+            regulatorSignals: [new PowerDegraded()],
             rng
         });
         const r = measure(samples, 5 * tau, tau);
@@ -742,7 +856,7 @@ async function main(): Promise<void> {
     }
 
     // ── Mode C: robustness under realistic (still drift-free) traffic ──
-    console.log(`\n── Mode C: LatencyDrift at z = ${z} under realistic H0 traffic ──`);
+    console.log(`\n── Mode C: PowerDegraded at z = ${z} under realistic H0 traffic ──`);
     console.log("workload      bound Φ(−z)   empirical      ±CI95      windows    notes");
     const robustness: Workload[] = [
         iidWorkload(BATCH),
@@ -757,8 +871,8 @@ async function main(): Promise<void> {
         const rng = mulberry32(SEED + 9000 + i);
         const samples = await runScenario({
             z,
-            signalNames: ["latency-drift"],
-            regulatorSignals: [new LatencyDrift()],
+            signalNames: ["power-degraded"],
+            regulatorSignals: [new PowerDegraded()],
             rng,
             workload
         });
@@ -781,8 +895,8 @@ async function main(): Promise<void> {
         const rng = mulberry32(SEED + 9500 + i);
         const samples = await runScenario({
             z,
-            signalNames: ["latency-drift"],
-            regulatorSignals: [new LatencyDrift()],
+            signalNames: ["power-degraded"],
+            regulatorSignals: [new PowerDegraded()],
             rng,
             workload: ar1Workload(BATCH, rho),
             controlWindow: cw
@@ -803,13 +917,13 @@ async function main(): Promise<void> {
     // delay tail is characterized.
     console.log(`\n── Mode D: noise-estimator ablation — default vs rejected ρ̂ vs block candidate, z = ${z} ──`);
     console.log("workload      bound Φ(−z)   default        ρ̂ (rejected)   block          windows");
-    const pairNames = ["latency-drift", "latency-drift-corrected", "block-latency-drift"];
+    const pairNames = ["power-degraded", "power-degraded-corrected", "block-power-degraded"];
     for (const [i, workload] of [iidWorkload(BATCH), ar1Workload(BATCH, 0.5), ar1Workload(BATCH, 0.8), gcWorkload(BATCH, 5)].entries()) {
         const rng = mulberry32(SEED + 9800 + i);
         const samples = await runScenario({
             z,
             signalNames: pairNames,
-            regulatorSignals: [new LatencyDrift(), new RhoCorrectedLatencyDrift(), new BlockNoiseLatencyDrift()],
+            regulatorSignals: [new PowerDegraded(), new RhoCorrectedPowerDegraded(), new BlockNoisePowerDegraded()],
             rng,
             workload
         });
@@ -837,7 +951,7 @@ async function main(): Promise<void> {
         const samples = await runScenario({
             z,
             signalNames: pairNames,
-            regulatorSignals: [new LatencyDrift(), new RhoCorrectedLatencyDrift(), new BlockNoiseLatencyDrift()],
+            regulatorSignals: [new PowerDegraded(), new RhoCorrectedPowerDegraded(), new BlockNoisePowerDegraded()],
             rng,
             workload: pc.workload
         });
@@ -848,6 +962,57 @@ async function main(): Promise<void> {
         console.log(`${pc.name.padEnd(18)} ${delay(0).padEnd(12)} ${delay(1).padEnd(12)} ${delay(2)}`);
     }
 
+    // ── Mode E: no-saturation ablation — δ² (MSSD/2) vs centered variance ──
+    // A step's transient inflates a centered noise floor by the *square*
+    // of the magnitude while the trend numerator grows only linearly, so
+    // the Welford statistic saturates: bigger incidents get *harder* to
+    // detect. δ² sees only successive differences — flat delay in
+    // magnitude (Theorem 8's drift invariance, measured).
+    console.log(
+        `\n── Mode E: noise-floor ablation — δ² (MSSD/2) vs centered variance (Welford), z = ${z} ──`
+    );
+    {
+        const names = ["power-degraded", "welford-power-degraded"];
+        const h0 = await runScenario({
+            z,
+            signalNames: names,
+            regulatorSignals: [new PowerDegraded(), new WelfordPowerDegraded()],
+            rng: mulberry32(SEED + 12000)
+        });
+        const r0 = measure(h0, 5 * tau, tau);
+        console.log(
+            `H0 calibration (iid): δ² ${pct(r0.perSignal[0])}, welford ${pct(r0.perSignal[1])} — bound ${pct(phi(-z))} (fair comparison)`
+        );
+        // Magnitude sweep. For δ² the delay should *shrink* with severity
+        // (test statistic grows ∝ μ — Theorem 8). A centered noise floor
+        // inflates with ~μ² during the transient, so its statistic hits a
+        // magnitude-independent ceiling — the delay floors instead.
+        console.log("\nscenario                    δ² (MSSD/2)   welford      (windows from onset to first trigger)");
+        const sweep: Array<{ label: string; workload: Workload }> = [
+            ...[0.002, 0.005, 0.02, 0.05].map((perWindow) => ({
+                label: `drift +${(100 * perWindow).toFixed(1)}%/window`,
+                workload: driftingWorkload(BATCH, DRIFT_START, perWindow, 0)
+            })),
+            { label: "step 2x", workload: stepWorkload(BATCH, DRIFT_START, 2) },
+            { label: "step 4x", workload: stepWorkload(BATCH, DRIFT_START, 4) }
+        ];
+        for (const [i, item] of sweep.entries()) {
+            const rng = mulberry32(SEED + 12100 + i);
+            const samples = await runScenario({
+                z,
+                signalNames: names,
+                regulatorSignals: [new PowerDegraded(), new WelfordPowerDegraded()],
+                rng,
+                workload: item.workload
+            });
+            const delayE = (j: number) => {
+                const idx = samples.findIndex((s, w) => w >= DRIFT_START && s.evaluated && s.firing[j]);
+                return idx === -1 ? "none" : String(idx - DRIFT_START);
+            };
+            console.log(item.label.padEnd(28) + delayE(0).padEnd(14) + delayE(1));
+        }
+    }
+
     console.log(
         "\nPass criterion: every empirical rate ≤ its bound. The shrink-adjusted column is" +
             "\nthe sharper prediction accounting for Bayesian shrinkage on the trend numerator;" +
@@ -855,8 +1020,8 @@ async function main(): Promise<void> {
             "\naccount for EWMA serial correlation." +
             "\n\nMode C interpretation: the calibration derives from an independent-window-noise" +
             "\nmodel, and its single failure axis is MULTI-WINDOW CORRELATED EXCURSIONS, with" +
-            "\nseverity monotone in amplitude × duration: ar1(0.8) sustained wander 22% >" +
-            "\ngc 5x pulses 7.5% > straggler micro-plateaus (+CW/r for ~20 windows) 3.4% >" +
+            "\nseverity monotone in amplitude × duration: ar1(0.8) sustained wander (~22%) >" +
+            "\ngc 5x pulses (~7%) > straggler micro-plateaus (+CW/r for ~20 windows, ~3%) >" +
             "\nanything single-window ≤ bound. Idiosyncratic 100x stragglers are damped ~1000x" +
             "\nby the residence integral (≤ CW/window, diluted by r) — their residual is the" +
             "\nsame correlation axis, not outlier pollution. All violations reduce to handled" +

@@ -59,8 +59,11 @@ function chartScript(scenarios: ScenarioOutput[]): string {
     const hasRps = has(ts0, "requestsPerSec");
     const hasErrorRate = has(ts0, "errorRate");
     const hasEwma = has(ts0, "logW", "logWBar");
-    const hasZTest = has(ts0, "dLogWBarEwma", "se");
+    const hasPowerSlope = has(ts0, "powerSlopeResidualEwma", "se");
+    const hasZTest = hasPowerSlope || has(ts0, "dLogWBarEwma", "se");
     const hasUncertainty = has(ts0, "ewmaSumW2", "threshold");
+    const hasRange = has(ts0, "referenceLevel", "recoveryMargin", "latched");
+    const hasEpsilon = has(ts0, "epsDLogL", "epsDLogW");
     const hasVariance = has(ts0, "dLogWBarVarianceEstimate");
     const hasPhases = scenarios.some((s) => s.phases && s.phases.length > 0);
 
@@ -336,16 +339,141 @@ ${hasVariance ? `
     });
 ` : ""}
 
+${hasRange ? `
+    // ── Range-test chart: level W\u0303 vs [reference, reference+margin] band + latch ──
+    new Chart(document.getElementById('chart-' + i + '-range').getContext('2d'), {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [
+                {
+                    label: 'W\u0303 (ms) — exp(logW\u0304)',
+                    data: ts.logWBar.map(v => v == null ? null : Math.exp(v)),
+                    borderColor: '#e6edf3',
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    tension: 0.1,
+                    fill: false,
+                    spanGaps: true,
+                },
+                {
+                    label: 'reference (pre-excursion level)',
+                    data: ts.referenceLevel.map(v => v == null ? null : Math.exp(v)),
+                    borderColor: '#3fb950',
+                    borderWidth: 1.5,
+                    pointRadius: 0,
+                    tension: 0.1,
+                    fill: false,
+                    spanGaps: true,
+                },
+                {
+                    label: 'release band (reference \u00d7 e^{z\u00b7SE})',
+                    data: ts.referenceLevel.map((v, j) =>
+                        (v == null || ts.recoveryMargin[j] == null) ? null : Math.exp(v + ts.recoveryMargin[j])),
+                    borderColor: 'rgba(63, 185, 80, 0.4)',
+                    backgroundColor: 'rgba(63, 185, 80, 0.12)',
+                    borderWidth: 1,
+                    pointRadius: 0,
+                    tension: 0.1,
+                    fill: '-1',
+                    spanGaps: true,
+                },
+                {
+                    label: 'latched',
+                    data: ts.latched.map(v => v ? 1 : 0),
+                    borderColor: '#ff7b72',
+                    borderWidth: 1.5,
+                    pointRadius: 0,
+                    stepped: true,
+                    fill: false,
+                    yAxisID: 'yLatch',
+                },
+            ],
+        },
+        options: {
+            ...CHART_DEFAULTS,
+            ${hasPhases ? "plugins: { ...CHART_DEFAULTS.plugins, annotation: { annotations } }," : ""}
+            scales: {
+                x: xScale(),
+                y: yScale('W\u0303 (ms)', '#e6edf3'),
+                yLatch: {
+                    position: 'right',
+                    min: 0, max: 1.05,
+                    ticks: { color: '#ff7b72', stepSize: 1 },
+                    grid: { drawOnChartArea: false },
+                    title: { display: true, text: 'latched', color: '#ff7b72' },
+                },
+            },
+        },
+    });
+` : ""}
+
+${hasEpsilon ? `
+    // ── ε-test chart: −Δℓ vs deficit D = Δw − Δℓ vs resolution m ──
+    new Chart(document.getElementById('chart-' + i + '-epsilon').getContext('2d'), {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [
+                {
+                    label: '−Δℓ (log-concurrency change since arming)',
+                    data: ts.epsDLogL.map(v => v == null ? null : -v),
+                    borderColor: '#a371f7',
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    stepped: true,
+                    fill: false,
+                    spanGaps: false,
+                },
+                {
+                    label: 'D = Δw − Δℓ (log-throughput cost)',
+                    data: ts.epsDLogW.map((w, j) => (w == null || ts.epsDLogL[j] == null) ? null : w - ts.epsDLogL[j]),
+                    borderColor: '#ff7b72',
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    tension: 0.1,
+                    fill: false,
+                    spanGaps: false,
+                },
+                {
+                    label: 'resolution m = z\u00b7SE(logW\u0304)',
+                    data: ts.recoveryMargin,
+                    borderColor: '#3fb950',
+                    borderWidth: 1,
+                    borderDash: [5, 4],
+                    pointRadius: 0,
+                    tension: 0.1,
+                    fill: false,
+                    spanGaps: true,
+                },
+            ],
+        },
+        options: {
+            ...CHART_DEFAULTS,
+            ${hasPhases ? "plugins: { ...CHART_DEFAULTS.plugins, annotation: { annotations } }," : ""}
+            scales: {
+                x: xScale(),
+                y: {
+                    position: 'left',
+                    title: { display: true, text: 'log units', color: '#a371f7' },
+                    ticks: { color: '#a371f7' },
+                    grid: { color: '#21262d' },
+                },
+            },
+        },
+    });
+` : ""}
+
 ${hasZTest ? `
-    // ── z-Test chart: dLogWBar trend with firing threshold + DEGRADING dots ──
+    // ── z-Test chart: power residual or latency trend with firing threshold + DEGRADING dots ──
     new Chart(document.getElementById('chart-' + i + '-ztest').getContext('2d'), {
         type: 'line',
         data: {
             labels,
             datasets: [
                 {
-                    label: 'dLogW\\u0304 EWMA (trend signal v\\u0302)',
-                    data: ts.dLogWBarEwma,
+                    label: ${hasPowerSlope ? "'dlogW - dlogX (power knee residual)'" : "'dLogW\\\\u0304 EWMA (trend signal v\\\\u0302)'"},
+                    data: ${hasPowerSlope ? "ts.powerSlopeResidualEwma" : "ts.dLogWBarEwma"},
                     borderColor: '#3fb950',
                     borderWidth: 2,
                     pointRadius: 0,
@@ -391,7 +519,7 @@ ${hasZTest ? `
                 },
                 {
                     label: 'DEGRADING',
-                    data: ts.throughputDegraded.map((v, j) => v ? ts.dLogWBarEwma[j] : null),
+                    data: ts.throughputDegraded.map((v, j) => v ? ${hasPowerSlope ? "ts.powerSlopeResidualEwma[j]" : "ts.dLogWBarEwma[j]"} : null),
                     backgroundColor: 'rgba(248, 81, 73, 0.2)',
                     borderColor: '#f85149',
                     borderWidth: 0,
@@ -505,8 +633,11 @@ function scenarioHtml(scenario: ScenarioOutput, index: number, ts0: TimeSeriesOu
     const hasRps = has(ts0, "requestsPerSec");
     const hasErrorRate = has(ts0, "errorRate");
     const hasEwma = has(ts0, "logW", "logWBar");
-    const hasZTest = has(ts0, "dLogWBarEwma", "se");
+    const hasPowerSlope = has(ts0, "powerSlopeResidualEwma", "se");
+    const hasZTest = hasPowerSlope || has(ts0, "dLogWBarEwma", "se");
     const hasUncertainty = has(ts0, "ewmaSumW2", "threshold");
+    const hasRange = has(ts0, "referenceLevel", "recoveryMargin", "latched");
+    const hasEpsilon = has(ts0, "epsDLogL", "epsDLogW");
     const hasVariance = has(ts0, "dLogWBarVarianceEstimate");
 
     const legendParts = [
@@ -528,9 +659,21 @@ function scenarioHtml(scenario: ScenarioOutput, index: number, ts0: TimeSeriesOu
         <div class="chart-container-sm"><canvas id="chart-${index}-ewma"></canvas></div>`);
     }
 
+    if (hasRange) {
+        charts.push(`
+        <div class="chart-label">Degradation Latch &mdash; Range Test (W&#771; vs release band)</div>
+        <div class="chart-container-sm"><canvas id="chart-${index}-range"></canvas></div>`);
+    }
+
+    if (hasEpsilon) {
+        charts.push(`
+        <div class="chart-label">&epsilon; Test &mdash; release when &minus;&Delta;&#8467; &ge; m &and; D &ge; m</div>
+        <div class="chart-container-sm"><canvas id="chart-${index}-epsilon"></canvas></div>`);
+    }
+
     if (hasZTest) {
         charts.push(`
-        <div class="chart-label">Latency Trend z-Test</div>
+        <div class="chart-label">${hasPowerSlope ? "Power-Knee Residual z-Test" : "Latency Trend z-Test"}</div>
         <div class="chart-container-sm"><canvas id="chart-${index}-ztest"></canvas></div>`);
     }
 
@@ -618,10 +761,13 @@ export function generateHtmlFromJson(jsonPath: string): string {
 }
 
 // ── CLI entry point ────────────────────────────────────────────────
+// Only when this file is the executed entry module — an unconditional
+// argv scan would misfire on the CLI flags of any script that merely
+// imports this module (e.g. `simulation-live.ts --signal trend`).
 
-const args = process.argv.slice(2);
-if (args.length > 0) {
-    for (const jsonPath of args) {
+import { fileURLToPath } from "node:url";
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+    for (const jsonPath of process.argv.slice(2)) {
         generateHtmlFromJson(jsonPath);
     }
 }

@@ -135,7 +135,7 @@ const logger = {
 
 function captureSnapshot(executor: Executor, pool: string, _zScoreThreshold: number): Snapshot {
     const rs = executor.getRegulatorState(pool);
-    const latency = executor.getSignalState(pool, "latency-drift");
+    const latency = executor.getSignalState(pool, "power-degraded");
     return {
         time: Math.round(currentTime),
         concurrencyLimit: executor.getConcurrencyLimit(pool),

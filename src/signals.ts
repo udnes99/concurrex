@@ -8,7 +8,7 @@
  * - **{@link RegulatorSignal}** decides *concurrency* — it observes task
  *   events and, once per evaluation cycle, returns whether the regulator
  *   should decrease the concurrency limit. The built-in default is
- *   {@link LatencyDrift}.
+ *   {@link PowerDegraded}.
  * - **{@link AdmissionSignal}** decides *admission* — it is queried at
  *   enqueue with the target lane and returns whether to shed (reject) the
  *   request. The built-in default is {@link EarlyShed}; {@link LaneErrorShed}
@@ -36,6 +36,10 @@ export interface SignalContext {
     readonly pool: string;
     readonly concurrencyLimit: number;
     readonly inFlight: number;
+    /** Peak in-flight this window (high-water mark of actual concurrency).
+     *  Equals `concurrencyLimit` when the limit binds, below it when slack —
+     *  so `concurrencyLimit ≤ maxInFlight` is the binding-transition signal. */
+    readonly maxInFlight: number;
     readonly queueLength: number;
     /** True while ProDel is actively shedding stale queued entries. */
     readonly dropping: boolean;
@@ -60,7 +64,7 @@ export interface SignalContext {
  * vector, and therefore this effective sample size and df. Signals
  * combine these fields with the `Statistics.*` primitives to compose
  * their own hypothesis test (typically a Student-t trend test on a
- * signal-specific observation stream); see `LatencyDrift` for the
+ * signal-specific observation stream); see `PowerDegraded` for the
  * canonical pattern.
  *
  * Constants (fixed at pool registration): `zScoreThreshold`, `z2`,
@@ -246,10 +250,10 @@ export interface AdmissionSignal<S = unknown> extends BaseSignal<S> {
     clone(): AdmissionSignal<S>;
 }
 
-// ── LatencyDrift — the canonical statistical regulator signal ─────────
+// ── PowerDegraded — the canonical statistical regulator signal ─────────
 
-/** Diagnostic state exposed by {@link LatencyDrift.state}. */
-export interface LatencyDriftState {
+/** Diagnostic state exposed by {@link PowerDegraded.state}. */
+export interface PowerDegradedState {
     /** Level EWMA of log-W̃ with Bayesian shrinkage on input. */
     logWBar: number | null;
     /** Trend EWMA of the dt-normalized derivative of `logWBar`. */
@@ -266,22 +270,45 @@ export interface LatencyDriftState {
     tCritical: number;
     /** Decision threshold on the trend: `tCritical * se`. */
     threshold: number;
-    /** `triggered()` outcome from the last evaluation. */
+    /** Trend-test outcome from the last evaluation (entry evidence). */
     degrading: boolean;
+    /** Degradation latch — what `triggered()` reports: high from a
+     *  trend-test fire until the level recovers to the reference. */
+    latched: boolean;
+    /** Pre-excursion reference level — a downward-only second EWMA of
+     *  `logWBar` (stationary during excursions by construction; upward
+     *  re-basing only via the knee-test release). */
+    referenceLevel: number | null;
+    /** Recovery margin — the level resolution m = z·SE(logW̄), in log-W
+     *  units. The latch releases when `logWBar ≤ referenceLevel + m`.
+     *  While latched this reports the episode's frozen yardstick m₀
+     *  (snapshotted at onset, re-snapshotted on deepening); between
+     *  episodes, the live resolution. */
+    recoveryMargin: number | null;
+    /** The ε test's signed log-changes since the crossing origin (null
+     *  between episodes): ε̂ = dLogW/dLogL. The saturation residual
+     *  D = dLogW − dLogL is the shortfall against the saturation null
+     *  ε = 1 (by Little's law, identically the log-throughput cost so
+     *  far). The knee release fires when D ≥ √(m₀² + m²) — z·SE(D) under
+     *  the two-epoch ruler, equivalent to ε̂ + z·SE(ε̂) ≤ 1 — with
+     *  excitation −dLogL above the floor √(m₀² + m²)/√2, and only if the
+     *  binding-premise check |dLogX − (dLogL − dLogW)| ≤ z·√(2κ_f/r̂)
+     *  passes. Diagnostic detail scoped to this signal's state only. */
+    epsilon: { dLogL: number; dLogW: number } | null;
 }
 
 /** One complete test evaluation — the outputs of a single window's
- *  hypothesis test, stored atomically (see `LatencyDrift.lastTest`). */
-type LatencyDriftTest = Pick<
-    LatencyDriftState,
+ *  hypothesis test, stored atomically (see `PowerDegraded.lastTest`). */
+type PowerDegradedTest = Pick<
+    PowerDegradedState,
     "se" | "zScore" | "tCritical" | "threshold" | "degrading"
 >;
 
-/** Configuration for {@link LatencyDrift}. */
-export interface LatencyDriftOptions {
+/** Configuration for {@link PowerDegraded}. */
+export interface PowerDegradedOptions {
     /** Signal name — must be unique within a pool. Override to run two
      *  differently-configured instances side by side. Default:
-     *  `"latency-drift"`. */
+     *  `"power-degraded"`. */
     name?: string;
 }
 
@@ -302,7 +329,11 @@ export interface LatencyDriftOptions {
  * `ctx.inference`) — no signal-local statistical parameters.
  *
  * **Test**: `t = v̂ / SE` against the Cornish-Fisher Student-t critical
- * value at df = 1/W^(2) − 1.
+ * value at the δ² estimator's effective df = 1/(Σw²·c)
+ * (`Statistics.mssdEffectiveDf`, ≈ 12.4 at steady state); the heartbeat
+ * df = 1/Σw² − 1 gates evaluability only. The critical value is finite
+ * only at df ≥ 5 — `tScore` returns Infinity below, the implicit
+ * warm-up gate (~1.2 time constants after cold start or idle reset).
  *
  * **Independence assumption**: the calibration corrects exactly for the
  * correlation the pipeline itself induces (a derived function of α) and
@@ -331,7 +362,7 @@ export interface LatencyDriftOptions {
  * The derivative is normalized by time since the last level update
  * (`lastLevelUpdateTime`) so empty windows don't inflate the rate.
  */
-export class LatencyDrift implements RegulatorSignal<LatencyDriftState> {
+export class PowerDegraded implements RegulatorSignal<PowerDegradedState> {
     public readonly name: string;
 
     // ── Operational Little's Law integral ──
@@ -340,19 +371,92 @@ export class LatencyDrift implements RegulatorSignal<LatencyDriftState> {
 
     // ── Latency-trend pipeline state ──
     private logWBar: number | null = null;
+    /** Σw² of the LEVEL filter's own weight vector (the α·s recursion).
+     *  The heartbeat's `ewmaSumW2` tracks the raw-α vector and overstates
+     *  the filters' effective sample size at low throughput; the margin
+     *  and the binding tolerance use this matched κ_f instead. The trend
+     *  test keeps the shared heartbeat κ — its asymmetric-shrinkage
+     *  conservatism is the v1-proven calibration and is not re-tuned. */
+    private levelSumW2 = 1;
     private lastLevelUpdateTime: number | null = null;
     private dLogWBarEwma: number | null = null;
     private dLogWBarVarEst = 0;
     private lastDLogWBarRate: number | null = null;
 
+    // ── Degradation latch ──
+    // The trend test is the *entry* evidence (calibrated FPR ≤ Φ(−z));
+    // the latch holds `triggered()` high until the *level* recovers to
+    // the pre-excursion reference — "degraded", not merely "degrading".
+    // A trend detector goes quiet at any stable operating point,
+    // including a degraded plateau; without the latch the regulator's
+    // the elasticity test concludes as soon as latency stops worsening, stranding the
+    // limit above the knee (and compounding into an upward ratchet under
+    // sustained saturation).
+    //
+    // `referenceLevel` is a second EWMA of `logWBar` (same α·shrinkage —
+    // no new constants): double smoothing lags the level by about one
+    // time constant, so when the trend test fires (within a few windows
+    // of onset) the reference still holds the pre-excursion level.
+    // Tracking is downward-only (min), so it stays pinned during an
+    // excursion by construction; the only upward move is the ε release's
+    // explicit re-base.
+    private referenceLevel: number | null = null;
+    private latched = false;
+    /** Last computed recovery margin (z·SE of the level estimator), for
+     *  observability — the latch's release band is `referenceLevel +
+     *  recoveryMargin` in log-W space. */
+    private lastMargin: number | null = null;
+    /** Matched-filtered log-limit: the same EWMA (α·s, same windows) as
+     *  `logWBar`, so Δℓ and Δw share one transfer function and filter
+     *  lag cancels identically in the ε test. */
+    private logLBar: number | null = null;
+    /** Matched-filtered log-throughput — the ε test's binding-premise
+     *  check (Little's law: Δx = Δℓ − Δw iff the limit binds). */
+    private logXBar: number | null = null;
+    /** Point-of-crossing snapshots, taken at latch onset: (logW̄₀, logL̄₀,
+     *  logX̄₀) — the common origin for the signed filtered differences
+     *  Δw, Δℓ, Δx that the elasticity test compares (plant state only;
+     *  the signal never reads the regulator's phase machine). Always
+     *  re-snapshotted together — Little's identity Δx = Δℓ − Δw only
+     *  holds for differences taken from one origin. */
+    private logWBar0: number | null = null;
+    private logLBar0: number | null = null;
+    private logXBar0: number | null = null;
+    /** Whether the concurrency limit was binding (L ≤ maxInFlight) when the
+     *  origin was snapshotted. If the crossing happened on inert headroom
+     *  (limit far above the operating concurrency), the origin's Δℓ is
+     *  fictional until the decrease actuator snaps the limit down to the
+     *  binding point — at which transition the experiment is re-anchored. */
+    private originIsBinding = false;
+    /** Resolution snapshot m₀, taken at latch onset and re-snapshotted on
+     *  deepening alongside the origins: the onset-epoch component of the
+     *  ε test's two-epoch thresholds (√(m₀² + m²)). The saturation
+     *  residual D compares endpoints from two epochs, so its uncertainty
+     *  carries both — a
+     *  ruler frozen entirely at onset goes stale when ambient noise
+     *  shifts mid-episode; a purely live ruler lets the excursion's own
+     *  transient widen the episode's thresholds. */
+    private resolution0: number | null = null;
+    /** Wall-clock time of the last evidence: the trend test firing, or
+     *  the limit moving (an experiment in progress). The latch may not
+     *  outlive its evidence: the filters forget by elapsed time
+     *  (α = 1 − e^(−Δt/(τ·CW))), so evidence ages by elapsed time too —
+     *  after one full time constant with neither evidence nor experiment,
+     *  the entry evidence has aged out of every estimator, and the only
+     *  remaining support for "degraded" is an absolute
+     *  level-vs-old-reference comparison, which this framework never
+     *  acts on. Release without re-base. */
+    private lastEvidenceTime: number | null = null;
+    private lastSeenLimit: number | null = null;
+
     // ── Last test evaluation ──
     // Atomic snapshot, replaced wholesale at each window boundary by
     // `onEvaluate`. `null` means the test was not evaluable (insufficient
     // data or warm-up df gate) — partial staleness is unrepresentable.
-    private lastTest: LatencyDriftTest | null = null;
+    private lastTest: PowerDegradedTest | null = null;
 
-    constructor(options?: LatencyDriftOptions) {
-        this.name = options?.name ?? "latency-drift";
+    constructor(options?: PowerDegradedOptions) {
+        this.name = options?.name ?? "power-degraded";
     }
 
     public onAdmit(ctx: SignalContext, info: AdmitInfo): void {
@@ -401,10 +505,46 @@ export class LatencyDrift implements RegulatorSignal<LatencyDriftState> {
         const previousLevelUpdateTime = this.lastLevelUpdateTime;
         if (this.logWBar === null) {
             this.logWBar = logInstantW;
+            this.levelSumW2 = 1;
         } else {
             this.logWBar = (1 - levelAlpha) * this.logWBar + levelAlpha * logInstantW;
+            this.levelSumW2 =
+                (1 - levelAlpha) * (1 - levelAlpha) * this.levelSumW2 + levelAlpha * levelAlpha;
         }
         this.lastLevelUpdateTime = info.windowEnd;
+
+        // Matched filter for the ε test: log L through the IDENTICAL EWMA
+        // (same α·s, same update windows) as the level. The ε test then
+        // differences two signals with the same transfer function, so the
+        // sensor lag cancels identically at every window — comparing a raw
+        // (instant) Δℓ against the filtered Δw would register the
+        // unabsorbed transient of every limit step as a spurious residual
+        // (~0.9·step one window after a tick) and falsely conclude
+        // "below the knee" at any true ε.
+        const logInstantL = Math.log(Math.max(1, ctx.concurrencyLimit));
+        if (this.logLBar === null) {
+            this.logLBar = logInstantL;
+        } else {
+            this.logLBar = (1 - levelAlpha) * this.logLBar + levelAlpha * logInstantL;
+        }
+
+        // Third matched filter: log throughput (completions per normalized
+        // window span), for the ε test's binding-premise check. Under a
+        // binding limit, Little's law forces Δx = Δℓ − Δw exactly; a
+        // resolvable disagreement means the limit was not binding during
+        // the concurrency-falling probe (demand slack), so Δℓ was not a real change in
+        // served concurrency and no
+        // below-knee conclusion may be drawn.
+        const dtNormX =
+            previousLevelUpdateTime !== null
+                ? Math.max(1e-9, (info.windowEnd - previousLevelUpdateTime) / controlWindow)
+                : 1;
+        const logInstantX = Math.log(Math.max(1e-9, info.completions / dtNormX));
+        if (this.logXBar === null) {
+            this.logXBar = logInstantX;
+        } else {
+            this.logXBar = (1 - levelAlpha) * this.logXBar + levelAlpha * logInstantX;
+        }
 
         // dt-normalized derivative + trend EWMA + δ² update. `dt` is
         // the elapsed time since the *previous* level update — not just
@@ -442,15 +582,264 @@ export class LatencyDrift implements RegulatorSignal<LatencyDriftState> {
 
         // Atomically replace the last test snapshot for triggered()/state().
         this.lastTest = this.evaluateTest(ctx);
+
+        // ── Degradation latch — an elasticity test run as directed experiments ──
+        //
+        // ε = dlogW/dlogL defines the contention knee (≈0 below, ≥1 above).
+        // ε is only measurable while L moves, so it is tested during the two
+        // directed experiments (the climb latches; falling concurrency releases) and
+        // the latch holds the last evidenced answer in between. All three
+        // comparisons below are against the same yardstick: the level
+        // RESOLUTION m = z·SE(logW̄) — the smallest log-latency difference
+        // distinguishable from this pool's own noise at confidence z.
+        const firing = this.lastTest?.degrading ?? false;
+        const gap =
+            this.logWBar !== null && this.referenceLevel !== null
+                ? this.logWBar - this.referenceLevel
+                : null;
+        const liveResolution = this.levelMargin(ctx);
+        const onsetWindow = firing && !this.latched;
+        if (onsetWindow) {
+            this.latched = true;
+            // Point of crossing: ε > 0 was just evidenced on the climb.
+            // Snapshot (logW̄₀, logL̄₀, logX̄₀) — the common origin for the
+            // differences Δw, Δℓ, Δx below — and the resolution m₀, the
+            // onset-epoch component of the ε test's two-epoch thresholds.
+            this.snapshotExperimentOrigin(ctx, liveResolution);
+        } else if (
+            firing &&
+            this.latched &&
+            this.logWBar !== null &&
+            this.logWBar0 !== null &&
+            this.logWBar > this.logWBar0
+        ) {
+            // Incident deepening while latched — restart the experiment at
+            // the worst level reached by re-snapshotting ALL THREE origins
+            // together (Little's identity Δx = Δℓ − Δw only holds from a
+            // common origin; moving only the Δw origin would bias the
+            // binding-premise check by the deepening amount) plus the
+            // yardstick m₀ (a new experiment gets a fresh ruler).
+            this.snapshotExperimentOrigin(ctx, liveResolution);
+        } else if (
+            this.latched &&
+            !this.originIsBinding &&
+            ctx.concurrencyLimit <= ctx.maxInFlight
+        ) {
+            // Slack→binding transition. The crossing origin was taken on
+            // inert headroom (limit far above the operating concurrency), so
+            // its Δℓ was fictional; the decrease actuator has now snapped the
+            // limit down to the binding point. The limit filter still carries
+            // the pre-snap headroom (it lags the raw step), so reset it to the
+            // now-binding limit — clearing dead-space memory — and re-anchor
+            // the experiment here, so Δℓ measures the real dose from where the
+            // actuator can act. W and X are untouched (the snap removed only
+            // headroom, no live concurrency, so no plant response). Keeping
+            // the concurrency variable = raw limit (never inFlight) is what
+            // preserves the binding-premise check: log L diverges from log N
+            // only while slack, which is the signal the check reads.
+            this.logLBar = Math.log(Math.max(1, ctx.concurrencyLimit));
+            this.snapshotExperimentOrigin(ctx, liveResolution);
+        }
+        // The exposed margin is always the live level ruler — the level
+        // release compares the CURRENT estimate against the long-memory
+        // reference, so its uncertainty is the current noise; m₀ enters
+        // only the ε test's two-epoch thresholds below.
+        this.lastMargin = liveResolution;
+        if (this.latched) {
+            // Evidence-expiry clock: refreshed whenever the test fires
+            // (new evidence) or the limit moves (an experiment is
+            // running). The onset window itself fires, so the clock
+            // starts strictly after onset. (Corollary: any responder with
+            // decision cadence ≤ timeConstant is guaranteed at least one
+            // opportunity to act before the backstop can conclude.)
+            if (
+                firing ||
+                this.lastSeenLimit !== ctx.concurrencyLimit ||
+                this.lastEvidenceTime === null
+            ) {
+                this.lastEvidenceTime = info.windowEnd;
+            }
+            this.lastSeenLimit = ctx.concurrencyLimit;
+            const resolution = liveResolution;
+            if (resolution === null) {
+                // Defensive: no resolution yardstick available (empty δ²) —
+                // release rather than hold without a measure.
+                this.latched = false;
+            } else if (gap !== null && gap <= resolution) {
+                // Level release: statistically back at the pre-excursion
+                // reference — no experiment needed.
+                this.latched = false;
+            } else if (
+                !firing &&
+                this.logWBar0 !== null &&
+                this.logLBar0 !== null &&
+                this.logWBar !== null &&
+                this.logLBar !== null
+            ) {
+                // The elasticity test. With signed changes since the
+                // crossing origin, Δℓ = Δlog L̄ and Δw = Δlog W̄:
+                //
+                //   release when  −Δℓ ≥ z·SE(D)/√2  ∧  D = Δw − Δℓ ≥ z·SE(D)
+                //
+                // (resolvable excitation was applied, and the response
+                // fell short of proportional by a resolvable amount).
+                // D ≈ 0 ⟺ ε ≈ 1 (above the knee — reducing L buys latency
+                // one-for-one, keep firing); D resolvable ⟺ ε resolvably
+                // below 1 (at/below the knee, or the latency is
+                // exogenous). "Release once paying throughput stopped
+                // buying latency." On release, re-base the reference to
+                // the new normal: explicitly, once, on evidence.
+                const dLogL = this.logLBar - this.logLBar0;
+                const dLogW = this.logWBar - this.logWBar0;
+                // D — the residual from the saturation null H₀: ε = 1.
+                // Under a binding limit Little's law forces Δw = Δℓ
+                // exactly, so any shortfall is evidence against
+                // saturation; by the same identity D ≡ −Δx, the
+                // log-throughput cost of the concurrency reduction so far.
+                const saturationResidual = dLogW - dLogL;
+                // z·SE(D) under the two-epoch ruler: D differences two
+                // noisy level endpoints — origin (resolution m₀) and now
+                // (resolution m) — so z·SE(D) = √(m₀² + m²) (√2·m is the
+                // equal-epoch special case; derived, not tuned).
+                // NOTE: `saturationResidual ≥ residualThreshold` is
+                // exactly the release rule ε̂ + z·SE(ε̂) ≤ 1 with the
+                // denominator cleared: with excitation d = −Δℓ and
+                // SE(ε̂) = SE(D)/d, multiplying through by d gives
+                // Δw − Δℓ ≥ z·SE(D). Division-free: no 0/0 guard, no sign
+                // special-cases.
+                const residualThreshold = Math.hypot(this.resolution0 ?? resolution, resolution);
+                // Excitation floor (the persistent-excitation condition):
+                // the rejection above is calibrated at ANY excitation —
+                // even zero — so this is NOT for type-I control. It exists
+                // because this is the only exit that RE-BASES the
+                // reference: without resolvable excitation, D can clear
+                // its threshold on level noise alone (Δℓ = 0 ⇒ D = Δw) or
+                // on sub-resolvable upward creep plus a token change in L
+                // — absorbing an elevated level as the new normal without
+                // evidence. The floor makes every re-base certify both
+                // halves of the experiment: resolvable excitation was
+                // applied AND the response fell resolvably short. Δℓ
+                // itself is filtered but noise-free (L is our own
+                // actuator).
+                const excitationFloor = residualThreshold / Math.SQRT2;
+                // Binding-premise check (Little's law integrity): under a
+                // binding limit the measured throughput change must equal
+                // Δℓ − Δw. Tolerance is z standard errors of the filtered
+                // log-throughput difference (Poisson: Var(log X) ≈ 1/r per
+                // window; two endpoints; filtered by κ) — derived, no
+                // constants. On disagreement the limit was not binding
+                // (demand slack — the measured Δℓ was not a real change in
+                // served concurrency): draw no below-knee conclusion.
+                const rHat = Math.max(1, ctx.regulator.completionRateEwma ?? 1);
+                const bindingTolerance =
+                    ctx.inference.zScoreThreshold *
+                    Math.sqrt((2 * this.levelSumW2) / rHat);
+                const dLogX =
+                    this.logXBar !== null && this.logXBar0 !== null
+                        ? this.logXBar - this.logXBar0
+                        : null;
+                const bindingOk =
+                    dLogX === null || Math.abs(dLogX - (dLogL - dLogW)) <= bindingTolerance;
+                const belowKnee =
+                    bindingOk &&
+                    -dLogL >= excitationFloor &&
+                    saturationResidual >= residualThreshold;
+                // Evidence-expiry backstop: a full time constant of
+                // wall-clock has passed with the test quiet and the limit
+                // unmoved — no new evidence, no running experiment. The
+                // entry evidence has aged out of the pool's own filters
+                // (which forget by elapsed time, exactly like this clock),
+                // and holding further would rest solely on an absolute
+                // level-vs-reference comparison. Release rather than
+                // assert.
+                const stalled =
+                    this.lastEvidenceTime !== null &&
+                    info.windowEnd - this.lastEvidenceTime >=
+                        ctx.inference.timeConstant * ctx.inference.controlWindow &&
+                    gap !== null &&
+                    gap > resolution;
+                if (belowKnee) {
+                    // Evidence-gated release: re-base the reference to the
+                    // new normal.
+                    this.latched = false;
+                    this.referenceLevel = this.logWBar;
+                } else if (stalled) {
+                    // No experiment could be run — release WITHOUT re-basing:
+                    // the stall is the absence of evidence, and a higher
+                    // level must never be absorbed as normal without it.
+                    this.latched = false;
+                }
+            }
+            if (!this.latched) {
+                this.logWBar0 = null;
+                this.logLBar0 = null;
+                this.logXBar0 = null;
+                this.resolution0 = null;
+                this.originIsBinding = false;
+                this.lastEvidenceTime = null;
+                this.lastSeenLimit = null;
+            }
+        }
+        // Reference tracking: a second EWMA of the level, DOWNWARD-ONLY.
+        // Improvements are absorbed immediately; a higher level is never
+        // silently accepted as the new normal (re-tracking an elevated
+        // plateau would legitimize one band-width of degradation per
+        // cycle — a slow residual ratchet). The only upward move is the
+        // evidence-gated knee-test re-base above. Note there is no
+        // separate "freeze while latched" rule: during an excursion the
+        // level sits above the reference, so the EWMA update points up
+        // and min() rejects it — stationarity during episodes is a
+        // property of downward-only tracking, not an extra mechanism.
+        if (this.logWBar !== null) {
+            if (this.referenceLevel === null) {
+                this.referenceLevel = this.logWBar;
+            } else {
+                const tracked =
+                    (1 - levelAlpha) * this.referenceLevel + levelAlpha * this.logWBar;
+                this.referenceLevel = Math.min(this.referenceLevel, tracked);
+            }
+        }
     }
 
     public triggered(_ctx: SignalContext): boolean {
-        // `onEvaluate` replaces the snapshot at every window boundary; the
-        // regulator calls `triggered` immediately after the heartbeat tick.
-        return this.lastTest?.degrading ?? false;
+        // Latched semantics: high from the calibrated trend-test fire
+        // until level recovery (or futility) — "the pool is degraded",
+        // not "latency is currently worsening".
+        return this.latched;
     }
 
-    public state(): LatencyDriftState {
+    /** Recovery margin / resolution: z standard errors of the level
+     *  estimator. σ_x² is recovered from δ² via Var(v) = ᾱ²σ_x²(1+κ_f)
+     *  (THEORY Appendix A) evaluated at the LEVEL filter's own effective
+     *  ᾱ = α·s and its own weight vector κ_f = `levelSumW2`, so
+     *  SE_level = √(κ_f · δ² / ((1+ᾱ/2)·ᾱ²·(1+κ_f))). The shared
+     *  heartbeat κ describes the raw-α vector and would overstate the
+     *  filter's effective sample size (understating the margin) exactly
+     *  when throughput — and therefore evidence — is scarce. Every input
+     *  is existing machinery; the only free parameter is z. */
+    /** Snapshot the common experiment origin (logW̄₀, logL̄₀, logX̄₀) and the
+     *  onset-epoch resolution m₀, and record whether the limit is binding at
+     *  the origin. Taken together so Little's identity Δx = Δℓ − Δw holds from
+     *  one origin; used at onset, on deepening, and on the slack→binding
+     *  re-anchor. */
+    private snapshotExperimentOrigin(ctx: SignalContext, liveResolution: number | null): void {
+        this.logWBar0 = this.logWBar;
+        this.logLBar0 = this.logLBar;
+        this.logXBar0 = this.logXBar;
+        this.resolution0 = liveResolution;
+        this.originIsBinding = ctx.concurrencyLimit <= ctx.maxInFlight;
+    }
+
+    private levelMargin(ctx: SignalContext): number | null {
+        const { currentAlpha, bayesianShrinkage, zScoreThreshold } = ctx.inference;
+        const levelAlpha = currentAlpha * bayesianShrinkage;
+        if (this.dLogWBarVarEst === 0 || levelAlpha === 0) return null;
+        const sigmaVSq = this.dLogWBarVarEst / (1 + levelAlpha / 2);
+        const sigmaXSq = sigmaVSq / (levelAlpha * levelAlpha * (1 + this.levelSumW2));
+        return zScoreThreshold * Math.sqrt(this.levelSumW2 * sigmaXSq);
+    }
+
+    public state(): PowerDegradedState {
         // Test fields are zero until the test is evaluable (warm-up).
         const test = this.lastTest ?? {
             se: 0,
@@ -464,19 +853,35 @@ export class LatencyDrift implements RegulatorSignal<LatencyDriftState> {
             dLogWBarEwma: this.dLogWBarEwma,
             dLogWBarVarEst: this.dLogWBarVarEst,
             inFlightMs: this.inFlightMs,
+            latched: this.latched,
+            referenceLevel: this.referenceLevel,
+            recoveryMargin: this.lastMargin,
+            // Live ε readouts, derived on demand — the origins and filters
+            // already carry them (null unless an episode is in progress).
+            epsilon:
+                this.latched &&
+                this.logLBar !== null &&
+                this.logWBar !== null &&
+                this.logLBar0 !== null &&
+                this.logWBar0 !== null
+                    ? {
+                          dLogL: this.logLBar - this.logLBar0,
+                          dLogW: this.logWBar - this.logWBar0
+                      }
+                    : null,
             ...test
         };
     }
 
-    public clone(): LatencyDrift {
-        return new LatencyDrift({ name: this.name });
+    public clone(): PowerDegraded {
+        return new PowerDegraded({ name: this.name });
     }
 
     /** Evaluate the hypothesis test against the current shared inference
      *  state. Reads pipeline state, mutates nothing — returns a complete
      *  snapshot, or `null` when the test cannot be evaluated (insufficient
      *  data, or the warm-up df gate). */
-    private evaluateTest(ctx: SignalContext): LatencyDriftTest | null {
+    private evaluateTest(ctx: SignalContext): PowerDegradedTest | null {
         if (this.dLogWBarEwma === null || this.dLogWBarVarEst === 0) return null;
         const { currentAlpha, ewmaSumW2, df, zScoreThreshold } = ctx.inference;
         // df ≤ 0: not enough effective evidence to reject (warm-up gate).

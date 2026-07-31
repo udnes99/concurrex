@@ -44,7 +44,7 @@ Multiple pools let you isolate different workloads (e.g. user-facing commands vs
 The executor owns the *engine* — the queue, lanes, the statistical heartbeat, and the concurrency/admission actuators — and delegates *policy* to pluggable signals. Four mechanisms cooperate:
 
 1. **ProDel** (Probabilistic Delay Load-shedding) — the core queue engine. Sojourn-based AQM: drop probability `P = 1 - threshold/sojourn`. Adaptive LIFO/FIFO admission (FIFO when healthy, LIFO when dropping to protect fresh work).
-2. **Regulator signals** — decide *concurrency*. Each pool runs a list of `RegulatorSignal`s; once per evaluation cycle, if any returns `triggered()`, the regulator decreases the limit (OR semantics). The built-in default is `LatencyDrift` — the latency-trend Student-t test (operational Little's Law, log-transform, EWMA on logW, von Neumann's δ² for drift-invariant noise estimation, autocorrelation-corrected SE, Cornish-Fisher critical value). FPR is upper-bounded by Φ(−Z) per statistical signal; joint FPR across N signals is bounded by Bonferroni `N · Φ(−Z)`. Concurrency adjusted via a convergent step formula with bisection damping for O(log L) equilibrium convergence.
+2. **Regulator signals** — decide *concurrency*. Each pool runs a list of `RegulatorSignal`s; once per evaluation cycle, if any returns `triggered()`, the regulator decreases the limit (OR semantics). The built-in default is `PowerDegraded` — a two-channel signal that protects Kleinrock's power knee: a calibrated Student-t latency-trend test (`dW/dt`, operational Little's Law) *arms* a degradation latch, and an elasticity test (`dW/dL`, measured while the limit moves) *attributes* the degradation to concurrency and releases when it's exogenous. FPR is upper-bounded by Φ(−Z) per statistical signal; joint FPR across N signals is bounded by Bonferroni `N · Φ(−Z)`. Concurrency adjusted via a convergent step formula with bisection damping for O(log L) equilibrium convergence.
 3. **Admission signals** — decide *enqueue-time shedding*. Each pool runs a list of `AdmissionSignal`s queried per request with the target lane; if any returns `shouldShed()`, the request is rejected instantly (OR semantics). The built-in default is `EarlyShed` — probabilistic early rejection (`P = dropRate/(dropRate+completionRate) * shrinkage`) when ProDel is dropping and the pool is at capacity. `LaneErrorShed` (per-lane error shedding) is an exported opt-in. Error-driven backpressure is domain-specific (HTTP 5xx vs business errors vs timeouts) — see `examples/express-server.ts`.
 4. **Fair lane scheduling** — round-robin across lanes (per-tenant, per-user, or shared). Prevents noisy neighbors from monopolizing capacity.
 
@@ -92,18 +92,18 @@ executor.registerPool("commands", {
 
 Policy is pluggable through two kinds of signal, both sharing lifecycle hooks (`onAdmit`, `onComplete`, `onEvaluate`, `onLaneRemoved`) and optional `state()`:
 
-- **`RegulatorSignal`** decides *concurrency* — `triggered()` is checked once per evaluation cycle; if any signal fires, the regulator decreases the limit. Default: `[new LatencyDrift()]`.
+- **`RegulatorSignal`** decides *concurrency* — `triggered()` is checked once per evaluation cycle; if any signal fires, the regulator decreases the limit. Default: `[new PowerDegraded()]`.
 - **`AdmissionSignal`** decides *admission* — `shouldShed(ctx, laneKey)` is queried per request at enqueue; if any returns `true`, the request is rejected instantly. Default: `[new EarlyShed()]`.
 
 ```typescript
-import { Executor, LatencyDrift, EarlyShed, LaneErrorShed } from "concurrex";
+import { Executor, PowerDegraded, EarlyShed, LaneErrorShed } from "concurrex";
 
-// Defaults: LatencyDrift (concurrency) + EarlyShed (admission)
+// Defaults: PowerDegraded (concurrency) + EarlyShed (admission)
 const executor = new Executor();
 
 // Per-pool override — each list replaces the executor defaults entirely (no merge)
 executor.registerPool("api", {
-    regulatorSignals: [new LatencyDrift()],
+    regulatorSignals: [new PowerDegraded()],
     admissionSignals: [new EarlyShed(), new LaneErrorShed()] // opt into per-lane shedding
 });
 
@@ -113,7 +113,7 @@ executor.registerPool("debug", { regulatorSignals: [], admissionSignals: [] });
 
 ### Built-in signals
 
-- **`LatencyDrift`** (regulator, default) — fires when the trend test detects sustained upward latency drift. Uses the pool's shared inference state (α, ESS, df from `zScoreThreshold`) and composes its own EWMAs + δ² inline. The calibration corrects exactly for the correlation the pipeline itself induces and assumes window-to-window noise is otherwise independent — size `controlWindow` above your longest routine pause (GC, compaction) or latency-noise correlation time (see `docs/THEORY.md` §4.2.6 for the measured boundary).
+- **`PowerDegraded`** (regulator, default) — protects Kleinrock's power knee (the operating point where more concurrency stops buying throughput). Two channels: a calibrated Student-t **latency-trend** test (`dW/dt` on an operational-Little's-Law residence pipeline) *arms* the degradation latch; an **elasticity** test (`dW/dL`, measured while the regulator's own limit moves) then *attributes and releases* — it keeps throttling only while concurrency is the cause and the actuator is helping, re-basing to the new normal when latency is exogenous. Uses the pool's shared inference state (α, ESS, df from `zScoreThreshold`) and composes matched EWMAs + δ² inline. FPR upper-bounded by Φ(−Z).
 - **`EarlyShed`** (admission, default) — sheds an arrival when ProDel is dropping and the pool is at capacity, with `P = dropRate/(dropRate+completionRate) * shrinkage`. Queue-health based, domain-agnostic.
 - **`LaneErrorShed`** (admission, opt-in) — tracks each lane's error-rate EWMA and sheds new requests to a failing lane (`P = lane.errorRateEwma`). Off by default — an "error" is domain-specific (a 404, a validation failure, or a business rejection is not an infrastructure failure), so the executor does not assume errors should shed work.
 
@@ -141,12 +141,12 @@ const breaker: AdmissionSignal = {
 };
 
 executor.registerPool("ingest", {
-    regulatorSignals: [new LatencyDrift(), memorySignal],
+    regulatorSignals: [new PowerDegraded(), memorySignal],
     admissionSignals: [new EarlyShed(), breaker]
 });
 ```
 
-Lifecycle hooks are optional — a minimal signal is just `{ name, triggered|shouldShed, clone }`. Signals holding per-lane state populate it in `onComplete(info.lane, …)` and release it in `onLaneRemoved(laneKey)`. For a statistically rigorous signal, follow `LatencyDrift`'s pattern (compose `Statistics.tScore`, `Statistics.studentTTrendSE`, etc. with inline EWMA state). See `src/signals.ts`.
+Lifecycle hooks are optional — a minimal signal is just `{ name, triggered|shouldShed, clone }`. Signals holding per-lane state populate it in `onComplete(info.lane, …)` and release it in `onLaneRemoved(laneKey)`. For a statistically rigorous signal, follow `PowerDegraded`'s pattern (compose `Statistics.tScore`, `Statistics.studentTTrendSE`, etc. with inline EWMA state). See `src/signals.ts`.
 
 ### Inspecting signal state
 
@@ -154,8 +154,8 @@ Lifecycle hooks are optional — a minimal signal is just `{ name, triggered|sho
 // General regulator state (rate EWMAs, regulation phase, etc.)
 executor.getRegulatorState("api");
 
-// Per-signal internal state (LatencyDrift's logWBar, zScore, tCritical, etc.)
-executor.getSignalState<LatencyDriftState>("api", "latency-drift");
+// Per-signal internal state (PowerDegraded's logWBar, zScore, tCritical, etc.)
+executor.getSignalState<PowerDegradedState>("api", "power-degraded");
 ```
 
 ## Lanes
@@ -200,14 +200,14 @@ executor.isThroughputDegraded("commands"); // latency degradation detected
 executor.getInFlight("commands");          // current in-flight count
 executor.getQueueLength("commands");       // current queue depth
 executor.getConcurrencyLimit("commands");  // current regulated limit
-executor.getRegulatorState("commands");    // full filter state snapshot
+executor.getRegulatorState("commands");    // controller state + rate EWMAs
 ```
 
 `isOverloaded` returns `true` only during confirmed sustained overload (dropping state). Use this to pause upstream work fetching.
 
 `getRegulatorState` returns a `RegulatorState` with general regulator metrics: `inFlightEwma`, `completionRateEwma`, `admissionRateEwma`, `dropRateEwma`, `regulationPhase`, `regulationDepth`, `elapsedWindows`, `overloadDetected` (= "any regulator signal is currently triggered").
 
-For signal-specific state (e.g. `LatencyDrift`'s `logWBar`, `dLogWBarEwma`, `dLogWBarVarEst`, `se`, `zScore`, `tCritical`, `threshold`), use `executor.getSignalState<S>(pool, signalName)`. Pass the signal's state type (e.g. `LatencyDriftState`) to get a typed result back. See `docs/THEORY.md` §4.2 for the derivation of the latency-trend Student-t test and its components.
+For signal-specific state (e.g. `PowerDegraded`'s `logWBar`, `dLogWBarEwma`, `dLogWBarVarEst`, `se`, `zScore`, `tCritical`, `threshold`), use `executor.getSignalState<S>(pool, signalName)`. Pass the signal's state type (e.g. `PowerDegradedState`) to get a typed result back. See `docs/THEORY.md` §4.2 for the derivation of the latency-trend Student-t test and its components.
 
 ## Error Handling
 
@@ -252,7 +252,7 @@ class Executor {
     constructor(options?: {
         logger?: Logger;
         zScoreThreshold?: number;
-        regulatorSignals?: RegulatorSignal[];   // default: [new LatencyDrift()]
+        regulatorSignals?: RegulatorSignal[];   // default: [new PowerDegraded()]
         admissionSignals?: AdmissionSignal[];   // default: [new EarlyShed()]
     });
 
@@ -287,7 +287,7 @@ class Executor {
 
 ## Theory
 
-See [THEORY.md](https://github.com/udnes99/concurrex/blob/main/docs/THEORY.md) for formal analysis with 17 theorems and proofs covering convergence guarantees, stability bounds, and fairness properties.
+See [THEORY.md](https://github.com/udnes99/concurrex/blob/main/docs/THEORY.md) for the formal analysis — theorems and proofs covering convergence guarantees, stability bounds, and the FPR calibration of the statistical framework.
 
 ## License
 

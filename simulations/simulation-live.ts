@@ -14,7 +14,7 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { Executor } from "../src/Executor.js";
-import { EarlyShed, LaneErrorShed } from "../src/signals.js";
+import { EarlyShed, LaneErrorShed, PowerDegraded, type RegulatorSignal } from "../src/signals.js";
 import { generateJsonOutput } from "./output.js";
 import { generateHtmlFromJson } from "./generate-html.js";
 
@@ -22,6 +22,29 @@ import { generateHtmlFromJson } from "./generate-html.js";
 
 const PORT = 9877;
 const SAMPLE_INTERVAL = 50; // ms between metric snapshots
+
+// --signal power|latched|trend : compare the default power signal against the
+// shipped latched latency signal and the raw per-evaluation latency trend test.
+const SIGNAL = process.argv.includes("--signal")
+    ? process.argv[process.argv.indexOf("--signal") + 1]
+    : "power";
+
+/** Research variant: the identical pipeline with the latch bypassed —
+ *  `triggered()` returns the instantaneous trend-test outcome. */
+class UnlatchedPowerDegraded extends PowerDegraded {
+    public override triggered(): boolean {
+        return (this.state() as { degrading: boolean }).degrading;
+    }
+    public override clone(): UnlatchedPowerDegraded {
+        return new UnlatchedPowerDegraded({ name: this.name });
+    }
+}
+
+function signalOverride(): { regulatorSignals?: RegulatorSignal[] } {
+    if (SIGNAL === "latched") return { regulatorSignals: [new PowerDegraded()] };
+    if (SIGNAL === "trend") return { regulatorSignals: [new UnlatchedPowerDegraded()] };
+    return {};
+}
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -34,22 +57,37 @@ type Snapshot = {
     throughputDegraded: boolean;
     requestsPerSec: number;
     errorRate: number;
-    // Latency-test filter state (sourced from LatencyDrift signal via getSignalState in v2)
+    // Regulator signal filter state.
     logWBar: number | null;
+    logXBar: number | null;
+    logPowerBar: number | null;
     dLogWBarEwma: number | null;
+    dLogXBarEwma: number | null;
+    dLogPowerBarEwma: number | null;
     dLogWBarVarEst: number;
+    dLogXBarVarEst: number;
+    powerSlopeResidualEwma: number | null;
+    powerSlopeResidualVarEst: number;
     se: number;
     zScore: number;
     tCritical: number;
     threshold: number;
+    throughputFalling: boolean;
     regulationPhase: string;
     regulationDepth: number;
+    // Degradation latch (the "range test"): triggered() = latched
+    latched: boolean;
+    referenceLevel: number | null;
+    recoveryMargin: number | null;
+    epsDLogL: number | null;
+    epsDLogW: number | null;
 };
 
 type Scenario = {
     name: string;
     description: string;
     data: Snapshot[];
+    completions?: number;
 };
 
 // ── Logger stub ──────────────────────────────────────────────────────
@@ -137,8 +175,9 @@ function captureSnapshot(
     windowErrorRate: number
 ): Snapshot {
     const rs = executor.getRegulatorState(pool);
-    const latency = executor.getSignalState(pool, "latency-drift");
-    const num = (k: string): number => (latency?.[k] as number | undefined) ?? 0;
+    const signalName = SIGNAL === "latched" || SIGNAL === "trend" ? "power-degraded" : "power-degraded";
+    const signal = executor.getSignalState(pool, signalName) as Record<string, unknown> | undefined;
+    const num = (k: string): number => (signal?.[k] as number | undefined) ?? 0;
     return {
         time: Math.round(performance.now() - startTime),
         concurrencyLimit: executor.getConcurrencyLimit(pool),
@@ -148,15 +187,28 @@ function captureSnapshot(
         throughputDegraded: executor.isThroughputDegraded(pool),
         requestsPerSec: Math.round(requestsPerSec),
         errorRate: Math.round(windowErrorRate * 100) / 100,
-        logWBar: (latency?.logWBar as number | null) ?? null,
-        dLogWBarEwma: (latency?.dLogWBarEwma as number | null) ?? null,
+        logWBar: (signal?.logWBar as number | null) ?? null,
+        logXBar: (signal?.logXBar as number | null) ?? null,
+        logPowerBar: (signal?.logPowerBar as number | null) ?? null,
+        dLogWBarEwma: (signal?.dLogWBarEwma as number | null) ?? null,
+        dLogXBarEwma: (signal?.dLogXBarEwma as number | null) ?? null,
+        dLogPowerBarEwma: (signal?.dLogPowerBarEwma as number | null) ?? null,
         dLogWBarVarEst: num("dLogWBarVarEst"),
+        dLogXBarVarEst: num("dLogXBarVarEst"),
+        powerSlopeResidualEwma: (signal?.powerSlopeResidualEwma as number | null) ?? null,
+        powerSlopeResidualVarEst: num("powerSlopeResidualVarEst"),
         se: num("se"),
         zScore: num("zScore"),
         tCritical: num("tCritical"),
         threshold: num("threshold"),
+        throughputFalling: (signal?.throughputFalling as boolean | undefined) ?? false,
         regulationPhase: rs.regulationPhase,
-        regulationDepth: rs.regulationDepth
+        regulationDepth: rs.regulationDepth,
+        latched: (signal?.latched as boolean | undefined) ?? false,
+        referenceLevel: (signal?.referenceLevel as number | null) ?? null,
+        recoveryMargin: (signal?.recoveryMargin as number | null) ?? null,
+        epsDLogL: (signal?.epsilon as { dLogL: number } | null)?.dLogL ?? null,
+        epsDLogW: (signal?.epsilon as { dLogW: number } | null)?.dLogW ?? null
     };
 }
 
@@ -211,7 +263,8 @@ async function scenarioSteadyState(): Promise<Scenario> {
         minimumConcurrency: 1,
         maximumConcurrency: 50,
         delayThreshold: 200,
-        controlWindow: 100
+        controlWindow: 100,
+        ...signalOverride()
     });
 
     completionCount = 0;
@@ -240,7 +293,8 @@ async function scenarioSteadyState(): Promise<Scenario> {
             "Arrival rate (100/sec) well within capacity (500/sec at baseline). " +
             "Expect: limit stays at baseline, gravity pulls down any drift. " +
             "~16 ESS evaluations. No ProDel, no regulator activation.",
-        data
+        data,
+        completions: completionCount
     };
 }
 
@@ -254,7 +308,8 @@ async function scenarioBurstAbsorption(): Promise<Scenario> {
         minimumConcurrency: 1,
         maximumConcurrency: 200,
         delayThreshold: 30_000,
-        controlWindow: 100
+        controlWindow: 100,
+        ...signalOverride()
     });
 
     completionCount = 0;
@@ -295,7 +350,8 @@ async function scenarioBurstAbsorption(): Promise<Scenario> {
             "At baseline 10, draining 2000 takes ~20s — convergent growth should ramp up to absorb faster. " +
             "Phase 3 (burst+15s): steady load continues — gravity snaps limit back to baseline. " +
             "ProDel disabled (30s threshold) — shows pure regulator growth without interference.",
-        data
+        data,
+        completions: completionCount
     };
 }
 
@@ -309,7 +365,8 @@ async function scenarioThroughputDegradation(): Promise<Scenario> {
         minimumConcurrency: 2,
         maximumConcurrency: 100,
         delayThreshold: 200,
-        controlWindow: 100
+        controlWindow: 100,
+        ...signalOverride()
     });
 
     completionCount = 0;
@@ -359,7 +416,8 @@ async function scenarioThroughputDegradation(): Promise<Scenario> {
             "queue shedding. The EWMA adapts to 500ms as the new baseline, then the system scales up to serve " +
             "demand at the new latency (500ms × 100 concurrent = 200/sec). " +
             "Phase 3 (24–36s): backend 10ms — latency recovers, system restores. ProDel sheds stale entries during transitions.",
-        data
+        data,
+        completions: completionCount
     };
 }
 
@@ -373,7 +431,8 @@ async function scenarioDemandSpike(): Promise<Scenario> {
         minimumConcurrency: 2,
         maximumConcurrency: 100,
         delayThreshold: 5000,
-        controlWindow: 100
+        controlWindow: 100,
+        ...signalOverride()
     });
 
     completionCount = 0;
@@ -423,7 +482,8 @@ async function scenarioDemandSpike(): Promise<Scenario> {
             "Phase 2 (10–30s): sustained 1000 req/sec — must grow from 10 to ~50 (~22 ESS evals). " +
             "Shows convergent slow start: step(1), step(2), ..., accelerating toward exponential doubling. " +
             "Phase 3 (30–40s): demand drops — gravity pulls limit back to baseline.",
-        data
+        data,
+        completions: completionCount
     };
 }
 
@@ -437,7 +497,8 @@ async function scenarioFullOverload(): Promise<Scenario> {
         minimumConcurrency: 2,
         maximumConcurrency: 20,
         delayThreshold: 100,
-        controlWindow: 100
+        controlWindow: 100,
+        ...signalOverride()
     });
 
     completionCount = 0;
@@ -484,7 +545,8 @@ async function scenarioFullOverload(): Promise<Scenario> {
             "so capacity (20/400ms = 50/sec) cannot meet arrival (100/sec). " +
             "ProDel drops stale entries. Z-test detects the step change during transition. " +
             "Phase 3 (30–42s): backend 15ms — system restores. Shows recovery growth.",
-        data
+        data,
+        completions: completionCount
     };
 }
 
@@ -498,7 +560,8 @@ async function scenarioGradualRamp(): Promise<Scenario> {
         minimumConcurrency: 1,
         maximumConcurrency: 100,
         delayThreshold: 500,
-        controlWindow: 100
+        controlWindow: 100,
+        ...signalOverride()
     });
 
     completionCount = 0;
@@ -543,7 +606,8 @@ async function scenarioGradualRamp(): Promise<Scenario> {
             "Each step runs ~11 ESS evaluations. regulator tracks the increasing load, " +
             "growing the limit in convergent slow start steps. " +
             "Cool-down shows gravity pulling limit back to baseline.",
-        data
+        data,
+        completions: completionCount
     };
 }
 
@@ -557,7 +621,8 @@ async function scenarioBackpressure(): Promise<Scenario> {
         minimumConcurrency: 2,
         maximumConcurrency: 100,
         delayThreshold: 200,
-        controlWindow: 100
+        controlWindow: 100,
+        ...signalOverride()
     });
 
     completionCount = 0;
@@ -615,7 +680,8 @@ async function scenarioBackpressure(): Promise<Scenario> {
             "dW goes positive → regulator retracts growth then decreases (~16 ESS evals). " +
             "Phase 3 (27–39s): 100 req/sec — system recovers (~13 ESS evals). " +
             "Key: growing concurrency is the wrong move — it makes things worse.",
-        data
+        data,
+        completions: completionCount
     };
 }
 
@@ -633,7 +699,8 @@ async function scenarioLocalizedErrors(): Promise<Scenario> {
         delayThreshold: 200,
         controlWindow: 100,
         // this scenario demonstrates per-lane shedding (opt-in admission signal)
-        admissionSignals: [new EarlyShed(), new LaneErrorShed()]
+        admissionSignals: [new EarlyShed(), new LaneErrorShed()],
+        ...signalOverride()
     });
 
     completionCount = 0;
@@ -712,7 +779,8 @@ async function scenarioLocalizedErrors(): Promise<Scenario> {
             "Regulator should NOT decrease. Per-lane shedding handles lane-0. " +
             "Phase 3 (30–42s): all lanes healthy — system stable. " +
             "Shows that localized errors don't trigger pool-wide regulation at production load.",
-        data
+        data,
+        completions: completionCount
     };
 }
 
@@ -747,14 +815,20 @@ async function main(): Promise<void> {
         console.log(
             `    Peak queue: ${maxQueue}, Peak in-flight: ${maxInFlight}, Limit: ${minLimit}–${maxLimit}`
         );
+        const degradedFraction = s.data.filter((d) => d.throughputDegraded).length / s.data.length;
         console.log(
-            `    ProDel drops: ${hadDrops ? "yes" : "no"}, Latency degraded: ${hadDegradation ? "yes" : "no"}`
+            `    ProDel drops: ${hadDrops ? "yes" : "no"}, Signal degraded: ${hadDegradation ? "yes" : "no"} ` +
+                `(${(100 * degradedFraction).toFixed(1)}% of samples), Completions: ${s.completions ?? "?"}`
         );
     }
 
-    const jsonPath = generateJsonOutput(import.meta.url, "simulation-live", scenarios, {
+    const outputName =
+        SIGNAL === "latched" ? "simulation-live-latched" :
+        SIGNAL === "trend" ? "simulation-live-trend" :
+        "simulation-live";
+    const jsonPath = generateJsonOutput(import.meta.url, outputName, scenarios, {
         title: "Executor \u2013 Live Simulation",
-        subtitle: "Real HTTP backend, real concurrency, real time. ProDel + Convergent Throughput Regulator (Little\u2019s Law / LatencyDrift signal)."
+        subtitle: `Real HTTP backend, real concurrency, real time. ProDel + Convergent Throughput Regulator (${SIGNAL} signal).`
     });
     generateHtmlFromJson(jsonPath);
 
