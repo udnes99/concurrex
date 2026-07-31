@@ -25,15 +25,9 @@ type Snapshot = {
     throughputDegraded: boolean;
     requestsPerSec: number;
     errorRate: number;
-    logW: number | null;
     logWBar: number | null;
     dLogWBarEwma: number | null;
-    dLogWBarVarianceEstimate: number;
-    ewmaSumW2: number;
-    se: number;
-    zScore: number;
-    tCritical: number;
-    threshold: number;
+    dLogWBarVarEst: number;
     regulationPhase: string;
     regulationDepth: number;
 };
@@ -115,6 +109,7 @@ function captureSnapshot(
     windowErrorRate: number
 ): Snapshot {
     const rs = executor.getRegulatorState(pool);
+    const latency = executor.getSignalState(pool, "power-degraded");
     return {
         time: Math.round(performance.now() - startTime),
         concurrencyLimit: executor.getConcurrencyLimit(pool),
@@ -124,15 +119,9 @@ function captureSnapshot(
         throughputDegraded: executor.isThroughputDegraded(pool),
         requestsPerSec: Math.round(requestsPerSec),
         errorRate: Math.round(windowErrorRate * 100) / 100,
-        logW: rs.logW,
-        logWBar: rs.logWBar,
-        dLogWBarEwma: rs.dLogWBarEwma,
-        dLogWBarVarianceEstimate: rs.dLogWBarVarianceEstimate,
-        ewmaSumW2: rs.ewmaSumW2,
-        se: rs.se,
-        zScore: rs.zScore,
-        tCritical: rs.tCritical,
-        threshold: rs.threshold,
+        logWBar: (latency?.logWBar as number | null) ?? null,
+        dLogWBarEwma: (latency?.dLogWBarEwma as number | null) ?? null,
+        dLogWBarVarEst: (latency?.dLogWBarVarEst as number | undefined) ?? 0,
         regulationPhase: rs.regulationPhase,
         regulationDepth: rs.regulationDepth
     };

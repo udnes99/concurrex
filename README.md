@@ -41,13 +41,14 @@ Multiple pools let you isolate different workloads (e.g. user-facing commands vs
 
 ## How It Works
 
-Five mechanisms cooperate:
+The executor owns the *engine* — the queue, lanes, the statistical heartbeat, and the concurrency/admission actuators — and delegates *policy* to pluggable signals. Four mechanisms cooperate:
 
-1. **ProDel** (Probabilistic Delay Load-shedding) — sojourn-based AQM. Drop probability `P = 1 - threshold/sojourn`. Adaptive LIFO/FIFO admission (FIFO when healthy, LIFO when dropping to protect fresh work).
-2. **Probabilistic early shedding** — rejects new arrivals at enqueue time with `P = dropRate/(dropRate+completionRate) * shrinkage` when ProDel is dropping and pool is at capacity. Instant rejections.
-3. **EWMA throughput regulator** — latency detection via operational Little's Law (`W = integral N(t)dt / completions`), log-transformed, smoothed by a shrinkage-dampened level EWMA. A Student-t hypothesis test on the trend detects sustained upward drift, with SE formula `√(δ² × W² × (1+W²) / (2 × (1+α/2)))` derived from von Neumann's lag-1 squared-difference noise estimator (drift-invariant) plus an autocorrelation variance-reduction factor for the EWMA. False-positive rate is upper-bounded by Φ(−Z) at steady state (≤2.3% at Z=2); small-sample conservatism comes from the Student-t critical value widening as effective sample size shrinks. Concurrency adjusted via a convergent step formula with bisection damping for O(log L) equilibrium convergence.
-4. **Per-lane error shedding** — each lane tracks its own error rate EWMA. High-error lanes probabilistically reject new requests without affecting pool-wide concurrency.
-5. **Fair lane scheduling** — round-robin across lanes (per-tenant, per-user, or shared). Prevents noisy neighbors from monopolizing capacity.
+1. **ProDel** (Probabilistic Delay Load-shedding) — the core queue engine. Sojourn-based AQM: drop probability `P = 1 - threshold/sojourn`. Adaptive LIFO/FIFO admission (FIFO when healthy, LIFO when dropping to protect fresh work).
+2. **Regulator signals** — decide *concurrency*. Each pool runs a list of `RegulatorSignal`s; once per evaluation cycle, if any returns `triggered()`, the regulator decreases the limit (OR semantics). The built-in default is `PowerDegraded` — a two-channel signal that protects Kleinrock's power knee: a calibrated Student-t latency-trend test (`dW/dt`, operational Little's Law) *arms* a degradation latch, and an elasticity test (`dW/dL`, measured while the limit moves) *attributes* the degradation to concurrency and releases when it's exogenous. FPR is upper-bounded by Φ(−Z) per statistical signal; joint FPR across N signals is bounded by Bonferroni `N · Φ(−Z)`. Concurrency adjusted via a convergent step formula with bisection damping for O(log L) equilibrium convergence.
+3. **Admission signals** — decide *enqueue-time shedding*. Each pool runs a list of `AdmissionSignal`s queried per request with the target lane; if any returns `shouldShed()`, the request is rejected instantly (OR semantics). The built-in default is `EarlyShed` — probabilistic early rejection (`P = dropRate/(dropRate+completionRate) * shrinkage`) when ProDel is dropping and the pool is at capacity. `LaneErrorShed` (per-lane error shedding) is an exported opt-in. Error-driven backpressure is domain-specific (HTTP 5xx vs business errors vs timeouts) — see `examples/express-server.ts`.
+4. **Fair lane scheduling** — round-robin across lanes (per-tenant, per-user, or shared). Prevents noisy neighbors from monopolizing capacity.
+
+All statistical parameters in the framework — α, ESS, df, Bayesian shrinkage, time constant — derive from a single `zScoreThreshold` per pool. The pool computes this shared inference state (informally, its "heartbeat") once per evaluation and exposes it to every signal via `SignalContext.inference`. The framework's rigor is preserved when composing multiple signals.
 
 ## Single-Constant Design
 
@@ -84,6 +85,78 @@ executor.registerPool("commands", {
 | `minimumConcurrency` | 1 | Absolute floor for the concurrency limit |
 | `maximumConcurrency` | Infinity | Absolute ceiling for the concurrency limit |
 | `zScoreThreshold` | (inherit) | Detection sensitivity; overrides the executor-level default |
+| `regulatorSignals` | (inherit) | Concurrency-policy signals (replaces executor's defaults entirely) |
+| `admissionSignals` | (inherit) | Admission-policy signals (replaces executor's defaults entirely) |
+
+## Signals
+
+Policy is pluggable through two kinds of signal, both sharing lifecycle hooks (`onAdmit`, `onComplete`, `onEvaluate`, `onLaneRemoved`) and optional `state()`:
+
+- **`RegulatorSignal`** decides *concurrency* — `triggered()` is checked once per evaluation cycle; if any signal fires, the regulator decreases the limit. Default: `[new PowerDegraded()]`.
+- **`AdmissionSignal`** decides *admission* — `shouldShed(ctx, laneKey)` is queried per request at enqueue; if any returns `true`, the request is rejected instantly. Default: `[new EarlyShed()]`.
+
+```typescript
+import { Executor, PowerDegraded, EarlyShed, LaneErrorShed } from "concurrex";
+
+// Defaults: PowerDegraded (concurrency) + EarlyShed (admission)
+const executor = new Executor();
+
+// Per-pool override — each list replaces the executor defaults entirely (no merge)
+executor.registerPool("api", {
+    regulatorSignals: [new PowerDegraded()],
+    admissionSignals: [new EarlyShed(), new LaneErrorShed()] // opt into per-lane shedding
+});
+
+// Empty arrays disable that policy (ProDel queue management still applies)
+executor.registerPool("debug", { regulatorSignals: [], admissionSignals: [] });
+```
+
+### Built-in signals
+
+- **`PowerDegraded`** (regulator, default) — protects Kleinrock's power knee (the operating point where more concurrency stops buying throughput). Two channels: a calibrated Student-t **latency-trend** test (`dW/dt` on an operational-Little's-Law residence pipeline) *arms* the degradation latch; an **elasticity** test (`dW/dL`, measured while the regulator's own limit moves) then *attributes and releases* — it keeps throttling only while concurrency is the cause and the actuator is helping, re-basing to the new normal when latency is exogenous. Uses the pool's shared inference state (α, ESS, df from `zScoreThreshold`) and composes matched EWMAs + δ² inline. FPR upper-bounded by Φ(−Z).
+- **`EarlyShed`** (admission, default) — sheds an arrival when ProDel is dropping and the pool is at capacity, with `P = dropRate/(dropRate+completionRate) * shrinkage`. Queue-health based, domain-agnostic.
+- **`LaneErrorShed`** (admission, opt-in) — tracks each lane's error-rate EWMA and sheds new requests to a failing lane (`P = lane.errorRateEwma`). Off by default — an "error" is domain-specific (a 404, a validation failure, or a business rejection is not an infrastructure failure), so the executor does not assume errors should shed work.
+
+There is no built-in *pool-wide* error signal. To make errors drive concurrency, write a `RegulatorSignal` that observes `info.errored` in `onComplete` — see `examples/express-server.ts`.
+
+### Custom signals
+
+Implement `RegulatorSignal` or `AdmissionSignal`. The pool's shared inference state (α, ESS, df, shrinkage) is exposed via `ctx.inference` — use it (with `Statistics.*` utilities) to build statistically rigorous detectors, or just write a predicate. Controller state and smoothed rate observations are separate, under `ctx.regulator`.
+
+```typescript
+import type { RegulatorSignal, AdmissionSignal } from "concurrex";
+
+// Predicate regulator signal — decreases concurrency under memory pressure.
+const memorySignal: RegulatorSignal = {
+    name: "memory-pressure",
+    triggered: () => process.memoryUsage().heapUsed > 1_000_000_000,
+    clone() { return this; }
+};
+
+// Predicate admission signal — sheds at enqueue when a breaker is open.
+const breaker: AdmissionSignal = {
+    name: "circuit-breaker",
+    shouldShed: () => myBreaker.isOpen(),
+    clone() { return this; }
+};
+
+executor.registerPool("ingest", {
+    regulatorSignals: [new PowerDegraded(), memorySignal],
+    admissionSignals: [new EarlyShed(), breaker]
+});
+```
+
+Lifecycle hooks are optional — a minimal signal is just `{ name, triggered|shouldShed, clone }`. Signals holding per-lane state populate it in `onComplete(info.lane, …)` and release it in `onLaneRemoved(laneKey)`. For a statistically rigorous signal, follow `PowerDegraded`'s pattern (compose `Statistics.tScore`, `Statistics.studentTTrendSE`, etc. with inline EWMA state). See `src/signals.ts`.
+
+### Inspecting signal state
+
+```typescript
+// General regulator state (rate EWMAs, regulation phase, etc.)
+executor.getRegulatorState("api");
+
+// Per-signal internal state (PowerDegraded's logWBar, zScore, tCritical, etc.)
+executor.getSignalState<PowerDegradedState>("api", "power-degraded");
+```
 
 ## Lanes
 
@@ -127,14 +200,14 @@ executor.isThroughputDegraded("commands"); // latency degradation detected
 executor.getInFlight("commands");          // current in-flight count
 executor.getQueueLength("commands");       // current queue depth
 executor.getConcurrencyLimit("commands");  // current regulated limit
-executor.getRegulatorState("commands");    // full filter state snapshot
+executor.getRegulatorState("commands");    // controller state + rate EWMAs
 ```
 
 `isOverloaded` returns `true` only during confirmed sustained overload (dropping state). Use this to pause upstream work fetching.
 
-`getRegulatorState` returns a `RegulatorState` with the filter internals: `logW`, `logWBar`, `dLogWBarEwma`, `dLogWBarVarianceEstimate`, `ewmaSumW2`, `se`, `zScore`, `tCritical`, `threshold`, `degrading`, `inFlightEwma`, `completionRateEwma`, `admissionRateEwma`, `dropRateEwma`, `errorRateEwma`, `regulationPhase`, `regulationDepth`, `elapsedWindows`, `alpha`. Use `threshold` (= `tCritical × se`) to plot the actual firing boundary — NOT `zScoreThreshold × se`, which is only correct at steady-state df.
+`getRegulatorState` returns a `RegulatorState` with general regulator metrics: `inFlightEwma`, `completionRateEwma`, `admissionRateEwma`, `dropRateEwma`, `regulationPhase`, `regulationDepth`, `elapsedWindows`, `overloadDetected` (= "any regulator signal is currently triggered").
 
-`dLogWBarVarianceEstimate` is von Neumann's δ² — an EWMA of `(v_k − v_{k-1})²/2`, where `v` is the trend signal `dLogWBar`. It's a drift-invariant noise estimator: pairwise differences cancel any sustained drift, so δ² stays calibrated to the actual noise level even under sustained latency degradation. See `docs/THEORY.md` §4.2.6 for the derivation.
+For signal-specific state (e.g. `PowerDegraded`'s `logWBar`, `dLogWBarEwma`, `dLogWBarVarEst`, `se`, `zScore`, `tCritical`, `threshold`), use `executor.getSignalState<S>(pool, signalName)`. Pass the signal's state type (e.g. `PowerDegradedState`) to get a typed result back. See `docs/THEORY.md` §4.2 for the derivation of the latency-trend Student-t test and its components.
 
 ## Error Handling
 
@@ -145,7 +218,7 @@ try {
     await executor.run("commands", () => handleCommand());
 } catch (err) {
     if (err instanceof ResourceExhaustedError) {
-        // Task rejected — overloaded, early shed, or per-lane shed
+        // Task rejected — ProDel drop or an admission signal shed
         return res.status(503).send("Service busy");
     }
     throw err; // re-throw application errors
@@ -159,7 +232,7 @@ try { ... } catch (err) {
 
 **Error classes:**
 - **`ConcurrexError`** — base class for all concurrex errors. Use for catch-all.
-- **`ResourceExhaustedError`** — task rejected due to overload (ProDel drop, early shed, or per-lane shed).
+- **`ResourceExhaustedError`** — task rejected due to overload (ProDel drop, or an admission signal shedding at enqueue).
 - **`ExecutorNotRunningError`** — `run()` called after `stop()`.
 - **`ArgumentError`** — invalid configuration (duplicate pool, bad parameters).
 
@@ -176,7 +249,12 @@ const executor2 = new Executor({ logger: myPinoLogger });
 
 ```typescript
 class Executor {
-    constructor(options?: { logger?: Logger; zScoreThreshold?: number });
+    constructor(options?: {
+        logger?: Logger;
+        zScoreThreshold?: number;
+        regulatorSignals?: RegulatorSignal[];   // default: [new PowerDegraded()]
+        admissionSignals?: AdmissionSignal[];   // default: [new EarlyShed()]
+    });
 
     // Lifecycle
     start(): void;
@@ -191,12 +269,13 @@ class Executor {
                     options?: TaskRunDebouncedOptions): Promise<T>;
 
     // Inspection
-    isOverloaded(pool: string): boolean;
-    isThroughputDegraded(pool: string): boolean;
+    isOverloaded(pool: string): boolean;          // ProDel `dropping` state
+    isThroughputDegraded(pool: string): boolean;  // any regulator signal triggered
     getInFlight(pool: string): number;
     getQueueLength(pool: string): number;
     getConcurrencyLimit(pool: string): number;
     getRegulatorState(pool: string): RegulatorState;
+    getSignalState<S = unknown>(pool: string, signalName: string): S | undefined;
 
     // Derived constants (read-only, executor-level defaults)
     readonly zScoreThreshold: number;
@@ -204,9 +283,11 @@ class Executor {
 }
 ```
 
+> `isOverloaded` and `isThroughputDegraded` (alias: `RegulatorState.overloadDetected`) report orthogonal conditions: the former is ProDel's sustained-queue-overload state; the latter is "any configured regulator signal currently fires". A pool can be one without the other.
+
 ## Theory
 
-See [THEORY.md](https://github.com/udnes99/concurrex/blob/main/docs/THEORY.md) for formal analysis with 17 theorems and proofs covering convergence guarantees, stability bounds, and fairness properties.
+See [THEORY.md](https://github.com/udnes99/concurrex/blob/main/docs/THEORY.md) for the formal analysis — theorems and proofs covering convergence guarantees, stability bounds, and the FPR calibration of the statistical framework.
 
 ## License
 

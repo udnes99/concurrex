@@ -15,3 +15,23 @@ export {
     ArgumentError,
     ExecutorNotRunningError,
 } from "./errors.js";
+
+export {
+    type BaseSignal,
+    type RegulatorSignal,
+    type AdmissionSignal,
+    type SignalContext,
+    type Inference,
+    type RegulatorContext,
+    type AdmitInfo,
+    type CompletionInfo,
+    type EvaluateInfo,
+    type PowerDegradedState,
+    type PowerDegradedOptions,
+    type LaneErrorShedState,
+    PowerDegraded,
+    EarlyShed,
+    LaneErrorShed,
+} from "./signals.js";
+
+export { Statistics } from "./statistics.js";
