@@ -1274,16 +1274,58 @@ async function runEProcess(): Promise<void> {
         await rowFor("fixed-σ_D latch", () => new PowerDegraded(), "power-degraded", zz);
     }
 
+    // ── Validation: drift-magnitude sweep + SHARP incident ──
+    console.log("\n── Validation: does the derived e-process dominate ACROSS regimes? (z=2, 20 seeds) ──\n");
+    console.log("scenario              e-process(detect/power)   fixed-σ_D(detect/power)   winner");
+    // NOTE: workloads are STATEFUL (internal window counter), so create a
+    // fresh one per seed — pass a factory, never a shared instance.
+    const detWl = async (mk: () => RegulatorSignal, sname: string, wlFactory: () => Workload) => {
+        const delays: number[] = [];
+        for (let i = 0; i < N; i++) {
+            const rng = mulberry32(SEED + 8484 + i);
+            const samples = await runScenario({
+                z: 2,
+                signalNames: [sname],
+                regulatorSignals: [mk()],
+                rng,
+                workload: wlFactory()
+            });
+            const first = samples.findIndex((s, k) => k >= 100 && s.firing[0]);
+            if (first >= 0) delays.push(first - 100);
+        }
+        delays.sort((a, b) => a - b);
+        return { med: delays.length ? delays[Math.floor(delays.length / 2)] : NaN, fired: delays.length };
+    };
+    const scenarios: Array<[string, () => Workload]> = [
+        ["drift +0.1%/win (subtle)", () => driftingWorkload(BATCH, 100, 0.001)],
+        ["drift +0.5%/win (medium)", () => driftingWorkload(BATCH, 100, 0.005)],
+        ["drift +2%/win  (steep)", () => driftingWorkload(BATCH, 100, 0.02)],
+        ["step 2x (sharp incident)", () => stepWorkload(BATCH, 100, 2)],
+        ["step 5x (sharp incident)", () => stepWorkload(BATCH, 100, 5)]
+    ];
+    for (const [label, wl] of scenarios) {
+        const e = await detWl(() => new EProcessAuto(), "eprocess-auto", wl);
+        const f = await detWl(() => new PowerDegraded(), "power-degraded", wl);
+        const es = `${isNaN(e.med) ? "never" : e.med + "w"}/${e.fired}/${N}`;
+        const fs = `${isNaN(f.med) ? "never" : f.med + "w"}/${f.fired}/${N}`;
+        // winner: faster at ≥ equal power, or higher power
+        let winner = "≈";
+        if (e.fired > f.fired + 1) winner = "e-process";
+        else if (f.fired > e.fired + 1) winner = "fixed-σ_D";
+        else if (!isNaN(e.med) && !isNaN(f.med)) winner = e.med < f.med - 2 ? "e-process" : f.med < e.med - 2 ? "fixed-σ_D" : "≈";
+        console.log(`${label.padEnd(24)}${es.padStart(14)}          ${fs.padStart(14)}       ${winner}`);
+    }
+
     console.log(
-        "\nResult: the CUSUM e-process DOMINATES the fixed-σ_D latch (56 win, 17/20 power). At c=1,h=1\n" +
-            "it detects the same drift in ~31 windows with 20/20 power at FAR ≈ 1.3% (iid) / 1.5% (ar1) —\n" +
-            "faster, higher power, valid, AND correlation-robust for free (the block rates are drift-\n" +
-            "invariant, so sub-τ correlation is priced automatically). The reset IS the per-episode\n" +
-            "anytime-valid guarantee (each excursion is a fresh SPRT); CUSUM is Lorden-optimal for delay.\n" +
-            "The DERIVED version (c=1, h=log(1/(α·τ)) — one constant, no new knob) dominates at z=2 on\n" +
-            "every axis (faster, higher power, lower FAR on iid/ar1/gc). Remaining before it could replace\n" +
-            "the default: a drift-MAGNITUDE sweep (sharp vs subtle), sharp-incident (anatomy) detection,\n" +
-            "and an overshoot correction to keep the derived h from getting conservative at large z.\n"
+        "\nResult (honest, not a wholesale win): the derived e-process (c=1, h=log(1/(α·τ)) — ONE\n" +
+            "constant) beats the fixed-σ_D latch on GRADUAL drift (faster + never misses: 20/20 vs\n" +
+            "17-18/20), is correlation-robust and lower-FAR everywhere, and is anytime-valid. BUT it\n" +
+            "works on τ-blocks, so it has a ~τ-window floor on SHARP incidents (8-9 win) that it cannot\n" +
+            "beat — the fixed-σ_D latch catches a step in 0-3 windows. Sharp capacity loss is the\n" +
+            "emergency case, so this is NOT a strict replacement. The two are COMPLEMENTARY: fixed-σ_D\n" +
+            "for per-window sharpness, e-process for gradual/valid/correlation-robust. The real\n" +
+            "opportunity is a HYBRID (fire on EITHER) — best of both, and both are ~anytime-valid so\n" +
+            "the composition is clean. Keep both as research artifacts until the hybrid is validated.\n"
     );
 }
 
