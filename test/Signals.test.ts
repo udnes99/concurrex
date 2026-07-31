@@ -271,4 +271,28 @@ describe("PowerDegraded latch (synthetic drive)", () => {
         expect(ref).not.toBeNull();
         expect(ref!).toBeGreaterThan(flat + 1.0);
     });
+
+    it("engages the batch-means noise floor once decision blocks mature, and still fires on drift", () => {
+        // The τ-block noise floor (§4.2.6) needs ≥2 closed blocks (≥2τ
+        // windows) before δ²_B is nonzero; the lag-1 δ² is the warm-up
+        // fallback until then. This checks the estimator runs (the FPR bench
+        // validates that it prices sub-τ correlation) and that a sustained
+        // drift still fires with it active — the block rate telescopes, so
+        // δ²_B stays drift-invariant.
+        const { step } = makeDriver(9); // τ = 9 windows / block
+        const flat = Math.log(50);
+        let s = step(flat, 50, 20);
+        for (let k = 0; k < 30; k++) s = step(flat + wiggle(k), 50, 20);
+        expect(s.blockVarEst).toBeGreaterThan(0); // block estimator engaged
+
+        // Sustained latency drift → still detected (drift-invariance holds).
+        let fired = false;
+        let logW = flat;
+        for (let k = 0; k < 30 && !fired; k++) {
+            logW += 0.15;
+            s = step(logW + wiggle(k), 50, 20);
+            fired ||= s.degrading;
+        }
+        expect(fired).toBe(true);
+    });
 });

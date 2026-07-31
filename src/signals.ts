@@ -260,6 +260,10 @@ export interface PowerDegradedState {
     dLogWBarEwma: number | null;
     /** δ² noise estimator (von Neumann's MSSD/2) on the rate stream. */
     dLogWBarVarEst: number;
+    /** Batch-means (decision-scale) noise estimator δ²_B on the τ-block rate
+     *  stream — the shipped steady-state noise floor (§4.2.6). 0 until the
+     *  first block closes; the lag-1 δ² above is the warm-up fallback. */
+    blockVarEst: number;
     /** Open ∫N(t)dt accumulator since the window start, in ms. */
     inFlightMs: number;
     /** Autocorrelation-corrected standard error of the trend EWMA. */
@@ -383,6 +387,25 @@ export class PowerDegraded implements RegulatorSignal<PowerDegradedState> {
     private dLogWBarVarEst = 0;
     private lastDLogWBarRate: number | null = null;
 
+    // ── Batch-means noise floor (decision-timescale) ──
+    // The lag-1 δ² above prices the pipeline-manufactured correlation but
+    // *understates* the noise floor when the DATA is correlation at scales
+    // below the decision horizon (AR(1) latency, multi-window GC pauses),
+    // over-firing. The batch-means floor estimates the noise at the τ
+    // (decision) scale instead: window rates are accumulated into blocks
+    // of length τ; the block rate telescopes to (level change over the
+    // block)/duration, so successive block rates stay drift-invariant while
+    // pricing ALL sub-τ correlation into δ²_B — no correlation model, no
+    // new constant. Correlation persisting past τ is treated as signal,
+    // matching the actuator's decision semantics. Used once the block
+    // estimator's own df matures (§4.2.6); until then the lag-1 δ² floor is
+    // the warm-up fallback, so cold-start detection is unchanged.
+    private blockRateSum = 0;
+    private blockDtSum = 0;
+    private lastBlockRate: number | null = null;
+    private blockVarEst = 0; // δ²_B — EWMA[MSSD/2] of block rates
+    private blockSumW2 = 1; // ESS tracker of the block estimator (seed 1)
+
     // ── Degradation latch ──
     // The trend test is the *entry* evidence (calibrated FPR ≤ Φ(−z));
     // the latch holds `triggered()` high until the *level* recovers to
@@ -480,7 +503,7 @@ export class PowerDegraded implements RegulatorSignal<PowerDegradedState> {
     }
 
     public onEvaluate(ctx: SignalContext, info: EvaluateInfo): void {
-        const { currentAlpha, bayesianShrinkage, controlWindow } = ctx.inference;
+        const { currentAlpha, bayesianShrinkage, controlWindow, timeConstant } = ctx.inference;
 
         // Close out the in-flight integral at the window boundary. No
         // task event happened — the slice ran at `ctx.inFlight`.
@@ -574,6 +597,31 @@ export class PowerDegraded implements RegulatorSignal<PowerDegradedState> {
                         (currentAlpha * diff * diff) / 2;
                 }
                 this.lastDLogWBarRate = dLogWBarRate;
+
+                // ── Batch-means accumulation at the decision timescale ──
+                // Accumulate the (unshrunk) window rate over dt into a block;
+                // close the block once it spans τ control windows. The block
+                // rate b = Σ(rate·dt)/Σdt telescopes to the level change
+                // across the block over its duration, so successive block
+                // rates are drift-invariant. δ²_B is their lag-1 MSSD/2, and
+                // its ESS (blockSumW2) tracks the block estimator's own df.
+                this.blockRateSum += dLogWBarRate * dt;
+                this.blockDtSum += dt;
+                if (this.blockDtSum >= timeConstant) {
+                    const blockRate = this.blockRateSum / this.blockDtSum;
+                    if (this.lastBlockRate !== null) {
+                        const bdiff = blockRate - this.lastBlockRate;
+                        this.blockVarEst =
+                            (1 - currentAlpha) * this.blockVarEst +
+                            (currentAlpha * bdiff * bdiff) / 2;
+                        this.blockSumW2 =
+                            (1 - currentAlpha) * (1 - currentAlpha) * this.blockSumW2 +
+                            currentAlpha * currentAlpha;
+                    }
+                    this.lastBlockRate = blockRate;
+                    this.blockRateSum = 0;
+                    this.blockDtSum = 0;
+                }
             }
         }
 
@@ -852,6 +900,7 @@ export class PowerDegraded implements RegulatorSignal<PowerDegradedState> {
             logWBar: this.logWBar,
             dLogWBarEwma: this.dLogWBarEwma,
             dLogWBarVarEst: this.dLogWBarVarEst,
+            blockVarEst: this.blockVarEst,
             inFlightMs: this.inFlightMs,
             latched: this.latched,
             referenceLevel: this.referenceLevel,
@@ -883,21 +932,41 @@ export class PowerDegraded implements RegulatorSignal<PowerDegradedState> {
      *  data, or the warm-up df gate). */
     private evaluateTest(ctx: SignalContext): PowerDegradedTest | null {
         if (this.dLogWBarEwma === null || this.dLogWBarVarEst === 0) return null;
-        const { currentAlpha, ewmaSumW2, df, zScoreThreshold } = ctx.inference;
+        const { currentAlpha, ewmaSumW2, df, zScoreThreshold, timeConstant } = ctx.inference;
         // df ≤ 0: not enough effective evidence to reject (warm-up gate).
         if (ewmaSumW2 === 0 || df <= 0) return null;
 
-        const sigmaSqEstimate = this.dLogWBarVarEst / (1 + currentAlpha / 2);
+        // Noise floor: the batch-means (decision-scale) estimator once its
+        // own df has matured, else the lag-1 δ² floor (warm-up fallback).
+        // δ²_B estimates Var(block rate) = σ²_LR / τ, so σ²_LR = τ · δ²_B is
+        // the per-window long-run variance INCLUDING sub-τ correlation; the
+        // δ² floor is δ²/(1+α/2) = σ²_window, which equals σ²_LR only when
+        // the data is uncorrelated. Both are drift-invariant. The t-critical
+        // uses whichever estimator supplied the floor (its overlapping-δ²
+        // effective df). The heartbeat κ (ewmaSumW2) still shapes the SE of
+        // the trend EWMA — the block floor changes the *variance level*, not
+        // the trend EWMA's weight structure.
+        const blockDfEff = Statistics.mssdEffectiveDf(currentAlpha, this.blockSumW2);
+        const blockTCritical =
+            this.blockVarEst > 0
+                ? Statistics.tScore(zScoreThreshold, blockDfEff)
+                : Number.POSITIVE_INFINITY;
+
+        let sigmaSqEstimate: number;
+        let tCritical: number;
+        if (Number.isFinite(blockTCritical)) {
+            sigmaSqEstimate = timeConstant * this.blockVarEst;
+            tCritical = blockTCritical;
+        } else {
+            sigmaSqEstimate = this.dLogWBarVarEst / (1 + currentAlpha / 2);
+            tCritical = Statistics.tScore(
+                zScoreThreshold,
+                Statistics.mssdEffectiveDf(currentAlpha, ewmaSumW2)
+            );
+        }
         const se = Statistics.studentTTrendSE({ sigmaSqEstimate, ewmaSumW2 });
         if (se === 0) return null;
 
-        // The t-quantile's df is the VARIANCE estimator's effective df —
-        // δ²'s overlapping squared differences carry ~1/1.45 the
-        // independent evidence of the weight count (theorem in α; see
-        // Statistics.mssdEffectiveDf). The heartbeat df (mean-type ESS)
-        // still gates evaluability above.
-        const dfEff = Statistics.mssdEffectiveDf(currentAlpha, ewmaSumW2);
-        const tCritical = Statistics.tScore(zScoreThreshold, dfEff);
         const threshold = tCritical * se;
         return {
             se,
